@@ -1,0 +1,20 @@
+{
+  "id": "44444444-4444-4444-4444-444444444444",
+  "created_at": "2026-10-03T12:00:00Z",
+  "expires_at": "2026-10-03T12:05:00Z",
+  "nonce": "nonce-multi-step-001",
+  "intent_type": "transfer",
+  "source_account": "acct-001-2345",
+  "amount": {
+    "value": "1000.00",
+    "currency": "SGD"
+  },
+  "confidence": 0.88,
+  "unresolved": [],
+  "transcript": "Transfer one thousand dollars to Jane, then buy five hundred dollars of ES3 shares at market price with half of it.",
+  "payee": {
+    "id": "payee-002",
+    "display_name": "Jane Tan",
+    "masked_account": "****5678"
+  }
+}

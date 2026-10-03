@@ -1,0 +1,28 @@
+{
+  "id": "22222222-2222-2222-2222-222222222222",
+  "created_at": "2026-10-03T10:00:00Z",
+  "expires_at": "2026-10-03T10:05:00Z",
+  "nonce": "nonce-ambiguous-payee-001",
+  "intent_type": "transfer",
+  "source_account": "acct-001-2345",
+  "amount": {
+    "value": "50.00",
+    "currency": "SGD"
+  },
+  "confidence": 0.4,
+  "unresolved": ["payee"],
+  "transcript": "Send fifty dollars to John.",
+  "payee": null,
+  "payee_candidates": [
+    {
+      "id": "payee-101",
+      "display_name": "John Doe",
+      "masked_account": "****4521"
+    },
+    {
+      "id": "payee-102",
+      "display_name": "John Smith",
+      "masked_account": "****8892"
+    }
+  ]
+}

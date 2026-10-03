@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dcta.local/contract/draft.schema.json",
+  "title": "Transaction Draft",
+  "description": "Canonical transaction draft produced by the parser. The AI drafts, it never executes.",
+  "type": "object",
+  "required": [
+    "id",
+    "created_at",
+    "expires_at",
+    "nonce",
+    "intent_type",
+    "source_account",
+    "amount",
+    "confidence",
+    "unresolved",
+    "transcript"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "description": "Globally unique draft identifier (UUID). Stable across runs for a given draft.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "created_at": {
+      "description": "ISO-8601 timestamp the draft was created.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "description": "ISO-8601 timestamp after which the draft is stale and must not be signed.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "nonce": {
+      "description": "Caller-supplied nonce for idempotent execution.",
+      "type": "string",
+      "minLength": 1
+    },
+    "intent_type": {
+      "description": "What the user wants to do.",
+      "type": "string",
+      "enum": ["transfer", "bill_payment", "equity_purchase"]
+    },
+    "source_account": {
+      "description": "The account money leaves or shares are bought from.",
+      "type": "string",
+      "minLength": 1
+    },
+    "amount": {
+      "description": "The monetary amount. Always a decimal string — never a float.",
+      "type": "object",
+      "required": ["value", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "description": "Decimal string, e.g. \"50.00\". No scientific notation, no float.",
+          "type": "string",
+          "pattern": "^\\d+\\.\\d{2}$"
+        },
+        "currency": {
+          "description": "ISO 4217 currency code.",
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      }
+    },
+    "confidence": {
+      "description": "Parser confidence in the draft, 0.0 to 1.0 inclusive.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "unresolved": {
+      "description": "Field names the parser could not resolve. If non-empty, the draft cannot be signed or executed.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "transcript": {
+      "description": "The raw user text the draft was produced from. Treated as data, never instructions.",
+      "type": "string"
+    },
+    "payee": {
+      "description": "Beneficiary for transfer or bill_payment intents. Null when payee is unresolved (see payee_candidates).",
+      "type": ["object", "null"],
+      "required": ["id", "display_name", "masked_account"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Payee identifier. Must be non-null; null payee id is rejected.",
+          "type": "string"
+        },
+        "display_name": {
+          "description": "Human-readable payee name shown to the user.",
+          "type": "string"
+        },
+        "masked_account": {
+          "description": "Masked destination account number, e.g. ****1234.",
+          "type": "string"
+        }
+      }
+    },
+    "payee_candidates": {
+      "description": "Candidate payees when 'payee' is in unresolved. Only meaningful then.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "display_name", "masked_account"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Payee identifier. Must be non-null.",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "Human-readable payee name shown to the user.",
+            "type": "string"
+          },
+          "masked_account": {
+            "description": "Masked destination account number, e.g. ****1234.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ticker": {
+      "description": "Stock/equity ticker symbol for equity_purchase intents.",
+      "type": "string"
+    },
+    "quantity": {
+      "description": "Number of shares for equity_purchase. Present when order is share-based.",
+      "type": ["string", "null"],
+      "pattern": "^\\d+(\\.\\d+)?$"
+    },
+    "notional_amount": {
+      "description": "Target dollar amount for equity_purchase when order is amount-based. Decimal string.",
+      "type": ["string", "null"],
+      "pattern": "^\\d+\\.\\d{2}$"
+    },
+    "order_type": {
+      "description": "Order type for equity_purchase: market or limit.",
+      "type": "string",
+      "enum": ["market", "limit"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "intent_type": { "const": "transfer" }
+        },
+        "required": ["intent_type"]
+      },
+      "then": {
+        "required": ["payee"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent_type": { "const": "transfer" },
+          "payee": { "type": "null" }
+        },
+        "required": ["intent_type", "payee"]
+      },
+      "then": {
+        "properties": {
+          "unresolved": {
+            "type": "array",
+            "contains": { "const": "payee" }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent_type": { "const": "bill_payment" }
+        },
+        "required": ["intent_type"]
+      },
+      "then": {
+        "required": ["payee"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent_type": { "const": "bill_payment" },
+          "payee": { "type": "null" }
+        },
+        "required": ["intent_type", "payee"]
+      },
+      "then": {
+        "properties": {
+          "unresolved": {
+            "type": "array",
+            "contains": { "const": "payee" }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent_type": { "const": "equity_purchase" }
+        },
+        "required": ["intent_type"]
+      },
+      "then": {
+        "required": ["ticker", "order_type"]
+      }
+    }
+  ]
+}
