@@ -1,0 +1,287 @@
+{
+  "description": "Test vectors for canonical draft hashing. Each vector has a draft input and an expected lowercase hex SHA-256. Vectors with should_raise=true must cause an error in both implementations.",
+  "vectors": [
+    {
+      "description": "normal transfer",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        }
+      },
+      "expected_hash": "49435db8b277e1a6a9b0db0585c3d0a452c197955776e1b5ab42c09288be2415",
+      "should_raise": false
+    },
+    {
+      "description": "same data, different key order (scrambled top-level)",
+      "draft": {
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        },
+        "transcript": "Send fifty dollars to John Smith.",
+        "confidence": 0.95,
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "unresolved": [],
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "nonce": "nonce-001",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "created_at": "2026-10-03T10:00:00Z",
+        "id": "11111111-1111-1111-1111-111111111111"
+      },
+      "expected_hash": "49435db8b277e1a6a9b0db0585c3d0a452c197955776e1b5ab42c09288be2415",
+      "should_raise": false
+    },
+    {
+      "description": "same data, another key order",
+      "draft": {
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "id": "11111111-1111-1111-1111-111111111111",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        },
+        "intent_type": "transfer",
+        "confidence": 0.95,
+        "transcript": "Send fifty dollars to John Smith.",
+        "source_account": "acct-001-2345",
+        "unresolved": [],
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "created_at": "2026-10-03T10:00:00Z"
+      },
+      "expected_hash": "49435db8b277e1a6a9b0db0585c3d0a452c197955776e1b5ab42c09288be2415",
+      "should_raise": false
+    },
+    {
+      "description": "payee name with accented characters",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to José Núñez.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "José Núñez",
+          "masked_account": "****1234"
+        }
+      },
+      "expected_hash": "11b721fe7d44fbdfdaf4385d0b44fce81b9c9b9111090f23926ac46c7e31a136",
+      "should_raise": false
+    },
+    {
+      "description": "non-BMP character in value and in object key (exposes UTF-16 vs code point sort)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to 张伟😀.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "张伟😀",
+          "masked_account": "****1234"
+        },
+        "😀_note": "emoji key",
+        "z_note": "after emoji in code-point sort"
+      },
+      "expected_hash": "0be2449542d8b68930469c08771dbf4c44c3c2f6e5aa973b8fe88c32d0883d6f",
+      "should_raise": false
+    },
+    {
+      "description": "with signature and confidence present (must match same draft without them)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        },
+        "signature": "fake-signature-data"
+      },
+      "expected_hash": "49435db8b277e1a6a9b0db0585c3d0a452c197955776e1b5ab42c09288be2415",
+      "should_raise": false
+    },
+    {
+      "description": "float amount value (must raise)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": 50.5,
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        }
+      },
+      "expected_hash": null,
+      "should_raise": true
+    },
+    {
+      "description": "one character changed in transcript (different hash)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John Smit.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        }
+      },
+      "expected_hash": "2fbbadd6a4cc5faac03d68cee862cef66d30e3bfdf63842b8132cd1f716731f3",
+      "should_raise": false
+    },
+    {
+      "description": "equity purchase draft",
+      "draft": {
+        "id": "33333333-3333-3333-3333-333333333333",
+        "created_at": "2026-10-03T11:00:00Z",
+        "expires_at": "2026-10-03T11:05:00Z",
+        "nonce": "nonce-equity-001",
+        "intent_type": "equity_purchase",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "1000.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.92,
+        "unresolved": [],
+        "transcript": "Buy one thousand dollars of DBS shares at market price.",
+        "ticker": "D05.SI",
+        "notional_amount": "1000.00",
+        "order_type": "market"
+      },
+      "expected_hash": "a8bd55282f97ac8dc66e5d2c6db98885d22caad0abec168259c5bf5fa900c80e",
+      "should_raise": false
+    },
+    {
+      "description": "array order matters (unresolved: amount,payee)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [
+          "amount",
+          "payee"
+        ],
+        "transcript": "Send fifty dollars to John Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        }
+      },
+      "expected_hash": "053d87eaa81abb4ce08898532ff024f6df7f3e569dd6668c988dd5d6b29b68b6",
+      "should_raise": false
+    },
+    {
+      "description": "array order matters (unresolved: payee,amount - different order, different hash)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [
+          "payee",
+          "amount"
+        ],
+        "transcript": "Send fifty dollars to John Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        }
+      },
+      "expected_hash": "9dad340f726f67463f5019956ece171a010184c458c737b56387bccc3dd1d79a",
+      "should_raise": false
+    }
+  ]
+}
