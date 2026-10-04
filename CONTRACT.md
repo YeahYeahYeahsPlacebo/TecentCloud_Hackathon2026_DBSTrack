@@ -62,6 +62,15 @@ check.
 Example: `["payee"]` means the parser could not determine which payee
 the user meant. The user must clarify before the draft can proceed.
 
+**Only `payee` may appear in `unresolved` while a draft exists.** If the
+parser cannot confidently resolve any other field — `intent_type`,
+`source_account`, `amount`, `ticker`, `quantity`, `notional_amount`, or
+`order_type` — it does not produce a draft at all. It asks the user a
+direct clarifying question for that field first (outside the draft
+flow), and only creates the draft once the answer resolves it. This
+prevents a guessed or placeholder value from ever sitting in a field
+that's simultaneously flagged as uncertain.
+
 ### `payee` and `payee_candidates`
 
 - A `payee` and `"payee"` in `unresolved` can never appear together.
