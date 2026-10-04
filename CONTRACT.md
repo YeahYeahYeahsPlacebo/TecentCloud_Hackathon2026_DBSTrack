@@ -26,12 +26,14 @@ the user approved.
 The flow is:
 
 1. User speaks or types text.
-2. The parser (Member 1) produces a **draft**.
+2. The parser (Member 1) produces a **draft**, and the server stores it.
 3. The validator (Member 1) compares the transcript to the draft.
 4. The policy engine (Member 3) decides whether the draft may proceed.
-5. The frontend (Member 2) displays the draft and collects a signature.
-6. The gateway (Member 3) verifies the signature and executes — or
-   rejects with a reason code.
+5. The frontend (Member 2) displays the draft and collects a WebAuthn
+   assertion whose challenge is the draft hash.
+6. The gateway (Member 3) loads **its own stored copy** of the draft,
+   verifies the assertion against it, and executes — or rejects with a
+   reason code.
 
 ---
 
@@ -44,36 +46,50 @@ The draft is the core data contract. It is defined in:
 - **Fixtures:** [`fixtures/drafts/`](fixtures/drafts/)
 
 This document does not duplicate the schema. Always refer to the schema
-file as the source of truth.
+file as the source of truth. Optional fields are **omitted, never
+null**; both the schema and the model reject an explicit `null`.
 
 ### `unresolved`
 
-An array of field names the parser could not resolve. If non-empty, the
-draft **cannot be signed or executed**. The gateway rejects it with
-`unresolved_fields` regardless of any frontend check.
+A **required** array of field names the parser could not resolve. Items
+must come from a fixed list (`intent_type`, `source_account`, `amount`,
+`payee`, `ticker`, `quantity`, `notional_amount`, `order_type`) with no
+duplicates. If non-empty, the draft **cannot be signed or executed**:
+`/api/webauthn/challenge` refuses to issue a challenge for it, and the
+gateway rejects it with `unresolved_fields` regardless of any frontend
+check.
 
 Example: `["payee"]` means the parser could not determine which payee
 the user meant. The user must clarify before the draft can proceed.
 
-### `payee_candidates`
+### `payee` and `payee_candidates`
 
-When `"payee"` is in `unresolved`, the draft may include
-`payee_candidates`: an array of `{id, display_name, masked_account}`
-objects, each fully populated (all fields required and non-null). The
-frontend presents these to the user for selection. Once the user
-selects one, a `/api/clarify` call resolves the ambiguity and the
-parser returns an updated draft with `payee` populated and `"payee"`
-removed from `unresolved`.
+- A `payee` and `"payee"` in `unresolved` can never appear together.
+- When `"payee"` is in `unresolved`, `payee` is omitted and
+  `payee_candidates` is **required with at least 2 entries**, each a
+  fully populated `{id, display_name, masked_account}`. The frontend
+  presents these for selection; `/api/clarify` resolves the choice.
+- When `"payee"` is not in `unresolved`, `payee_candidates` must be
+  absent or empty.
 
 See [`fixtures/drafts/ambiguous_payee.json`](fixtures/drafts/ambiguous_payee.json)
 for a working example.
 
+### `nonce`
+
+A server-generated random value, unique per draft. It is **anti-replay
+only**: it makes two otherwise identical drafts (same user, same words,
+same second) hash differently, so the WebAuthn challenge is never
+predictable or reused. It is **not** an idempotency mechanism —
+idempotency is `idempotency_key` on `/api/execute`, and nothing else.
+
 ### Frontend never builds a draft
 
 The frontend (Member 2) **never constructs or edits a draft**. It
-receives the draft from the server, displays it, and sends back a
-signature. The signature is over the canonical hash of the exact bytes
-the server returned. The frontend may not add, remove, or modify fields.
+receives the draft from the server, displays it, recomputes its hash
+with `frontend/js/canonical.js`, checks that hash against the challenge
+the server issued, and only then asks the authenticator to sign. The
+gateway never trusts any draft body the client sends (see §4).
 
 ---
 
@@ -87,6 +103,14 @@ of the draft. The canonicalisation rule is defined in:
 - **JavaScript mirror:** `frontend/js/canonical.js`
 - **Test vectors:** [`contract/test_vectors.json`](contract/test_vectors.json)
 
+**The hashed object is the server-stored draft as the plain dict
+produced by `TransactionDraft.model_dump(mode="json", exclude_none=True)`.**
+It contains no `null`, no `Decimal` (money is already a string such as
+`"50.00"`), no `datetime` (timestamps are serialised as
+`YYYY-MM-DDTHH:MM:SSZ`, so `+00:00` and `Z` never diverge) and no
+`Enum` objects. `draft_hash()` raises on anything else. The frontend
+gets the same tree by `JSON.parse`-ing the server's response.
+
 Every implementation — Python or JavaScript — must produce the hashes
 listed in `contract/test_vectors.json`. The test suite
 (`tests/test_canonical.py` and `frontend/js/canonical.test.js`) enforces
@@ -97,7 +121,8 @@ Key points (see `CANONICAL_HASH.md` for the full rule):
 - Keys sorted by Unicode **code point** at every nesting level.
 - No whitespace between tokens.
 - Non-ASCII characters are not escaped (emitted as raw UTF-8).
-- Floats are rejected, not formatted.
+- Control-character escapes use lowercase hex.
+- Floats, null and lone UTF-16 surrogates are rejected, not formatted.
 - `signature` and `confidence` are excluded from the hash.
 - All other fields are included — nothing can be smuggled in unsigned.
 
@@ -105,13 +130,15 @@ Key points (see `CANONICAL_HASH.md` for the full rule):
 
 ## 4. API endpoints
 
-All endpoints accept and return JSON. Examples below are built from the
-real fixtures in `fixtures/drafts/`.
+All endpoints accept and return JSON. Draft examples below are built
+from the real fixtures in `fixtures/drafts/`. All binary WebAuthn values
+are **base64url without padding** (RFC 4648 §5).
 
 ### POST /api/message
 
-User text in. Returns the draft, `unresolved` fields, the validator
-verdict, and the policy decision.
+User text in. Returns the draft (which the server has stored), the
+validator verdict, and the policy decision. `unresolved` lives only
+inside `draft`.
 
 **Request:**
 
@@ -145,7 +172,6 @@ verdict, and the policy decision.
       "masked_account": "****1234"
     }
   },
-  "unresolved": [],
   "validator": {
     "verdict": "pass",
     "discrepancies": []
@@ -175,7 +201,6 @@ verdict, and the policy decision.
     "confidence": 0.4,
     "unresolved": ["payee"],
     "transcript": "Send fifty dollars to John.",
-    "payee": null,
     "payee_candidates": [
       {
         "id": "payee-101",
@@ -189,7 +214,6 @@ verdict, and the policy decision.
       }
     ]
   },
-  "unresolved": ["payee"],
   "validator": {
     "verdict": "pass",
     "discrepancies": []
@@ -203,7 +227,20 @@ verdict, and the policy decision.
 
 ### POST /api/clarify
 
-A field name plus the user's answer. Returns the updated draft.
+A field name plus the user's answer. Returns a new, updated draft.
+
+Rules:
+
+- `field` must be in the stored draft's `unresolved` list.
+- For `field: "payee"`, `answer` **must equal the `id` of one of the
+  stored draft's `payee_candidates`**. Any other value (an id that was
+  not offered, free text, a display name) is rejected with
+  `invalid_clarification_answer`, and the draft is unchanged.
+- The clarified draft is stored as a **new draft with a new `id` and a
+  new `nonce`**. The old draft id stays unresolved and can never be
+  executed. Because the gateway loads drafts by id (see
+  `/api/execute`), stored drafts are never modified in place.
+- Once the payee is resolved, `payee_candidates` is omitted.
 
 **Request:**
 
@@ -220,10 +257,10 @@ A field name plus the user's answer. Returns the updated draft.
 ```json
 {
   "draft": {
-    "id": "22222222-2222-2222-2222-222222222222",
-    "created_at": "2026-10-03T10:00:00Z",
-    "expires_at": "2026-10-03T10:05:00Z",
-    "nonce": "nonce-ambiguous-payee-001",
+    "id": "77777777-7777-7777-7777-777777777777",
+    "created_at": "2026-10-03T10:00:30Z",
+    "expires_at": "2026-10-03T10:05:30Z",
+    "nonce": "nonce-ambiguous-payee-002",
     "intent_type": "transfer",
     "source_account": "acct-001-2345",
     "amount": {
@@ -239,7 +276,6 @@ A field name plus the user's answer. Returns the updated draft.
       "masked_account": "****8892"
     }
   },
-  "unresolved": [],
   "validator": {
     "verdict": "pass",
     "discrepancies": []
@@ -251,39 +287,136 @@ A field name plus the user's answer. Returns the updated draft.
 }
 ```
 
-### POST /api/execute
+**Response (422, answer not offered):**
 
-A draft, a signature, and an idempotency key. Returns the result or a
-rejection.
+```json
+{
+  "result": "rejected",
+  "reason_code": "invalid_clarification_answer",
+  "message": "answer 'payee-999' is not one of the offered payee_candidates."
+}
+```
+
+### POST /api/webauthn/register (placeholder)
+
+WebAuthn registration. To be implemented by Member 2 (frontend) and
+Member 3 (gateway). The credential must be created with
+`userVerification: "required"` and algorithm ES256 (COSE `-7`).
+
+**Request (placeholder):**
+
+```json
+{
+  "user_id": "user-001",
+  "display_name": "John Smith"
+}
+```
+
+**Response (placeholder):**
+
+```json
+{
+  "status": "registered",
+  "credential_id": "Y3JlZGVudGlhbC0wMDE"
+}
+```
+
+### POST /api/webauthn/challenge
+
+Returns the challenge for signing a stored draft. **There is no separate
+random challenge: the challenge IS the draft hash** — base64url of the
+raw 32-byte SHA-256 (not of the 64-character hex string). The draft's
+`nonce` is what makes it unpredictable.
+
+The server refuses (`unknown_draft`, `unresolved_fields`, `expired`) to
+issue a challenge for a draft it did not store, that has unresolved
+fields, or that has expired.
+
+The frontend must recompute `draftHashAsync(draft)` over the draft it is
+displaying and check that it matches `draft_hash` here before calling
+`navigator.credentials.get()`. If they differ, it must not sign.
 
 **Request:**
 
 ```json
 {
-  "draft": {
-    "id": "11111111-1111-1111-1111-111111111111",
-    "created_at": "2026-10-03T10:00:00Z",
-    "expires_at": "2026-10-03T10:05:00Z",
-    "nonce": "nonce-clean-transfer-001",
-    "intent_type": "transfer",
-    "source_account": "acct-001-2345",
-    "amount": {
-      "value": "50.00",
-      "currency": "SGD"
-    },
-    "confidence": 0.95,
-    "unresolved": [],
-    "transcript": "Send fifty dollars to John Smith.",
-    "payee": {
-      "id": "payee-001",
-      "display_name": "John Smith",
-      "masked_account": "****1234"
-    }
-  },
-  "signature": "base64-encoded-signature-over-canonical-hash",
-  "idempotency_key": "user-supplied-key-001"
+  "draft_id": "11111111-1111-1111-1111-111111111111"
 }
 ```
+
+**Response (200):**
+
+```json
+{
+  "draft_id": "11111111-1111-1111-1111-111111111111",
+  "draft_hash": "b5fe8f0c9dd1b16cb1e9e716ded5a998ae3417c7c71bf187de5f73dc95c34777",
+  "challenge": "tf6PDJ3RsWyx6ecW3tWpmK40F8fHG_GH3l9z3JXDR3c",
+  "rp_id": "localhost",
+  "user_verification": "required",
+  "allow_credentials": ["Y3JlZGVudGlhbC0wMDE"]
+}
+```
+
+### POST /api/execute
+
+A **draft id** (never a draft body), the credential id, the WebAuthn
+assertion, and an idempotency key. Returns the result or a rejection.
+
+The gateway:
+
+1. Loads **the draft it stored itself** under `draft_id`.
+2. Computes its own hash of that stored copy (§3).
+3. Checks that hash against the challenge inside the assertion.
+4. Executes only that stored copy.
+
+It **never executes a client-supplied draft body**. A request that
+carries a `draft` field (or any field not listed below) is rejected with
+`malformed_request` — the body is not used, merged or "swapped in".
+
+**Request:**
+
+```json
+{
+  "draft_id": "11111111-1111-1111-1111-111111111111",
+  "credential_id": "Y3JlZGVudGlhbC0wMDE",
+  "idempotency_key": "user-supplied-key-001",
+  "assertion": {
+    "credential_id": "Y3JlZGVudGlhbC0wMDE",
+    "authenticator_data": "SZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2MFAAAAAQ",
+    "client_data_json": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoidGY2UERKM1JzV3l4NmVjVzN0V3BtSzQwRjhmSEdfR0gzbDl6M0pYRFIzYyIsIm9yaWdpbiI6Imh0dHA6Ly9sb2NhbGhvc3Q6ODAwMCJ9",
+    "signature": "MEUCIQ...base64url-DER-ECDSA-signature..."
+  }
+}
+```
+
+`client_data_json` above decodes to
+`{"type":"webauthn.get","challenge":"tf6PDJ3RsWyx6ecW3tWpmK40F8fHG_GH3l9z3JXDR3c","origin":"http://localhost:8000"}`.
+`authenticator_data` is SHA-256(`localhost`) ‖ flags `0x05` (user
+present + user verified) ‖ sign count 1. The `signature` value is
+illustrative.
+
+**Check order.** The gateway runs these checks in order and returns the
+first failure, so every rejection has exactly one reason code:
+
+| # | Check | Reason code on failure |
+|---|---|---|
+| 1 | Body has only `draft_id`, `credential_id`, `idempotency_key`, `assertion`; the first three are present | `malformed_request` |
+| 2 | `assertion` is present | `missing_signature` |
+| 3 | `draft_id` names a draft the server stored | `unknown_draft` |
+| 4 | Stored draft validates against the schema | `schema_invalid` |
+| 5 | Stored draft's `unresolved` is empty | `unresolved_fields` |
+| 6 | Now is before the stored draft's `expires_at` | `expired` |
+| 7 | Assertion has exactly its 4 fields, all valid base64url; `client_data_json` is JSON; `assertion.credential_id` equals `credential_id` | `malformed_signature` |
+| 8 | `challenge` in `client_data_json` equals base64url of the server's recomputed hash of the stored draft | `hash_mismatch` |
+| 9 | `type` is `webauthn.get`; `origin` is the expected origin; rpIdHash matches; user-verified flag set; credential is registered; ES256 signature over `authenticator_data ‖ SHA256(client_data_json)` verifies | `signature_invalid` |
+| 10 | `idempotency_key` not previously used for a different draft (same key + same draft returns the original result) | `replayed` |
+| 11 | Validator verdict for this draft hash is `pass` | `validator_frozen` |
+| 12 | Policy decision for this draft hash is `allow` (or step-up satisfied) | `policy_blocked` / `step_up_required` |
+
+`tests/test_execute_binding.py` checks this order against a stub store,
+including that a request carrying a different draft body is rejected
+and that a user-signed hash of a client-built draft fails with
+`hash_mismatch`.
 
 **Response (200):**
 
@@ -302,7 +435,7 @@ rejection.
 {
   "result": "rejected",
   "reason_code": "hash_mismatch",
-  "message": "The signature does not match the canonical hash of the draft."
+  "message": "The challenge in client_data_json does not equal the hash of the stored draft."
 }
 ```
 
@@ -334,59 +467,13 @@ Whether the audit chain is intact, and the first broken row if not.
 }
 ```
 
-### POST /api/webauthn/register (placeholder)
-
-WebAuthn registration. To be implemented by Member 2 (frontend) and
-Member 3 (gateway).
-
-**Request (placeholder):**
-
-```json
-{
-  "user_id": "user-001",
-  "display_name": "John Smith"
-}
-```
-
-**Response (placeholder):**
-
-```json
-{
-  "status": "registered",
-  "credential_id": "base64-encoded-credential-id"
-}
-```
-
-### POST /api/webauthn/challenge (placeholder)
-
-WebAuthn challenge for signing. To be implemented by Member 2 (frontend)
-and Member 3 (gateway).
-
-**Request (placeholder):**
-
-```json
-{
-  "user_id": "user-001",
-  "draft_hash": "49435db8b277e1a6a9b0db0585c3d0a452c197955776e1b5ab42c09288be2415"
-}
-```
-
-**Response (placeholder):**
-
-```json
-{
-  "challenge": "base64-encoded-challenge",
-  "rp_id": "dcta.local"
-}
-```
-
 ---
 
 ## 5. Error response shape and rejection reason codes
 
 ### Standard error response
 
-Every error uses the same shape:
+Every rejection uses the same shape and HTTP status 422:
 
 ```json
 {
@@ -403,17 +490,20 @@ developer log, not necessarily for the user.
 
 | Code | Triggered when |
 |---|---|
-| `missing_signature` | `/api/execute` is called without a `signature` field. |
-| `malformed_signature` | The `signature` field is present but not valid base64 or not the expected format. |
-| `hash_mismatch` | The signature is valid in format but was computed over a different draft hash — the draft was tampered with or is stale. |
-| `signature_invalid` | The signature does not verify against the user's registered public key. |
-| `expired` | The draft's `expires_at` timestamp is in the past. |
+| `malformed_request` | The `/api/execute` body has a field other than `draft_id`, `credential_id`, `idempotency_key`, `assertion` (for example a `draft` body), or is missing one of the first three. |
+| `missing_signature` | `/api/execute` is called without an `assertion`. |
+| `malformed_signature` | The `assertion` does not have exactly `credential_id`, `authenticator_data`, `client_data_json`, `signature`; a value is not valid base64url; `client_data_json` is not JSON; or `assertion.credential_id` differs from the request's `credential_id`. |
+| `unknown_draft` | `draft_id` does not name a draft the server stored. |
+| `hash_mismatch` | The challenge embedded in `client_data_json` does not equal the server's recomputed draft hash (base64url of the SHA-256 of the stored draft's canonical bytes). |
+| `signature_invalid` | The ECDSA (ES256) signature over `authenticator_data ‖ SHA256(client_data_json)` does not verify against the registered public key for `credential_id`. Also covers: unregistered credential, `type` not `webauthn.get`, wrong `origin`, wrong rpIdHash, or the user-verified (UV) flag not set. |
+| `expired` | The stored draft's `expires_at` is not in the future. |
 | `replayed` | The `idempotency_key` has already been used for a different draft. |
-| `unresolved_fields` | The draft's `unresolved` array is non-empty. The gateway rejects this regardless of any frontend check. |
+| `unresolved_fields` | The stored draft's `unresolved` array is non-empty. The gateway rejects this regardless of any frontend check. |
 | `policy_blocked` | The policy engine determined the draft violates a rule (e.g. over per-transaction limit). |
 | `validator_frozen` | The validator returned a verdict of `frozen` — the transcript does not match the draft. |
 | `step_up_required` | Additional authentication (e.g. biometric or 2FA) is required for this transaction. |
 | `schema_invalid` | The draft does not validate against `contract/draft.schema.json`. |
+| `invalid_clarification_answer` | `/api/clarify` was called with an `answer` that is not the `id` of one of the stored draft's `payee_candidates`, or with a `field` that is not in its `unresolved` list. |
 
 ---
 
@@ -443,13 +533,16 @@ Each member must be able to demonstrate the following:
 ### Member 1 (AI layer)
 
 - Every fixture in `fixtures/drafts/` validates against both the JSON
-  Schema and the Pydantic model.
-- A draft with a float amount is rejected.
-- A draft with a missing required field is rejected.
+  Schema and the Pydantic model, and the two agree on every negative case
+  in `tests/test_draft_contract.py`.
+- A draft with a float, integer or non-ASCII-digit amount is rejected.
+- A draft with a missing required field (including `unresolved`) is rejected.
 - A draft with an unknown `intent_type` is rejected.
-- A transfer with `payee: null` and empty `unresolved` is rejected.
+- A transfer with no `payee` and empty `unresolved` is rejected.
 - A payee object with a null `id` is rejected.
-- The parser does not import the ledger module (enforced by a test).
+- The parser and validator do not import the ledger or gateway
+  (`tests/test_import_boundaries.py`, enforced by AST inspection).
+- `/api/clarify` rejects an answer that was not an offered candidate.
 - The validator is read-only and has no tools.
 - The validator runs on a different model from the parser.
 
@@ -457,8 +550,9 @@ Each member must be able to demonstrate the following:
 
 - The frontend displays a draft received from the server without
   modifying it.
-- The frontend sends back a signature over the canonical hash of the
-  exact draft bytes it received.
+- The frontend recomputes the hash of the displayed draft, checks it
+  against the issued challenge, and refuses to sign on mismatch.
+- The frontend sends a draft id plus a WebAuthn assertion, never a draft body.
 - The frontend never constructs a draft locally.
 - The canonical JavaScript implementation
   (`frontend/js/canonical.js`) passes all vectors in
@@ -466,10 +560,17 @@ Each member must be able to demonstrate the following:
 
 ### Member 3 (backend services)
 
+- `/api/execute` loads its own stored draft and never executes a
+  client-supplied body; a request carrying one is rejected
+  (`malformed_request`) and the ledger is untouched.
+- An unknown `draft_id` is rejected with `unknown_draft`.
 - A draft with a non-empty `unresolved` list and an otherwise valid
-  signature is rejected with `unresolved_fields` and the ledger is
+  assertion is rejected with `unresolved_fields` and the ledger is
   untouched.
-- A signature for draft A is rejected for draft B (`hash_mismatch`).
+- An assertion whose challenge is the hash of draft A is rejected for
+  stored draft B (`hash_mismatch`).
+- A bad signature, wrong origin, wrong type, or missing UV flag is
+  rejected with `signature_invalid`.
 - An expired draft is rejected with `expired`.
 - A replayed `idempotency_key` is rejected with `replayed`.
 - The policy engine is pure deterministic code — no LLM anywhere.
@@ -477,6 +578,8 @@ Each member must be able to demonstrate the following:
 - The audit log is hash-chained; `verify_chain()` detects tampering.
 - The canonical Python implementation (`backend/canonical.py`) passes
   all vectors in `contract/test_vectors.json`.
+- `tests/test_execute_binding.py` passes against the real gateway, not
+  only the stub.
 
 ---
 
@@ -485,10 +588,8 @@ Each member must be able to demonstrate the following:
 These are ambiguous points I noticed. They need a decision from the
 team, not a silent assumption:
 
-1. **Signature algorithm.** The contract says "cryptographic signature"
-   but does not specify the algorithm. WebAuthn typically uses
-   ES256 or RS256. Which one? This affects the `/api/webauthn/*`
-   endpoints and the `signature_invalid` verification path.
+1. ~~**Signature algorithm.**~~ **Resolved:** WebAuthn ES256 (ECDSA
+   P-256 with SHA-256, COSE `-7`), user verification required. See §4.
 
 2. **`idempotency_key` scope.** Is the key unique per user, per
    session, or globally? If user A and user B both submit the same
@@ -505,20 +606,15 @@ team, not a silent assumption:
    represents only the first step (the transfer). How are multi-step
    drafts modelled — as a sequence of separate drafts, or as a single
    draft with sub-steps? The schema does not currently support
-   sub-steps.
+   sub-steps. Until decided, note that this fixture drops the second
+   step with an empty `unresolved`, which constraint 6 forbids.
 
-5. **`confidence` exclusion from the hash.** `confidence` is excluded
-   from the canonical hash because it is a float and is diagnostic
-   only. But if the parser re-runs and produces a different confidence
-   for the same draft, the hash stays the same. Is this intended?
-   (I believe yes, since confidence is not shown to the user, but it
-   should be confirmed.)
+5. ~~**`confidence` exclusion from the hash.**~~ **Moved** to §9
+   (Known limitations).
 
-6. **`payee_candidates` after clarification.** When the user selects
-   a candidate and `/api/clarify` returns an updated draft, should
-   `payee_candidates` be removed (set to null/absent) or kept for
-   audit? The schema allows it to be absent, but the contract does
-   not say.
+6. ~~**`payee_candidates` after clarification.**~~ **Resolved:** it is
+   omitted once the payee is resolved; the schema and model reject it
+   otherwise. See §2.
 
 7. **Validator verdict values.** The examples use `"pass"` and the
    reason-code table mentions `"frozen"`. What are all the possible
@@ -528,3 +624,30 @@ team, not a silent assumption:
 8. **Policy `decision` values.** The examples use `"allow"` and
    `"hold"`. Is `"block"` different from `"hold"`? What are all the
    possible policy decisions, and which map to which reason codes?
+
+---
+
+## 9. Known limitations
+
+Deliberately not fixed in this pass. Each is a decision, not an oversight.
+
+- **Equity: quantity vs notional.** Both or neither may be set; exactly-one is not enforced.
+- **Equity: notional vs amount.** `notional_amount` is not cross-checked against `amount.value`.
+- **Equity: limit orders.** `order_type: "limit"` has no limit-price field.
+- **Equity: fractional shares.** `quantity` uses the money pattern, so shares are always written with exactly two decimals (`"10.00"`).
+- **Unknown or single-match payee.** `"payee"` in `unresolved` requires at least 2 candidates, so a payee with 0 or 1 matches cannot be expressed as a draft yet.
+- **Unresolved required fields.** A required field listed in `unresolved` (e.g. `amount`) must still carry a schema-valid placeholder value.
+- **`confidence` trust boundary.** It is excluded from the hash, so a client copy can be altered freely. Policy and step-up must read only the server-stored value. This is documented, not tested.
+- **`confidence` coercion.** Pydantic accepts `true` and `"0.5"`, which the schema rejects.
+- **`id` format.** Pydantic does not check that `id` is a UUID. The schema's `format: uuid` is only enforced when a format checker is enabled, and the tests don't enable one.
+- **`expires_at > created_at`.** Pydantic enforces it; JSON Schema cannot compare two fields. There is no maximum window yet (open question 3).
+- **Unicode normalisation.** None: NFC `José` and NFD `José` hash differently, and confusable display names are not detected.
+- **Lone surrogates in the model.** Pydantic does not reject them in strings; the canonicaliser does (`ValueError`). The gateway must map that to `schema_invalid`, not a 500.
+- **Numbers in JavaScript.** JS cannot tell `50.0` from `50` and loses precision above 2^53. No hashed field is currently a number, so any future numeric field must be a string.
+- **JS `__proto__` key.** A top-level `__proto__` key is dropped by `canonical.js`. The schema forbids extra keys, so valid drafts can't contain one.
+- **Non-plain JS objects.** `canonical.js` serialises a `Date` or `Map` as `{}`. Only reachable without `JSON.parse`.
+- **Deep nesting.** Python raises `RecursionError` at roughly 1000 levels; the draft schema is shallow.
+- **Duplicate JSON keys.** Both parsers keep the last value; neither rejects duplicates.
+- **Stubbed crypto in tests.** `tests/test_execute_binding.py` stubs ECDSA verification. Real WebAuthn verification is untested until the gateway exists.
+- **Not yet specified.** WebAuthn `signCount` / clone detection, KYC, and binding validator and policy verdicts to the draft hash in storage.
+- **Zero amounts.** `"0.00"` passes the money pattern; policy must reject it.

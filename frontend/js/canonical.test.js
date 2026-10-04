@@ -50,7 +50,13 @@ vectors.forEach(function (vector, index) {
             canonical.draftHash(vector.draft);
             fail(desc + " — expected error but none was raised");
         } catch (e) {
-            ok(desc + " — raised as expected (" + e.message + ")");
+            // Only the canonicaliser's own rejections count; a TypeError
+            // from a bug must not pass as "raised as expected".
+            if (/forbidden in the canonical form/.test(e.message)) {
+                ok(desc + " — raised as expected (" + e.message + ")");
+            } else {
+                fail(desc + " — raised the wrong error: " + e.message);
+            }
         }
     } else {
         try {
@@ -142,16 +148,71 @@ vectors.forEach(function (vector, index) {
     }
 })();
 
-// ── Non-BMP key sorting (code point, not UTF-16) ───────────────
+// ── Key sort: code point, not UTF-16 code unit ─────────────────
+
+// A deliberately wrong canonicaliser: identical except it uses the
+// default .sort(), which orders keys by UTF-16 code units.
+function naiveUtf16SortHash(draft) {
+    function ser(v) {
+        if (Array.isArray(v)) return "[" + v.map(ser).join(",") + "]";
+        if (v !== null && typeof v === "object") {
+            return "{" + Object.keys(v).sort().map(function (k) {
+                return JSON.stringify(k) + ":" + ser(v[k]);
+            }).join(",") + "}";
+        }
+        return JSON.stringify(v);
+    }
+    var root = {};
+    Object.keys(draft).forEach(function (k) {
+        if (canonical.EXCLUDED_FIELDS.indexOf(k) === -1) root[k] = draft[k];
+    });
+    return require("crypto").createHash("sha256").update(ser(root), "utf8").digest("hex");
+}
 
 (function () {
-    // Vector 4 has an emoji key. If we were sorting by UTF-16 code units
-    // instead of code points, the hash would differ. The expected hash
-    // was computed with code-point sorting in Python.
-    var h = canonical.draftHash(vectors[4].draft);
+    var sortVector = vectors.filter(function (v) {
+        return v.description.indexOf("key sort: U+FF5A vs emoji") === 0;
+    })[0];
     try {
-        assert.strictEqual(h, vectors[4].expected_hash, "non-BMP key sort mismatch");
-        ok("non-BMP characters in keys sorted by code point (not UTF-16)");
+        assert.ok(sortVector, "key sort vector missing");
+        // Control: on ASCII keys the naive version agrees.
+        assert.strictEqual(naiveUtf16SortHash(vectors[0].draft), vectors[0].expected_hash,
+            "naive sort should agree on ASCII-only keys");
+        assert.deepStrictEqual(["ｚ", "😀"].sort(), ["😀", "ｚ"],
+            "default .sort() should put the emoji first");
+        assert.strictEqual(canonical.draftHash(sortVector.draft), sortVector.expected_hash,
+            "code-point sort mismatch");
+        assert.notStrictEqual(naiveUtf16SortHash(sortVector.draft), sortVector.expected_hash,
+            "key sort vector does not catch a naive .sort()");
+        ok("key sort vector catches a naive UTF-16 .sort() implementation");
+    } catch (e) {
+        fail(e.message);
+    }
+})();
+
+// ── Malformed input is rejected ─────────────────────────────────
+
+(function () {
+    var bad = ["\ud800", "\udc00", "a\ud83d", "\ude00b"];
+    try {
+        bad.forEach(function (s) {
+            var vObj = {}; vObj.v = s;
+            var kObj = {}; kObj[s] = "v";
+            assert.throws(function () { canonical.draftHash(vObj); }, /surrogate/, "value " + JSON.stringify(s));
+            assert.throws(function () { canonical.draftHash(kObj); }, /surrogate/, "key " + JSON.stringify(s));
+        });
+        assert.throws(function () { canonical.draftHash({ v: null }); }, /null/);
+        ok("lone surrogates and null are rejected");
+    } catch (e) {
+        fail(e.message);
+    }
+})();
+
+(function () {
+    var s = Buffer.from(canonical.canonicalBytes({ v: "\u0000\u001f\n" })).toString("utf-8");
+    try {
+        assert.strictEqual(s, '{"v":"\\u0000\\u001f\\n"}');
+        ok("control characters use lowercase hex escapes");
     } catch (e) {
         fail(e.message);
     }

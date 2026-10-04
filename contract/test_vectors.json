@@ -282,6 +282,84 @@
       },
       "expected_hash": "9dad340f726f67463f5019956ece171a010184c458c737b56387bccc3dd1d79a",
       "should_raise": false
+    },
+    {
+      "description": "key sort: U+FF5A vs emoji U+1F600 (code-point order puts U+FF5A first; UTF-16 code-unit order puts the emoji first)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234",
+          "ｚ": "fullwidth z",
+          "😀": "emoji"
+        }
+      },
+      "expected_hash": "b181b8c5e0463503f4a3a2215c7f8b25e099b032eeaa9c5bf1c286339cc1ad72",
+      "should_raise": false
+    },
+    {
+      "description": "null value (must raise: the hashed object never contains null)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        },
+        "ticker": null
+      },
+      "expected_hash": null,
+      "should_raise": true
+    },
+    {
+      "description": "lone UTF-16 surrogate in a string (must raise: malformed input)",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John \ud800Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        }
+      },
+      "expected_hash": null,
+      "should_raise": true
     }
   ]
 }

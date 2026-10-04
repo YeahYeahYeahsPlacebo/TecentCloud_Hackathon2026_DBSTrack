@@ -12,7 +12,6 @@
   "confidence": 0.4,
   "unresolved": ["payee"],
   "transcript": "Send fifty dollars to John.",
-  "payee": null,
   "payee_candidates": [
     {
       "id": "payee-101",

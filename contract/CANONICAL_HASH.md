@@ -9,9 +9,34 @@ produce byte-identical output.
 ## Overview
 
 Given a draft as a JSON-deserialised object (a tree of objects, arrays,
-strings, nulls, and integers), the canonicaliser produces a deterministic
+strings, booleans and integers), the canonicaliser produces a deterministic
 byte string. The SHA-256 of that byte string is the **draft hash**. The
-signature is over the draft hash.
+WebAuthn challenge is the draft hash (see CONTRACT.md §4).
+
+## The hashed object
+
+**The hashed object is the server-stored draft as the plain dict produced
+by `TransactionDraft.model_dump(mode="json", exclude_none=True)`.** Nothing
+else is hashed: not the Pydantic model, not a python-mode dump, not a
+client-supplied body, not the raw bytes of an HTTP response.
+
+That dict has this shape, and `draft_hash()` rejects anything else:
+
+- Only plain `dict`, `list`, `str`, `int` and `bool` values (and the
+  excluded top-level `confidence` float). No `Decimal`, `datetime`,
+  `Enum`, tuple or subclass of any of these (`TypeError`).
+- **No `null` anywhere.** Absent optional fields are omitted, never
+  null (`ValueError`). The model also rejects explicit nulls on input.
+- Money (`amount.value`, `quantity`, `notional_amount`) is already a
+  string such as `"50.00"`. It is never a `Decimal` or a float.
+- Timestamps are serialised as UTC with a `Z` suffix and whole seconds:
+  `YYYY-MM-DDTHH:MM:SSZ`. `+00:00`, `+08:00` and `Z` for the same instant
+  all serialise to the same string, so they hash the same.
+
+Parsing the server's JSON response with `JSON.parse` (frontend) or
+`json.loads` (backend) yields the same tree, so both sides hash the same
+object. `tests/test_canonical.py` checks that every fixture hashes the
+same raw and after a round trip through the model.
 
 ## Excluded fields
 
@@ -65,10 +90,18 @@ Escaping rules:
 - Escape control characters U+0000–U+001F using the shortest standard
   JSON escape: `\b` (U+0008), `\t` (U+0009), `\n` (U+000A),
   `\f` (U+000C), `\r` (U+000D). All other control characters use
-  `\u00XX`.
+  `\u00xx` with **lowercase** hex digits, e.g. `\u001f`, never `\u001F`.
 - **Do NOT escape non-ASCII characters.** A Chinese character, an
   emoji, an accented letter — all are emitted as their raw UTF-8 bytes.
-  Do not use `\uXXXX` escapes for them.
+  Do not use `\uXXXX` escapes for them. DEL (U+007F), C1 controls and
+  U+2028/U+2029 are also emitted raw.
+- **Lone UTF-16 surrogates are an error.** A string containing an
+  unpaired surrogate (U+D800–U+DFFF not part of a valid pair) is
+  malformed input and must raise. It is not valid Unicode, so it has no
+  UTF-8 encoding. Python's encoder raises, while JavaScript's
+  `TextEncoder` silently replaces it with U+FFFD (which would make
+  `"\ud800"` and `"�"` hash the same). Both implementations
+  therefore reject it explicitly, in keys and values.
 
 #### Integer
 
@@ -85,7 +118,8 @@ not silently convert a float to a string.
 
 #### Null
 
-Emit the four characters `null`.
+**Raise an error.** The hashed object never contains null (see "The
+hashed object" above); a null means the caller hashed the wrong object.
 
 #### Boolean
 
@@ -104,15 +138,30 @@ hexadecimal string.
 ## Key sorting
 
 Keys are sorted by **Unicode code point**, not by UTF-16 code unit.
+Compare keys character by character by code point; if one key is a
+prefix of the other, the shorter key sorts first.
 
-This distinction matters for characters outside the Basic Multilingual
-Plane (code points U+10000 and above, such as emoji). In UTF-16 these
-are represented as surrogate pairs (two 16-bit units). Sorting by UTF-16
-code units would place surrogate pairs after all BMP characters, which
-is **wrong** — a surrogate pair encodes a single code point that is
-numerically larger than any BMP code point, so it sorts after all BMP
-characters, but among themselves surrogate pairs must be ordered by
-their decoded code point.
+The two orders differ in exactly one situation. A character above
+U+FFFF (e.g. an emoji, U+1F600) is stored in UTF-16 as a surrogate pair
+whose first unit is in U+D800–U+DBFF. A character in U+E000–U+FFFF
+(private use, CJK compatibility, fullwidth forms such as `ｚ` U+FF5A) is a
+single unit in that higher range. So:
+
+| Keys | Code-point order (correct) | UTF-16 code-unit order (wrong) |
+|---|---|---|
+| `"ｚ"` (U+FF5A), `"😀"` (U+1F600) | `ｚ`, `😀` (0xFF5A < 0x1F600) | `😀`, `ｚ` (0xD83D < 0xFF5A) |
+
+For every other pair of characters (both at or below U+D7FF, both in
+U+E000–U+FFFF, or both above U+FFFF) the two orders agree. That is why
+a vector with only ASCII and emoji keys cannot detect the bug: `z` < `😀`
+in both orders.
+
+The vector "key sort: U+FF5A vs emoji U+1F600" in `test_vectors.json`
+exercises the difference. Both test suites prove it catches a naive
+implementation: they run a deliberately wrong canonicaliser that uses
+JavaScript's default `.sort()` (or Python's equivalent UTF-16 sort) and
+assert that it agrees on ASCII keys but produces a different hash for
+this vector.
 
 ### How each implementation honours this
 
@@ -135,12 +184,17 @@ indentation. The output is a single dense JSON string.
 
 ## Determinism checklist
 
+- [x] Hashed object is `model_dump(mode="json", exclude_none=True)` of the server-stored draft
 - [x] Keys sorted by Unicode code point at every nesting level
 - [x] No whitespace
 - [x] UTF-8 encoding
 - [x] Non-ASCII characters not escaped
+- [x] Control-character escapes use lowercase hex
 - [x] Floats rejected (not formatted)
+- [x] null rejected (absent fields are omitted)
+- [x] Lone UTF-16 surrogates rejected
 - [x] Arrays keep insertion order
-- [x] null serialised as `null`
 - [x] All fields included except `signature` and `confidence`
-- [x] Same output in Python and JavaScript
+- [x] Same output in Python and JavaScript for every valid hashed object
+  (see CONTRACT.md "Known limitations" for inputs outside that shape,
+  such as numbers other than small integers)

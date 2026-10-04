@@ -88,7 +88,11 @@
   // ── Internal: recursive canonicaliser ──────────────────────────
 
   function _canonicalise(value) {
-    if (value === null) return "null";
+    if (value === null) {
+      throw new Error(
+        "null is forbidden in the canonical form; the server omits absent fields"
+      );
+    }
     if (typeof value === "boolean") return value ? "true" : "false";
     if (typeof value === "number") {
       if (!Number.isInteger(value)) {
@@ -148,7 +152,14 @@
     for (var i = 0; i < chars.length; i++) {
       var ch = chars[i];
       var cp = ch.codePointAt(0);
-      if (ch === '"') {
+      if (cp >= 0xd800 && cp <= 0xdfff) {
+        // Array.from() keeps valid pairs together, so a surrogate here is
+        // unpaired. TextEncoder would silently turn it into U+FFFD.
+        throw new Error(
+          "lone UTF-16 surrogate U+" + cp.toString(16).toUpperCase() +
+          " is forbidden in the canonical form"
+        );
+      } else if (ch === '"') {
         out.push('\\"');
       } else if (ch === "\\") {
         out.push("\\\\");
@@ -163,6 +174,7 @@
       } else if (cp === 0x000d) {
         out.push("\\r");
       } else if (cp <= 0x001f) {
+        // Lowercase hex, matching backend/canonical.py.
         out.push("\\u" + ("0000" + cp.toString(16)).slice(-4));
       } else {
         out.push(ch);

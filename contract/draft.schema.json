@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dcta.local/contract/draft.schema.json",
   "title": "Transaction Draft",
-  "description": "Canonical transaction draft produced by the parser. The AI drafts, it never executes.",
+  "description": "Canonical transaction draft produced by the parser. The AI drafts, it never executes. Optional fields are omitted, never null. Not expressible here (enforced by the Pydantic model only): expires_at must be after created_at.",
   "type": "object",
   "required": [
     "id",
@@ -17,6 +17,40 @@
     "transcript"
   ],
   "additionalProperties": false,
+  "$defs": {
+    "money": {
+      "$comment": "The 'not' clause exists because Python's re treats '$' as matching before a final newline; ECMA-262 does not. Together they reject '50.00\\n' in every implementation.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.[0-9]{2}$",
+      "not": { "pattern": "\\n" }
+    },
+    "utc_timestamp": {
+      "$comment": "UTC, whole seconds, Z suffix. See $defs/money for why the 'not' clause exists.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "not": { "pattern": "\\n" }
+    },
+    "payee": {
+      "type": "object",
+      "required": ["id", "display_name", "masked_account"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Payee identifier. Must be non-null.",
+          "type": "string"
+        },
+        "display_name": {
+          "description": "Human-readable payee name shown to the user.",
+          "type": "string"
+        },
+        "masked_account": {
+          "description": "Masked destination account number, e.g. ****1234.",
+          "type": "string"
+        }
+      }
+    }
+  },
   "properties": {
     "id": {
       "description": "Globally unique draft identifier (UUID). Stable across runs for a given draft.",
@@ -24,17 +58,15 @@
       "format": "uuid"
     },
     "created_at": {
-      "description": "ISO-8601 timestamp the draft was created.",
-      "type": "string",
-      "format": "date-time"
+      "description": "UTC timestamp the draft was created, e.g. 2026-10-03T10:00:00Z.",
+      "$ref": "#/$defs/utc_timestamp"
     },
     "expires_at": {
-      "description": "ISO-8601 timestamp after which the draft is stale and must not be signed.",
-      "type": "string",
-      "format": "date-time"
+      "description": "UTC timestamp after which the draft is stale and must not be signed. Must be after created_at.",
+      "$ref": "#/$defs/utc_timestamp"
     },
     "nonce": {
-      "description": "Caller-supplied nonce for idempotent execution.",
+      "description": "Server-generated random value, unique per draft. Anti-replay only: it makes two otherwise identical drafts hash differently. NOT an idempotency key.",
       "type": "string",
       "minLength": 1
     },
@@ -55,19 +87,19 @@
       "additionalProperties": false,
       "properties": {
         "value": {
-          "description": "Decimal string, e.g. \"50.00\". No scientific notation, no float.",
-          "type": "string",
-          "pattern": "^\\d+\\.\\d{2}$"
+          "description": "Decimal string, e.g. \"50.00\". ASCII digits, no leading zeros, exactly two decimals.",
+          "$ref": "#/$defs/money"
         },
         "currency": {
           "description": "ISO 4217 currency code.",
           "type": "string",
-          "pattern": "^[A-Z]{3}$"
+          "pattern": "^[A-Z]{3}$",
+          "maxLength": 3
         }
       }
     },
     "confidence": {
-      "description": "Parser confidence in the draft, 0.0 to 1.0 inclusive.",
+      "description": "Parser confidence in the draft, 0.0 to 1.0 inclusive. Excluded from the hash.",
       "type": "number",
       "minimum": 0,
       "maximum": 1
@@ -75,8 +107,19 @@
     "unresolved": {
       "description": "Field names the parser could not resolve. If non-empty, the draft cannot be signed or executed.",
       "type": "array",
+      "uniqueItems": true,
       "items": {
-        "type": "string"
+        "type": "string",
+        "enum": [
+          "intent_type",
+          "source_account",
+          "amount",
+          "payee",
+          "ticker",
+          "quantity",
+          "notional_amount",
+          "order_type"
+        ]
       }
     },
     "transcript": {
@@ -84,47 +127,13 @@
       "type": "string"
     },
     "payee": {
-      "description": "Beneficiary for transfer or bill_payment intents. Null when payee is unresolved (see payee_candidates).",
-      "type": ["object", "null"],
-      "required": ["id", "display_name", "masked_account"],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "description": "Payee identifier. Must be non-null; null payee id is rejected.",
-          "type": "string"
-        },
-        "display_name": {
-          "description": "Human-readable payee name shown to the user.",
-          "type": "string"
-        },
-        "masked_account": {
-          "description": "Masked destination account number, e.g. ****1234.",
-          "type": "string"
-        }
-      }
+      "description": "Beneficiary for transfer or bill_payment intents. Omitted (never null) when payee is unresolved.",
+      "$ref": "#/$defs/payee"
     },
     "payee_candidates": {
-      "description": "Candidate payees when 'payee' is in unresolved. Only meaningful then.",
+      "description": "Candidate payees. Required with at least 2 entries when 'payee' is in unresolved; otherwise absent or empty.",
       "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["id", "display_name", "masked_account"],
-        "additionalProperties": false,
-        "properties": {
-          "id": {
-            "description": "Payee identifier. Must be non-null.",
-            "type": "string"
-          },
-          "display_name": {
-            "description": "Human-readable payee name shown to the user.",
-            "type": "string"
-          },
-          "masked_account": {
-            "description": "Masked destination account number, e.g. ****1234.",
-            "type": "string"
-          }
-        }
-      }
+      "items": { "$ref": "#/$defs/payee" }
     },
     "ticker": {
       "description": "Stock/equity ticker symbol for equity_purchase intents.",
@@ -132,13 +141,11 @@
     },
     "quantity": {
       "description": "Number of shares for equity_purchase. Present when order is share-based.",
-      "type": ["string", "null"],
-      "pattern": "^\\d+(\\.\\d+)?$"
+      "$ref": "#/$defs/money"
     },
     "notional_amount": {
       "description": "Target dollar amount for equity_purchase when order is amount-based. Decimal string.",
-      "type": ["string", "null"],
-      "pattern": "^\\d+\\.\\d{2}$"
+      "$ref": "#/$defs/money"
     },
     "order_type": {
       "description": "Order type for equity_purchase: market or limit.",
@@ -148,58 +155,46 @@
   },
   "allOf": [
     {
+      "$comment": "transfer / bill_payment need a payee unless 'payee' is unresolved.",
       "if": {
         "properties": {
-          "intent_type": { "const": "transfer" }
+          "intent_type": { "enum": ["transfer", "bill_payment"] },
+          "unresolved": { "not": { "contains": { "const": "payee" } } }
         },
-        "required": ["intent_type"]
+        "required": ["intent_type", "unresolved"]
       },
       "then": {
         "required": ["payee"]
       }
     },
     {
+      "$comment": "A payee cannot coexist with 'payee' in unresolved.",
       "if": {
-        "properties": {
-          "intent_type": { "const": "transfer" },
-          "payee": { "type": "null" }
-        },
-        "required": ["intent_type", "payee"]
+        "required": ["payee"]
       },
       "then": {
         "properties": {
-          "unresolved": {
-            "type": "array",
-            "contains": { "const": "payee" }
-          }
+          "unresolved": { "not": { "contains": { "const": "payee" } } }
         }
       }
     },
     {
+      "$comment": "payee_candidates: at least 2 when 'payee' is unresolved, otherwise absent or empty.",
       "if": {
         "properties": {
-          "intent_type": { "const": "bill_payment" }
+          "unresolved": { "contains": { "const": "payee" } }
         },
-        "required": ["intent_type"]
+        "required": ["unresolved"]
       },
       "then": {
-        "required": ["payee"]
-      }
-    },
-    {
-      "if": {
+        "required": ["payee_candidates"],
         "properties": {
-          "intent_type": { "const": "bill_payment" },
-          "payee": { "type": "null" }
-        },
-        "required": ["intent_type", "payee"]
+          "payee_candidates": { "minItems": 2 }
+        }
       },
-      "then": {
+      "else": {
         "properties": {
-          "unresolved": {
-            "type": "array",
-            "contains": { "const": "payee" }
-          }
+          "payee_candidates": { "maxItems": 0 }
         }
       }
     },

@@ -13,7 +13,6 @@
   "unresolved": [],
   "transcript": "Buy one thousand dollars of DBS shares at market price.",
   "ticker": "D05.SI",
-  "quantity": null,
   "notional_amount": "1000.00",
   "order_type": "market"
 }
