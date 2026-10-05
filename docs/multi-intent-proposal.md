@@ -1,6 +1,6 @@
 # Proposal: Multi-Intent Requests (Transaction Groups)
 
-**Status:** Proposal by Member 2 (frontend). Not agreed. This document
+**Status:** Accepted in part. See Decisions below. This document
 does not modify `CONTRACT.md`, `contract/draft.schema.json`,
 `fixtures/`, `tests/`, `backend/`, or `frontend/`. It exists only to
 frame a decision for the team.
@@ -15,6 +15,64 @@ may depend on earlier ones.
 semantics); `CONTEXT.md` hard constraints 1, 6, 10 and the core rule
 ("the generative AI is a generator of drafts, never an executor of
 funds"); `fixtures/drafts/multi_step.json`.
+
+---
+
+## 0. Decisions (team review, agreed in part)
+
+The team has agreed the following design directions. These are
+**agreed directions, not completed implementations** — none of the
+features below have been built yet. Phase 1 may return a list
+containing a single item; full multi-intent group execution is
+deferred to Phase 5, after the working single-intent demo.
+
+**Item 1 — Modelling style (§8 item 1).** We accept separate
+per-transaction drafts plus a group metadata object as the future
+modelling approach. The existing draft schema
+(`draft.schema.json`), the canonical hash, and the per-draft WebAuthn
+approach remain unchanged. No sub-steps or nested intents are added
+to the draft.
+
+**Item 8 — Parser coverage ownership (§8 item 8).** Member 1 owns
+parser coverage. The parser interface will return an items list plus
+an intent count, with a test that compares them. This closes the
+whole-request coverage gap (§5.2) at the parser level for v1.
+
+**Item 11 — Validator behaviour (§8 item 11).** The validator remains
+read-only and checks each draft individually. It does not reason
+about the group as a whole in v1.
+
+**Item 14 — Endpoint surface (§8 item 14).** Items/group information
+will be returned inline from `/api/message` rather than through a
+separate endpoint for v1. No new `GET /api/group/{group_id}` or
+`POST /api/group/clarify` endpoint in Phase 1.
+
+**Item 16 — Fixture migration (§8 item 16).** Use option (b) now:
+correct the `multi_step.json` transcript to describe one intent
+honestly, so the fixture no longer claims to represent two actions
+while only modelling one. Revisit option (a) — splitting into a
+group fixture under `fixtures/groups/` — in Phase 5 when the group
+model is actually built.
+
+**Deferred to Phase 5 (after the working single-intent demo):**
+
+All other group modelling, including but not limited to:
+- Group storage and the `transaction_group` schema/object (§3.1)
+- Inter-step dependencies (`depends_on`) and ordering enforcement
+  (§6)
+- Failure rules (`on_failure`, `on_earlier_failure`, `pause_and_ask`,
+  `abort_group`, `continue`, `mark_partial`) (§4)
+- Combined balance checks and the pre-execution check (§4.1)
+- New gateway enforcement and reason codes
+  (`group_paused_pre_execution`, `dependency_not_satisfied`,
+  `earlier_step_failed`) (§6.1)
+- Dependent-amount lifecycle (§5.3)
+- Group-level signing (§7)
+
+These remain design directions in this proposal. They are not
+implemented, and no contract, schema, fixture, test, backend, or
+frontend changes for them have been made. Member 1 will handle the
+parser, contract, and fixture changes in their own work.
 
 ---
 
