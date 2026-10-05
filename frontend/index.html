@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DCTA Frontend Prototype</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div class="phone-frame">
+
+  <!-- Header -->
+  <header class="app-header">
+    <h1>Transaction Drafts</h1>
+    <p class="subtitle">Fixture preview only · no live API · no signing or execution</p>
+  </header>
+
+  <!-- Page-wide preview banner -->
+  <div class="preview-banner">
+    This entire page is a <strong>fixture preview</strong>. The sample drafts
+    expired on 2026-10-03 and cannot be signed or executed. No draft is
+    constructed or mutated in the frontend.
+  </div>
+
+  <!-- Text input -->
+  <section class="input-section">
+    <label for="text-input" class="input-label">Your message</label>
+    <textarea id="text-input" rows="2" placeholder="Type a message…" disabled></textarea>
+    <button id="send-btn" class="btn btn-primary" disabled>Send</button>
+    <p class="hint" id="input-hint">
+      Text input is disabled because the parser API (<code>/api/message</code>)
+      is not implemented yet. Use the sample-scenario buttons below to view
+      fixture drafts.
+    </p>
+  </section>
+
+  <!-- Sample scenario buttons -->
+  <section class="scenarios">
+    <h2>Sample scenarios</h2>
+    <p class="hint">Each button loads a fixture draft for display. No draft is constructed or mutated in the frontend.</p>
+    <div class="scenario-buttons">
+      <button class="btn btn-scenario" data-scenario="clean_transfer">1. Clean Transfer</button>
+      <button class="btn btn-scenario" data-scenario="ambiguous_payee">2. Ambiguous Payee (clarify)</button>
+      <button class="btn btn-scenario" data-scenario="equity_purchase">3. Equity Purchase</button>
+      <button class="btn btn-scenario" data-scenario="over_limit">4. Over Limit (policy hold)</button>
+    </div>
+  </section>
+
+  <!-- Draft display area -->
+  <section id="draft-display" class="draft-display">
+    <p class="placeholder">Select a scenario above to display its draft.</p>
+  </section>
+
+  <!-- Footer -->
+  <footer class="app-footer">
+    <p class="footer-note">
+      WebAuthn signing and execution are <strong>disabled</strong> in this
+      fixture-only prototype. The frontend never builds or mutates a draft
+      (CONTEXT.md core rule, hard constraint 1).
+    </p>
+  </footer>
+
+</div>
+
+<script src="js/canonical.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
