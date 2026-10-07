@@ -5,6 +5,13 @@ This is NOT the real AI parser.  It handles a small number of fixed
 patterns with plain string matching so that Member 2 (frontend) and
 Member 3 (backend) can build against real draft objects now.
 
+The stub handles **one intent per call**.  If the transcript contains
+more than one intent (for example " then ", " and then ", or two
+separate amounts), it raises :class:`ParserCannotHandle` with a clear
+message asking the user to send one request at a time.  It must never
+return one item for a multi-intent sentence, because that would silently
+drop an intent (violating the ``len(items) == intents_detected`` rule).
+
 Patterns handled:
 
 * "Send fifty dollars to John Smith."
@@ -15,6 +22,10 @@ Patterns handled:
     → equity purchase draft (matches fixtures/drafts/equity_purchase.json shape)
 * Amount the stub cannot parse with confidence
     → ClarifyingQuestion for "amount" (never a draft with a guessed value)
+* Multi-intent sentence (more than one action verb, more than one
+  amount mention, or a sequencing/addition connector such as
+  " then ", " and then ", " also ", " plus ")
+    → raise ParserCannotHandle (multi-intent not supported)
 * Anything else
     → raise ParserCannotHandle
 
@@ -40,6 +51,53 @@ from backend.parser.interface import (
     ParseResult,
 )
 
+# ── Multi-intent detection ─────────────────────────────────────────────
+# The stub handles one intent per call.  _is_multi_intent checks three
+# signals; ANY one is sufficient to decline:
+#
+#   1. More than one action verb (send, transfer, pay, buy, sell,
+#      invest, move, top up).
+#   2. More than one amount mention — counting both digit amounts
+#      ($50, 50.00) and word amounts ("fifty dollars",
+#      "one thousand dollars").  Every occurrence of "dollar"/"dollars"
+#      or a "$" amount is one mention.
+#   3. A sequencing or addition connector: " then ", " and then ",
+#      " also ", " after that ", " afterwards ", " as well ", " plus ".
+#
+# It is better to refuse a valid single-intent sentence than to return
+# a partial draft for a multi-intent one.
+
+_MULTI_INTENT_PHRASES = (
+    " then ",
+    " and then ",
+    " also ",
+    " after that ",
+    " afterwards ",
+    " as well ",
+    " plus ",
+)
+
+# Action verbs that indicate a financial transaction.  Each occurrence
+# of any of these (as a whole word) is one potential intent.
+_ACTION_VERBS = (
+    "send",
+    "transfer",
+    "pay",
+    "buy",
+    "sell",
+    "invest",
+    "move",
+    "top up",
+)
+
+# Digit amounts: "$50.00", "$1000.00", or bare "50.00".
+_DIGIT_AMOUNT_RE = re.compile(r"(?:\$|\b)(\d+\.\d{2})\b", re.ASCII)
+
+# Word amounts: "fifty dollars", "one thousand dollars", "$50".
+# Count every occurrence of "dollar" or "dollars" as one amount mention.
+_DOLLAR_WORD_RE = re.compile(r"\bdollars?\b", re.IGNORECASE)
+_DOLLAR_SIGN_RE = re.compile(r"\$", re.ASCII)
+
 # ── Known amounts ──────────────────────────────────────────────────────
 # The stub recognises a small set of word-numbers and "$XX.XX" patterns.
 _AMOUNT_WORDS = {
@@ -48,6 +106,64 @@ _AMOUNT_WORDS = {
 }
 
 _DOLLAR_RE = re.compile(r"\$(\d+\.\d{2})", re.ASCII)
+
+
+def _count_action_verbs(lower: str) -> int:
+    """Count occurrences of action verbs (whole-word matches)."""
+    count = 0
+    for verb in _ACTION_VERBS:
+        count += len(re.findall(rf"\b{re.escape(verb)}\b", lower))
+    return count
+
+
+def _count_amount_mentions(lower: str) -> int:
+    """Count amount mentions: digit amounts + word amounts.
+
+    Digit amounts: "$50.00", "50.00".
+    Word amounts: every occurrence of "dollar"/"dollars" or a "$" sign.
+    """
+    # Each "$" amount is one mention.
+    dollar_sign_amounts = len(_DIGIT_AMOUNT_RE.findall(lower))
+
+    # Each "dollar"/"dollars" word is one mention (covers "fifty dollars",
+    # "one thousand dollars", etc.).
+    dollar_words = len(_DOLLAR_WORD_RE.findall(lower))
+
+    # A bare "$" not followed by digits (e.g. "fifty $") is rare but
+    # count it via _DOLLAR_SIGN_RE minus those already captured.
+    bare_dollar_signs = len(_DOLLAR_SIGN_RE.findall(lower))
+
+    # Take the larger of digit-amount count and bare-dollar-sign count
+    # to avoid double counting "$50" as both a sign and a digit amount.
+    digit_mentions = max(dollar_sign_amounts, bare_dollar_signs)
+
+    return digit_mentions + dollar_words
+
+
+def _is_multi_intent(transcript: str) -> bool:
+    """Return True if the transcript likely describes more than one intent.
+
+    Checks three signals; ANY one is sufficient:
+      1. More than one action verb.
+      2. More than one amount mention.
+      3. A sequencing or addition connector.
+    """
+    lower = transcript.lower()
+
+    # ── Signal 1: more than one action verb ─────────────────────────
+    if _count_action_verbs(lower) > 1:
+        return True
+
+    # ── Signal 2: more than one amount mention ──────────────────────
+    if _count_amount_mentions(lower) > 1:
+        return True
+
+    # ── Signal 3: sequencing / addition connector ───────────────────
+    for phrase in _MULTI_INTENT_PHRASES:
+        if phrase in lower:
+            return True
+
+    return False
 
 
 def _parse_amount(transcript: str) -> str | None:
@@ -73,6 +189,11 @@ def _fresh_id() -> str:
 
 def _fresh_nonce() -> str:
     return uuid.uuid4().hex
+
+
+def _fresh_question_id(field: str) -> str:
+    """Generate a short unique question id, e.g. 'q-amount-a1b2c3d4'."""
+    return f"q-{field}-{uuid.uuid4().hex[:8]}"
 
 
 def _fresh_timestamps() -> tuple[datetime, datetime]:
@@ -151,14 +272,36 @@ def _equity_purchase(transcript: str, amount_value: str) -> TransactionDraft:
     )
 
 
+def _clarifying_question(field: str, question: str) -> ClarifyingQuestion:
+    """Build a ClarifyingQuestion with a fresh question_id."""
+    return ClarifyingQuestion(
+        question_id=_fresh_question_id(field),
+        field=field,
+        question=question,
+    )
+
+
 def parse(transcript: str) -> ParseResult:
     """
-    Parse a user transcript into a draft or a clarifying question.
+    Parse a user transcript into a :class:`ParseResult`.
+
+    The stub handles one intent per call.  A multi-intent transcript
+    raises :class:`ParserCannotHandle` rather than silently dropping
+    one of the intents.
 
     See module docstring for the patterns handled.
     """
     if not transcript or not transcript.strip():
         raise ParserCannotHandle("empty transcript")
+
+    # ── Multi-intent guard ───────────────────────────────────────────
+    # The stub handles one intent only.  If the transcript describes
+    # more than one, decline so no intent is silently dropped.
+    if _is_multi_intent(transcript):
+        raise ParserCannotHandle(
+            "Multiple intents detected in the transcript. "
+            "Please send one request at a time."
+        )
 
     lower = transcript.lower().strip()
 
@@ -166,11 +309,16 @@ def parse(transcript: str) -> ParseResult:
     if any(kw in lower for kw in ("share", "stock", "buy")):
         amount = _parse_amount(transcript)
         if amount is None:
-            return ClarifyingQuestion(
-                field="amount",
-                question="How much would you like to invest?",
+            return ParseResult(
+                items=[_clarifying_question(
+                    "amount", "How much would you like to invest?"
+                )],
+                intents_detected=1,
             )
-        return _equity_purchase(transcript, amount)
+        return ParseResult(
+            items=[_equity_purchase(transcript, amount)],
+            intents_detected=1,
+        )
 
     # ── Transfer patterns ────────────────────────────────────────────
     if "send" in lower and ("dollar" in lower or "money" in lower):
@@ -178,18 +326,26 @@ def parse(transcript: str) -> ParseResult:
         if amount is None:
             # Per CONTRACT.md §2, amount cannot be in unresolved.
             # The parser must ask before producing any draft.
-            return ClarifyingQuestion(
-                field="amount",
-                question="How much would you like to send?",
+            return ParseResult(
+                items=[_clarifying_question(
+                    "amount", "How much would you like to send?"
+                )],
+                intents_detected=1,
             )
 
         # "John Smith" (full name) → clean transfer
         if "john smith" in lower:
-            return _clean_transfer(transcript)
+            return ParseResult(
+                items=[_clean_transfer(transcript)],
+                intents_detected=1,
+            )
 
         # "John" alone (ambiguous — two saved Johns)
         if "john" in lower and "john smith" not in lower:
-            return _ambiguous_payee(transcript)
+            return ParseResult(
+                items=[_ambiguous_payee(transcript)],
+                intents_detected=1,
+            )
 
     # ── Unrecognized ─────────────────────────────────────────────────
     raise ParserCannotHandle(

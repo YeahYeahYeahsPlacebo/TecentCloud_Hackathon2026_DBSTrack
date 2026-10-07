@@ -4,6 +4,10 @@ Tests for the throwaway stub parser (backend/parser/stub.py).
 Every draft the stub returns must validate against the JSON Schema and the
 Pydantic model.  Unrecognized transcripts must raise, and ambiguous amounts
 must return a ClarifyingQuestion — never a draft with a guessed number.
+
+The new ``parse()`` contract returns a ``ParseResult`` with ``items``
+(a list of drafts or clarifying questions) and ``intents_detected`` (an
+int).  ``len(items)`` must equal ``intents_detected`` at all times.
 """
 
 import json
@@ -20,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 from backend.models.draft import TransactionDraft  # noqa: E402
 from backend.parser.interface import (  # noqa: E402
     ClarifyingQuestion,
+    ParseResult,
     ParserCannotHandle,
 )
 from backend.parser.stub import parse  # noqa: E402
@@ -46,35 +51,58 @@ def _validate_pydantic(draft: TransactionDraft) -> None:
     TransactionDraft(**data)
 
 
+def assert_items_match_intents(result: ParseResult) -> None:
+    """Every parser test calls this after a successful parse().
+
+    Asserts ``len(result.items) == result.intents_detected``.
+    """
+    assert len(result.items) == result.intents_detected, (
+        f"len(items)={len(result.items)} but intents_detected="
+        f"{result.intents_detected} — an intent was silently dropped"
+    )
+
+
+def _single_item(result: ParseResult) -> object:
+    """Return the single item from a one-intent ParseResult."""
+    assert_items_match_intents(result)
+    assert len(result.items) == 1, (
+        f"expected 1 item, got {len(result.items)}"
+    )
+    return result.items[0]
+
+
 # ── Pattern 1: clean transfer ────────────────────────────────────────
 
 
 def test_clean_transfer_returns_draft():
     """'Send fifty dollars to John Smith.' → clean transfer draft."""
     result = parse("Send fifty dollars to John Smith.")
-    assert isinstance(result, TransactionDraft)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
 
-    assert result.intent_type.value == "transfer"
-    assert result.amount.value == "50.00"
-    assert result.amount.currency == "SGD"
-    assert result.source_account == "acct-001-2345"
-    assert result.unresolved == []
-    assert result.payee is not None
-    assert result.payee.id == "payee-001"
-    assert result.payee.display_name == "John Smith"
-    assert result.payee.masked_account == "****1234"
+    assert item.intent_type.value == "transfer"
+    assert item.amount.value == "50.00"
+    assert item.amount.currency == "SGD"
+    assert item.source_account == "acct-001-2345"
+    assert item.unresolved == []
+    assert item.payee is not None
+    assert item.payee.id == "payee-001"
+    assert item.payee.display_name == "John Smith"
+    assert item.payee.masked_account == "****1234"
 
 
 def test_clean_transfer_validates_against_schema():
     result = parse("Send fifty dollars to John Smith.")
-    assert isinstance(result, TransactionDraft)
-    _validate_schema(result)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
+    _validate_schema(item)
 
 
 def test_clean_transfer_validates_against_pydantic():
     result = parse("Send fifty dollars to John Smith.")
-    assert isinstance(result, TransactionDraft)
-    _validate_pydantic(result)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
+    _validate_pydantic(item)
 
 
 # ── Pattern 2: ambiguous payee ────────────────────────────────────────
@@ -83,37 +111,40 @@ def test_clean_transfer_validates_against_pydantic():
 def test_ambiguous_payee_returns_draft_with_unresolved():
     """'Send fifty dollars to John.' → ambiguous payee draft."""
     result = parse("Send fifty dollars to John.")
-    assert isinstance(result, TransactionDraft)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
 
-    assert result.intent_type.value == "transfer"
-    assert result.unresolved == ["payee"]
-    assert result.payee is None
-    assert result.payee_candidates is not None
-    assert len(result.payee_candidates) == 2
+    assert item.intent_type.value == "transfer"
+    assert item.unresolved == ["payee"]
+    assert item.payee is None
+    assert item.payee_candidates is not None
+    assert len(item.payee_candidates) == 2
 
-    ids = [c.id for c in result.payee_candidates]
+    ids = [c.id for c in item.payee_candidates]
     assert "payee-101" in ids
     assert "payee-102" in ids
 
-    names = [c.display_name for c in result.payee_candidates]
+    names = [c.display_name for c in item.payee_candidates]
     assert "John Doe" in names
     assert "John Smith" in names
 
-    masked = [c.masked_account for c in result.payee_candidates]
+    masked = [c.masked_account for c in item.payee_candidates]
     assert "****4521" in masked
     assert "****8892" in masked
 
 
 def test_ambiguous_payee_validates_against_schema():
     result = parse("Send fifty dollars to John.")
-    assert isinstance(result, TransactionDraft)
-    _validate_schema(result)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
+    _validate_schema(item)
 
 
 def test_ambiguous_payee_validates_against_pydantic():
     result = parse("Send fifty dollars to John.")
-    assert isinstance(result, TransactionDraft)
-    _validate_pydantic(result)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
+    _validate_pydantic(item)
 
 
 # ── Pattern 3: equity purchase ───────────────────────────────────────
@@ -122,33 +153,37 @@ def test_ambiguous_payee_validates_against_pydantic():
 def test_equity_purchase_returns_draft():
     """Anything mentioning shares/stock/buy → equity purchase draft."""
     result = parse("Buy one thousand dollars of DBS shares at market price.")
-    assert isinstance(result, TransactionDraft)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
 
-    assert result.intent_type.value == "equity_purchase"
-    assert result.source_account == "acct-001-2345"
-    assert result.ticker == "D05.SI"
-    assert result.order_type.value == "market"
-    assert result.unresolved == []
+    assert item.intent_type.value == "equity_purchase"
+    assert item.source_account == "acct-001-2345"
+    assert item.ticker == "D05.SI"
+    assert item.order_type.value == "market"
+    assert item.unresolved == []
 
 
 def test_equity_purchase_with_dollar_amount():
     """'$1000.00 of shares' → equity purchase with that amount."""
     result = parse("Buy $1000.00 of DBS shares.")
-    assert isinstance(result, TransactionDraft)
-    assert result.intent_type.value == "equity_purchase"
-    assert result.amount.value == "1000.00"
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
+    assert item.intent_type.value == "equity_purchase"
+    assert item.amount.value == "1000.00"
 
 
 def test_equity_purchase_validates_against_schema():
     result = parse("Buy one thousand dollars of DBS shares at market price.")
-    assert isinstance(result, TransactionDraft)
-    _validate_schema(result)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
+    _validate_schema(item)
 
 
 def test_equity_purchase_validates_against_pydantic():
     result = parse("Buy one thousand dollars of DBS shares at market price.")
-    assert isinstance(result, TransactionDraft)
-    _validate_pydantic(result)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
+    _validate_pydantic(item)
 
 
 # ── Pattern 4: ambiguous amount → ClarifyingQuestion ─────────────────
@@ -157,22 +192,26 @@ def test_equity_purchase_validates_against_pydantic():
 def test_ambiguous_amount_returns_clarifying_question():
     """An amount the stub cannot parse → ClarifyingQuestion, never a draft."""
     result = parse("Buy a lot of shares.")
-    assert isinstance(result, ClarifyingQuestion)
-    assert result.field == "amount"
-    assert result.question  # non-empty
+    item = _single_item(result)
+    assert isinstance(item, ClarifyingQuestion)
+    assert item.field == "amount"
+    assert item.question  # non-empty
+    assert item.question_id  # non-empty
 
 
 def test_ambiguous_amount_never_returns_draft():
-    """The result must be a ClarifyingQuestion, not a TransactionDraft."""
+    """The result item must be a ClarifyingQuestion, not a TransactionDraft."""
     result = parse("Buy a lot of shares.")
-    assert not isinstance(result, TransactionDraft)
+    item = _single_item(result)
+    assert not isinstance(item, TransactionDraft)
 
 
 def test_ambiguous_amount_for_transfer_returns_clarifying_question():
     """'Send some money to John Smith' → ClarifyingQuestion for amount."""
     result = parse("Send some money to John Smith.")
-    assert isinstance(result, ClarifyingQuestion)
-    assert result.field == "amount"
+    item = _single_item(result)
+    assert isinstance(item, ClarifyingQuestion)
+    assert item.field == "amount"
 
 
 # ── Pattern 5: unrecognized → raise ──────────────────────────────────
@@ -184,8 +223,8 @@ def test_unrecognized_raises():
         parse("What's the weather today?")
 
 
-def test_unrecognized_raises_not_draft():
-    """Ensure no draft is returned for unrecognized input."""
+def test_unrecognized_raises_not_result():
+    """Ensure no result is returned for unrecognized input."""
     try:
         result = parse("Hello world.")
     except ParserCannotHandle:
@@ -203,8 +242,10 @@ def test_empty_transcript_raises():
 
 def test_fresh_id_per_call():
     """Two calls with the same transcript must produce different ids."""
-    d1 = parse("Send fifty dollars to John Smith.")
-    d2 = parse("Send fifty dollars to John Smith.")
+    r1 = parse("Send fifty dollars to John Smith.")
+    r2 = parse("Send fifty dollars to John Smith.")
+    d1 = _single_item(r1)
+    d2 = _single_item(r2)
     assert isinstance(d1, TransactionDraft)
     assert isinstance(d2, TransactionDraft)
     assert d1.id != d2.id
@@ -214,33 +255,122 @@ def test_fresh_id_per_call():
 # ── Every draft from every pattern validates ─────────────────────────
 
 
-@pytest.mark.parametrize(
-    "transcript",
-    [
-        "Send fifty dollars to John Smith.",
-        "Send fifty dollars to John.",
-        "Buy one thousand dollars of DBS shares at market price.",
-        "Buy $50.00 of shares.",
-    ],
-)
+SUPPORTED_DRAFT_TRANSCRIPTS = [
+    "Send fifty dollars to John Smith.",
+    "Send fifty dollars to John.",
+    "Buy one thousand dollars of DBS shares at market price.",
+    "Buy $50.00 of shares.",
+]
+
+SUPPORTED_QUESTION_TRANSCRIPTS = [
+    "Buy a lot of shares.",
+    "Send some money to John Smith.",
+]
+
+ALL_SUPPORTED_TRANSCRIPTS = SUPPORTED_DRAFT_TRANSCRIPTS + SUPPORTED_QUESTION_TRANSCRIPTS
+
+
+@pytest.mark.parametrize("transcript", SUPPORTED_DRAFT_TRANSCRIPTS)
 def test_every_draft_validates_against_schema(transcript: str):
     result = parse(transcript)
-    assert isinstance(result, TransactionDraft), (
-        f"expected draft for {transcript!r}, got {type(result).__name__}"
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft), (
+        f"expected draft for {transcript!r}, got {type(item).__name__}"
     )
-    _validate_schema(result)
+    _validate_schema(item)
 
 
-@pytest.mark.parametrize(
-    "transcript",
-    [
-        "Send fifty dollars to John Smith.",
-        "Send fifty dollars to John.",
-        "Buy one thousand dollars of DBS shares at market price.",
-        "Buy $50.00 of shares.",
-    ],
-)
+@pytest.mark.parametrize("transcript", SUPPORTED_DRAFT_TRANSCRIPTS)
 def test_every_draft_validates_against_pydantic(transcript: str):
     result = parse(transcript)
-    assert isinstance(result, TransactionDraft)
-    _validate_pydantic(result)
+    item = _single_item(result)
+    assert isinstance(item, TransactionDraft)
+    _validate_pydantic(item)
+
+
+# ── ParseResult contract: len(items) == intents_detected ─────────────
+
+
+@pytest.mark.parametrize("transcript", ALL_SUPPORTED_TRANSCRIPTS)
+def test_items_match_intents_detected(transcript: str):
+    """The helper holds for every supported sentence."""
+    result = parse(transcript)
+    assert_items_match_intents(result)
+
+
+# ── ClarifyingQuestion has question_id and no draft ──────────────────
+
+
+@pytest.mark.parametrize("transcript", SUPPORTED_QUESTION_TRANSCRIPTS)
+def test_clarifying_question_has_question_id(transcript: str):
+    """A ClarifyingQuestion must have a non-empty question_id."""
+    result = parse(transcript)
+    item = _single_item(result)
+    assert isinstance(item, ClarifyingQuestion)
+    assert item.question_id
+    assert item.field
+    assert item.question
+
+
+@pytest.mark.parametrize("transcript", SUPPORTED_QUESTION_TRANSCRIPTS)
+def test_clarifying_question_has_no_draft(transcript: str):
+    """A question item never carries a draft."""
+    result = parse(transcript)
+    item = _single_item(result)
+    assert isinstance(item, ClarifyingQuestion)
+    assert not isinstance(item, TransactionDraft)
+
+
+def test_question_id_format():
+    """question_id should look like 'q-<field>-<8 hex>'."""
+    result = parse("Buy a lot of shares.")
+    item = _single_item(result)
+    assert isinstance(item, ClarifyingQuestion)
+    assert item.question_id.startswith("q-amount-")
+    # 8 hex chars after the last dash
+    suffix = item.question_id.rsplit("-", 1)[-1]
+    assert len(suffix) == 8
+    int(suffix, 16)  # valid hex
+
+
+# ── Multi-intent sentences must raise ─────────────────────────────────
+
+
+MULTI_INTENT_TRANSCRIPTS = [
+    # ── Two bug sentences that previously returned a partial draft ──
+    "Send fifty dollars to John Smith and buy one thousand dollars of DBS shares.",
+    "Send fifty dollars to John Smith, also pay my bill.",
+    # ── Original multi-intent sentences ──
+    "Send fifty dollars to John Smith then buy fifty dollars of shares.",
+    "Send fifty dollars to John Smith and then buy shares.",
+    "Send $50.00 to John Smith, then send $100.00 to Jane.",
+    "Buy $50.00 of shares and then buy $100.00 of shares.",
+    "Transfer one thousand dollars to Jane, then buy five hundred dollars of ES3 shares.",
+    # ── Three new: word amounts joined by "and" ──
+    "Send fifty dollars and send one thousand dollars to John Smith.",
+    # ── "also" connector ──
+    "Buy fifty dollars of shares, also sell one hundred dollars of stock.",
+    # ── Two verbs, no amounts ──
+    "Pay my bill and send money to Jane.",
+]
+
+
+@pytest.mark.parametrize("transcript", MULTI_INTENT_TRANSCRIPTS)
+def test_multi_intent_raises(transcript: str):
+    """A multi-intent sentence must raise, never partially draft."""
+    with pytest.raises(ParserCannotHandle) as exc_info:
+        parse(transcript)
+    assert "one request at a time" in str(exc_info.value).lower()
+
+
+@pytest.mark.parametrize("transcript", MULTI_INTENT_TRANSCRIPTS)
+def test_multi_intent_never_returns_result(transcript: str):
+    """A multi-intent sentence must not return a ParseResult at all."""
+    try:
+        result = parse(transcript)
+    except ParserCannotHandle:
+        return
+    pytest.fail(
+        f"expected ParserCannotHandle for {transcript!r}, "
+        f"got ParseResult with {len(result.items)} item(s)"
+    )

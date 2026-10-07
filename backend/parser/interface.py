@@ -1,9 +1,22 @@
 """
 Parser interface.
 
-The parser turns user text into either a :class:`TransactionDraft` or a
-:class:`ClarifyingQuestion`.  It never executes funds and never imports the
-ledger or gateway (enforced by ``tests/test_import_boundaries.py``).
+The parser turns user text into a :class:`ParseResult` — a list of
+items (each a :class:`TransactionDraft` or a :class:`ClarifyingQuestion`)
+plus a count of distinct intents detected.  It never executes funds and
+never imports the ledger or gateway (enforced by
+``tests/test_import_boundaries.py``).
+
+Contract:
+
+- ``len(result.items)`` **must equal** ``result.intents_detected``.
+  A parser that detects more intents than it returns items for has
+  silently dropped an intent.
+- A :class:`ClarifyingQuestion` item means **no draft exists yet** for
+  that intent.  It is used for every unresolved field *except* ``payee``.
+  Only ``payee`` may be unresolved inside an existing draft (see
+  CONTRACT.md §2).
+- A question item never carries a draft.
 
 Per CONTRACT.md §2, only ``payee`` may appear in ``unresolved`` while a
 draft exists.  If the parser cannot confidently resolve any *other*
@@ -15,7 +28,7 @@ so the user can supply the missing value first.
 
 from __future__ import annotations
 
-from typing import Union
+from typing import List, Union
 
 from pydantic import BaseModel, ConfigDict
 
@@ -30,31 +43,57 @@ class ClarifyingQuestion(BaseModel):
     Only used for fields *other than* ``payee`` — a payee ambiguity is
     expressed as a draft with ``"payee"`` in ``unresolved`` and
     ``payee_candidates`` populated (see CONTRACT.md §2).
+
+    A question item never carries a draft.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    question_id: str
     field: str
     question: str
 
 
-# The return type of ``parse``.
-ParseResult = Union[TransactionDraft, ClarifyingQuestion]
+# A single item in the result list: either a draft or a clarifying question.
+ParseItem = Union[TransactionDraft, ClarifyingQuestion]
+
+
+class ParseResult(BaseModel):
+    """
+    The return type of :func:`parse`.
+
+    Attributes:
+        items: A list whose elements are each a
+            :class:`TransactionDraft` or a :class:`ClarifyingQuestion`.
+        intents_detected: The number of distinct intents the parser found
+            in the transcript.
+
+    Rule: ``len(items)`` must equal ``intents_detected``.  A parser that
+    detects more intents than it returns items for has silently dropped
+    an intent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: List[ParseItem]
+    intents_detected: int
 
 
 class ParserCannotHandle(Exception):
     """
-    Raised when the stub parser does not recognise the input pattern.
+    Raised when the stub parser does not recognise the input pattern,
+    or when the transcript describes more than one transaction.
 
     A real (LLM) parser would attempt to parse anything, but the stub only
-    handles a small fixed set of sentences.  Raising here is better than
-    returning a malformed or guessed draft.
+    handles a small fixed set of single-intent sentences.  Raising here is
+    better than returning a malformed or guessed draft, and better than
+    silently dropping one of two detected intents.
     """
 
 
 def parse(transcript: str) -> ParseResult:
     """
-    Parse a user transcript into a draft or a clarifying question.
+    Parse a user transcript into a :class:`ParseResult`.
 
     Implementations must:
 
@@ -64,6 +103,10 @@ def parse(transcript: str) -> ParseResult:
       :class:`ClarifyingQuestion` for the field.
     * Return a draft that validates against ``contract/draft.schema.json``
       and ``backend/models/draft.py``.
+    * Ensure ``len(result.items) == result.intents_detected``.
+    * Decline a multi-intent transcript (raise
+      :class:`ParserCannotHandle`) rather than returning a partial result
+      that silently drops an intent.
 
     This function is the single entry point.  The stub implementation lives
     in :mod:`backend.parser.stub`; the real LLM parser will replace it later.
