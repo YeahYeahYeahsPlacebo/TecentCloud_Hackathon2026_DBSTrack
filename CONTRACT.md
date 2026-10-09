@@ -26,7 +26,8 @@ the user approved.
 The flow is:
 
 1. User speaks or types text.
-2. The parser (Member 1) produces a **draft**, and the server stores it.
+2. The parser (Member 1) returns a **list of drafts and questions**,
+   and the server stores each draft.
 3. The validator (Member 1) compares the transcript to the draft.
 4. The policy engine (Member 3) decides whether the draft may proceed.
 5. The frontend (Member 2) displays the draft and collects a WebAuthn
@@ -145,9 +146,26 @@ are **base64url without padding** (RFC 4648 §5).
 
 ### POST /api/message
 
-User text in. Returns the draft (which the server has stored), the
-validator verdict, and the policy decision. `unresolved` lives only
-inside `draft`.
+User text in. Returns a list of items — each item is either a `draft`
+(which the server has stored, with its validator verdict and policy
+decision attached) or a `question` (a clarifying question for an
+unresolved field). `unresolved` lives only inside `draft`.
+
+Rules:
+
+- `intents_detected` is the number of intents the parser found in the
+  transcript. `len(items)` **must equal** `intents_detected`. A parser
+  that detects more intents than it returns items for is a bug (an
+  intent was silently dropped), and the parser tests enforce this.
+- A `"question"` item means **no draft exists yet** for that intent. It
+  is used for every unresolved field **except `payee`**. Only `payee`
+  may be unresolved inside an existing draft (see §2). The `question_id`
+  is used by `/api/clarify` to correlate the answer with the original
+  transcript.
+- The `validator` and `policy` objects are attached per draft **by the
+  server**, not by the parser. The parser produces drafts and questions;
+  the server runs the validator and policy engine over each draft and
+  folds the results into the response.
 
 **Request:**
 
@@ -161,34 +179,40 @@ inside `draft`.
 
 ```json
 {
-  "draft": {
-    "id": "11111111-1111-1111-1111-111111111111",
-    "created_at": "2026-10-03T10:00:00Z",
-    "expires_at": "2026-10-03T10:05:00Z",
-    "nonce": "nonce-clean-transfer-001",
-    "intent_type": "transfer",
-    "source_account": "acct-001-2345",
-    "amount": {
-      "value": "50.00",
-      "currency": "SGD"
-    },
-    "confidence": 0.95,
-    "unresolved": [],
-    "transcript": "Send fifty dollars to John Smith.",
-    "payee": {
-      "id": "payee-001",
-      "display_name": "John Smith",
-      "masked_account": "****1234"
+  "intents_detected": 1,
+  "items": [
+    {
+      "kind": "draft",
+      "draft": {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-clean-transfer-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.95,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John Smith.",
+        "payee": {
+          "id": "payee-001",
+          "display_name": "John Smith",
+          "masked_account": "****1234"
+        }
+      },
+      "validator": {
+        "verdict": "pass",
+        "discrepancies": []
+      },
+      "policy": {
+        "decision": "allow",
+        "reason": null
+      }
     }
-  },
-  "validator": {
-    "verdict": "pass",
-    "discrepancies": []
-  },
-  "policy": {
-    "decision": "allow",
-    "reason": null
-  }
+  ]
 }
 ```
 
@@ -196,47 +220,71 @@ inside `draft`.
 
 ```json
 {
-  "draft": {
-    "id": "22222222-2222-2222-2222-222222222222",
-    "created_at": "2026-10-03T10:00:00Z",
-    "expires_at": "2026-10-03T10:05:00Z",
-    "nonce": "nonce-ambiguous-payee-001",
-    "intent_type": "transfer",
-    "source_account": "acct-001-2345",
-    "amount": {
-      "value": "50.00",
-      "currency": "SGD"
-    },
-    "confidence": 0.4,
-    "unresolved": ["payee"],
-    "transcript": "Send fifty dollars to John.",
-    "payee_candidates": [
-      {
-        "id": "payee-101",
-        "display_name": "John Doe",
-        "masked_account": "****4521"
+  "intents_detected": 1,
+  "items": [
+    {
+      "kind": "draft",
+      "draft": {
+        "id": "22222222-2222-2222-2222-222222222222",
+        "created_at": "2026-10-03T10:00:00Z",
+        "expires_at": "2026-10-03T10:05:00Z",
+        "nonce": "nonce-ambiguous-payee-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.4,
+        "unresolved": ["payee"],
+        "transcript": "Send fifty dollars to John.",
+        "payee_candidates": [
+          {
+            "id": "payee-101",
+            "display_name": "John Doe",
+            "masked_account": "****4521"
+          },
+          {
+            "id": "payee-102",
+            "display_name": "John Smith",
+            "masked_account": "****8892"
+          }
+        ]
       },
-      {
-        "id": "payee-102",
-        "display_name": "John Smith",
-        "masked_account": "****8892"
+      "validator": {
+        "verdict": "pass",
+        "discrepancies": []
+      },
+      "policy": {
+        "decision": "hold",
+        "reason": "unresolved_fields"
       }
-    ]
-  },
-  "validator": {
-    "verdict": "pass",
-    "discrepancies": []
-  },
-  "policy": {
-    "decision": "hold",
-    "reason": "unresolved_fields"
-  }
+    }
+  ]
+}
+```
+
+**Response (200, unresolved amount — question item):**
+
+```json
+{
+  "intents_detected": 1,
+  "items": [
+    {
+      "kind": "question",
+      "question_id": "q-amount-001",
+      "field": "amount",
+      "question": "How much would you like to send?"
+    }
+  ]
 }
 ```
 
 ### POST /api/clarify
 
-A field name plus the user's answer. Returns a new, updated draft.
+A field name plus the user's answer. Returns a response shaped
+exactly like `/api/message` — `intents_detected` and `items` — so the
+client has one response shape across both endpoints.
 
 Rules:
 
@@ -265,34 +313,40 @@ Rules:
 
 ```json
 {
-  "draft": {
-    "id": "77777777-7777-7777-7777-777777777777",
-    "created_at": "2026-10-03T10:00:30Z",
-    "expires_at": "2026-10-03T10:05:30Z",
-    "nonce": "nonce-ambiguous-payee-002",
-    "intent_type": "transfer",
-    "source_account": "acct-001-2345",
-    "amount": {
-      "value": "50.00",
-      "currency": "SGD"
-    },
-    "confidence": 0.9,
-    "unresolved": [],
-    "transcript": "Send fifty dollars to John.",
-    "payee": {
-      "id": "payee-102",
-      "display_name": "John Smith",
-      "masked_account": "****8892"
+  "intents_detected": 1,
+  "items": [
+    {
+      "kind": "draft",
+      "draft": {
+        "id": "77777777-7777-7777-7777-777777777777",
+        "created_at": "2026-10-03T10:00:30Z",
+        "expires_at": "2026-10-03T10:05:30Z",
+        "nonce": "nonce-ambiguous-payee-002",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "50.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.9,
+        "unresolved": [],
+        "transcript": "Send fifty dollars to John.",
+        "payee": {
+          "id": "payee-102",
+          "display_name": "John Smith",
+          "masked_account": "****8892"
+        }
+      },
+      "validator": {
+        "verdict": "pass",
+        "discrepancies": []
+      },
+      "policy": {
+        "decision": "allow",
+        "reason": null
+      }
     }
-  },
-  "validator": {
-    "verdict": "pass",
-    "discrepancies": []
-  },
-  "policy": {
-    "decision": "allow",
-    "reason": null
-  }
+  ]
 }
 ```
 
@@ -303,6 +357,91 @@ Rules:
   "result": "rejected",
   "reason_code": "invalid_clarification_answer",
   "message": "answer 'payee-999' is not one of the offered payee_candidates."
+}
+```
+
+#### Second form: answering a question item (proposed, needs team agreement)
+
+> **Note:** The question-answer form below is **proposed and needs team
+> agreement** before implementation. The existing payee form above is
+> unchanged and remains the only committed form.
+
+When the server returns a `"question"` item from `/api/message`, the
+client answers it here. The request carries the `question_id` (from
+the question item) and the user's `answer`. The server re-parses the
+original transcript with the answer folded in, and returns a
+response shaped exactly like `/api/message`.
+
+Rules (proposed):
+
+- `question_id` must match a question the server issued from a prior
+  `/api/message` call. An unknown or already-used id is rejected with
+  `invalid_clarification_answer` (see §5).
+- A `question_id` is **single-use**: once the server has accepted an
+  answer for it, it cannot be reused. It **expires with the draft
+  window** (the 5-minute `expires_at` of the draft the question was
+  derived from).
+- The `answer` is **free text** and therefore **data, never
+  instructions** (CONTEXT.md constraint 5). The server isolates it in
+  a delimited block before passing it to the parser or validator.
+- The server stores the **original transcript and the answer
+  separately** and records both in the audit log.
+- The validator receives **both** the original transcript and the
+  answer — not a merged sentence — and compares the draft against the
+  combination.
+- The server re-parses the original transcript together with the
+  answer. The response has the same shape as `/api/message` —
+  `intents_detected` and `items` — so the client can treat it
+  uniformly. A subsequent question item may appear if a different
+  field is now unresolved.
+
+**Request (proposed):**
+
+```json
+{
+  "question_id": "q-amount-001",
+  "answer": "one thousand dollars"
+}
+```
+
+**Response (200, proposed):** — same shape as `/api/message`
+
+```json
+{
+  "intents_detected": 1,
+  "items": [
+    {
+      "kind": "draft",
+      "draft": {
+        "id": "44444444-4444-4444-4444-444444444444",
+        "created_at": "2026-10-03T12:00:00Z",
+        "expires_at": "2026-10-03T12:05:00Z",
+        "nonce": "nonce-multi-step-001",
+        "intent_type": "transfer",
+        "source_account": "acct-001-2345",
+        "amount": {
+          "value": "1000.00",
+          "currency": "SGD"
+        },
+        "confidence": 0.88,
+        "unresolved": [],
+        "transcript": "Transfer one thousand dollars to Jane.",
+        "payee": {
+          "id": "payee-002",
+          "display_name": "Jane Tan",
+          "masked_account": "****5678"
+        }
+      },
+      "validator": {
+        "verdict": "pass",
+        "discrepancies": []
+      },
+      "policy": {
+        "decision": "allow",
+        "reason": null
+      }
+    }
+  ]
 }
 ```
 
@@ -512,7 +651,7 @@ developer log, not necessarily for the user.
 | `validator_frozen` | The validator returned a verdict of `frozen` — the transcript does not match the draft. |
 | `step_up_required` | Additional authentication (e.g. biometric or 2FA) is required for this transaction. |
 | `schema_invalid` | The draft does not validate against `contract/draft.schema.json`. |
-| `invalid_clarification_answer` | `/api/clarify` was called with an `answer` that is not the `id` of one of the stored draft's `payee_candidates`, or with a `field` that is not in its `unresolved` list. |
+| `invalid_clarification_answer` | `/api/clarify` was called with an `answer` that is not the `id` of one of the stored draft's `payee_candidates`, with a `field` that is not in its `unresolved` list, or (in the proposed question form) with a `question_id` that is unknown or already used. |
 
 ---
 
@@ -554,6 +693,9 @@ Each member must be able to demonstrate the following:
 - `/api/clarify` rejects an answer that was not an offered candidate.
 - The validator is read-only and has no tools.
 - The validator runs on a different model from the parser.
+- Every parser test asserts `len(items) == intents_detected`.
+- A question item never contains a draft.
+- A multi-intent request is declined, never partially drafted.
 
 ### Member 2 (frontend)
 
@@ -563,12 +705,18 @@ Each member must be able to demonstrate the following:
   against the issued challenge, and refuses to sign on mismatch.
 - The frontend sends a draft id plus a WebAuthn assertion, never a draft body.
 - The frontend never constructs a draft locally.
+- The frontend renders both item kinds (`"draft"` and `"question"`)
+  from `/api/message` and `/api/clarify` responses.
+- After any clarification, the frontend uses the **new draft id** from
+  the response, not the old one.
 - The canonical JavaScript implementation
   (`frontend/js/canonical.js`) passes all vectors in
   `contract/test_vectors.json`.
 
 ### Member 3 (backend services)
 
+- `/api/message` calls `parse()` and attaches `validator` and `policy`
+  to draft items only — never to question items.
 - `/api/execute` loads its own stored draft and never executes a
   client-supplied body; a request carrying one is rejected
   (`malformed_request`) and the ledger is untouched.
@@ -610,13 +758,25 @@ team, not a silent assumption:
    intended policy, or just a fixture convention? The policy engine
    needs a concrete number.
 
-4. **`multi_step.json` semantics.** The transcript describes two
-   steps (transfer, then buy shares with half), but the fixture
-   represents only the first step (the transfer). How are multi-step
-   drafts modelled — as a sequence of separate drafts, or as a single
-   draft with sub-steps? The schema does not currently support
-   sub-steps. Until decided, note that this fixture drops the second
-   step with an empty `unresolved`, which constraint 6 forbids.
+4. ~~**`multi_step.json` semantics.**~~ **Resolved:** multi-step
+   transactions are modelled as **separate drafts plus a group** (not
+   sub-steps within a single draft). The parser owns the coverage
+   guarantee: `len(items)` in `/api/message` must equal
+   `intents_detected` so no intent is silently dropped (see §4,
+   `/api/message` rules). The validator stays **per-draft** — each
+   draft's transcript is compared independently. Drafts and questions
+   are returned **inline** in the `/api/message` `items` array. The
+   group model — `depends_on`, failure policies, and a server-side
+   balance/limit check — is **deferred to phase 5**. Until phase 5, a
+   request describing more than one transaction is **declined** with a
+   message asking the user to send one request at a time, and nothing
+   is drafted. Reason: executing dependent steps independently, with
+   nothing enforcing order, is the risk raised in the multi-intent
+   proposal. The exact response for a declined request is an open
+   decision (suggest 422 with `reason_code` `"multi_intent_unsupported"`);
+   it is not yet added to the reason code table. Until then,
+   `multi_step.json` represents a single transfer whose transcript
+   matches the draft exactly.
 
 5. ~~**`confidence` exclusion from the hash.**~~ **Moved** to §9
    (Known limitations).
@@ -645,7 +805,11 @@ Deliberately not fixed in this pass. Each is a decision, not an oversight.
 - **Equity: limit orders.** `order_type: "limit"` has no limit-price field.
 - **Equity: fractional shares.** `quantity` uses the money pattern, so shares are always written with exactly two decimals (`"10.00"`).
 - **Unknown or single-match payee.** `"payee"` in `unresolved` requires at least 2 candidates, so a payee with 0 or 1 matches cannot be expressed as a draft yet.
-- **Unresolved required fields.** A required field listed in `unresolved` (e.g. `amount`) must still carry a schema-valid placeholder value.
+- **Unresolved required fields.** By the rule in §2, only `payee` may
+  appear in `unresolved` while a draft exists, but the schema and
+  model still accept other values (e.g. `amount`). The rule is
+  enforced by the parser, not yet by the schema. Tightening the
+  `unresolved` enum to `payee` only is a possible follow-up.
 - **`confidence` trust boundary.** It is excluded from the hash, so a client copy can be altered freely. Policy and step-up must read only the server-stored value. This is documented, not tested.
 - **`confidence` coercion.** Pydantic accepts `true` and `"0.5"`, which the schema rejects.
 - **`id` format.** Pydantic does not check that `id` is a UUID. The schema's `format: uuid` is only enforced when a format checker is enabled, and the tests don't enable one.
@@ -660,3 +824,16 @@ Deliberately not fixed in this pass. Each is a decision, not an oversight.
 - **Stubbed crypto in tests.** `tests/test_execute_binding.py` stubs ECDSA verification. Real WebAuthn verification is untested until the gateway exists.
 - **Not yet specified.** WebAuthn `signCount` / clone detection, KYC, and binding validator and policy verdicts to the draft hash in storage.
 - **Zero amounts.** `"0.00"` passes the money pattern; policy must reject it.
+- **Multi-step group model (deferred to phase 5).** Multi-step
+  transactions produce separate drafts returned inline in
+  `/api/message` `items` (see §8 open question 4). The group model —
+  `depends_on` between drafts, failure policies, and a server-side
+  balance/limit check — is **deferred to phase 5**. Until phase 5, a
+  request describing more than one transaction is declined with a
+  message asking the user to send one request at a time, and nothing
+  is drafted. Reason: executing dependent steps independently, with
+  nothing enforcing order, is the risk raised in the multi-intent
+  proposal. The exact response for a declined request is an open
+  decision (suggest 422 with `reason_code`
+  `"multi_intent_unsupported"`); it is not yet added to the reason
+  code table.
