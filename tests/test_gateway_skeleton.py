@@ -6,8 +6,10 @@ documented. CONTRACT.md §4 fixes the order and requires that every rejection
 carry exactly one reason code — the code of the first check that failed. If
 someone reorders CHECKS, these tests fail.
 
-ES256 is not implemented, so `verify_ecdsa` is injected as a stub here. Every
-other check runs for real.
+ES256 is real (backend/gateway/webauthn.verify_es256) and is asserted end to
+end at the bottom of this file. Most checks here still inject a stub
+`verify_ecdsa` so they do not depend on cryptography; every other check runs
+for real.
 """
 
 import copy
@@ -32,9 +34,13 @@ from backend.gateway.execute import (  # noqa: E402
     InMemoryLedger,
     PolicyDecision,
     ExecuteGateway,
+    b64url_decode,
     b64url_encode,
 )
+from backend.gateway.webauthn import der_to_raw_signature, verify_es256  # noqa: E402
 from backend.models.draft import TransactionDraft  # noqa: E402
+from cryptography.hazmat.primitives import hashes  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 
 FIXTURES_DIR = ROOT / "fixtures" / "drafts"
 RP_ID = "localhost"
@@ -292,20 +298,60 @@ def test_step_12_block_is_policy_blocked_and_hold_is_step_up_required():
     assert held.ledger.entries == []
 
 
-# ── ES256 is genuinely not implemented ────────────────────────────────
+# ── ES256 is real, not a stub ─────────────────────────────────────────
 
 
-def test_default_verify_ecdsa_raises_not_implemented():
-    """Guard against anyone assuming the skeleton already verifies signatures."""
+def _signed_bytes(assertion: dict) -> bytes:
+    """authData ‖ SHA256(client_data_json) — exactly what the gateway verifies."""
+    auth_data = b64url_decode(assertion["authenticator_data"])
+    client_data_raw = b64url_decode(assertion["client_data_json"])
+    return auth_data + hashlib.sha256(client_data_raw).digest()
+
+
+def _sign_raw(private_key, signed: bytes) -> bytes:
+    """Produce the raw r ‖ s signature a browser would send."""
+    return der_to_raw_signature(private_key.sign(signed, ec.ECDSA(hashes.SHA256())))
+
+
+def test_real_es256_signature_verifies_end_to_end():
+    """The default verify_ecdsa is real ES256, not a placeholder."""
     clean = load_draft("clean_transfer.json")
-    gw = ExecuteGateway(
-        draft_store={clean.id: clean},
-        credentials={CREDENTIAL_ID: "stub-public-key"},
-        verdicts={draft_hash(dump(clean)): "pass"},
-        clock=lambda: clean.created_at + timedelta(minutes=1),
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    assertion = make_assertion(challenge_for(clean), signature=b"placeholder")
+    assertion["signature"] = b64url_encode(_sign_raw(private_key, _signed_bytes(assertion)))
+
+    gw = build(credentials={CREDENTIAL_ID: private_key.public_key()}, verify=verify_es256)
+    result = gw.execute(request_for(clean.id, assertion))
+    assert result["result"] == "executed", result
+
+
+def test_real_es256_rejects_a_signature_over_the_wrong_bytes():
+    """Signing authenticator_data alone must not verify: the gateway signs the
+    concatenation with SHA256(client_data_json), so a signature over only half
+    of it proves nothing about the transaction the user was shown."""
+    clean = load_draft("clean_transfer.json")
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    assertion = make_assertion(challenge_for(clean), signature=b"placeholder")
+    auth_data = b64url_decode(assertion["authenticator_data"])
+    assertion["signature"] = b64url_encode(_sign_raw(private_key, auth_data))
+
+    gw = build(credentials={CREDENTIAL_ID: private_key.public_key()}, verify=verify_es256)
+    assert only_code(gw.execute(request_for(clean.id, assertion))) == R.SIGNATURE_INVALID
+
+
+def test_real_es256_rejects_a_signature_from_an_unregistered_key():
+    """A valid signature from some other key must not verify."""
+    clean = load_draft("clean_transfer.json")
+    assertion = make_assertion(challenge_for(clean), signature=b"placeholder")
+    assertion["signature"] = b64url_encode(
+        _sign_raw(ec.generate_private_key(ec.SECP256R1()), _signed_bytes(assertion))
     )
-    with pytest.raises(NotImplementedError, match="ES256"):
-        gw.execute(request_for(clean.id, make_assertion(challenge_for(clean))))
+
+    gw = build(
+        credentials={CREDENTIAL_ID: ec.generate_private_key(ec.SECP256R1()).public_key()},
+        verify=verify_es256,
+    )
+    assert only_code(gw.execute(request_for(clean.id, assertion))) == R.SIGNATURE_INVALID
 
 
 # ── Happy path and the trust boundary ─────────────────────────────────

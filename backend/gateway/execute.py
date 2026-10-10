@@ -10,15 +10,15 @@ copy, and executes *that* copy. It never reads a draft body out of the request:
 check 1 refuses any body carrying one. See CONTRACT.md §4 "POST /api/execute"
 and §2 "Frontend never builds a draft".
 
-**Not implemented:** ES256 / WebAuthn signature verification. It is injected
-as ``verify_ecdsa`` and defaults to raising ``NotImplementedError``. Everything
-that is pure deterministic logic — request shape, draft state, base64url
+ES256 verification is real (:func:`backend.gateway.webauthn.verify_es256`) and
+is the default. It stays injectable so tests can use a fixed key pair without
+doing cryptography. Everything else — request shape, draft state, base64url
 framing, the challenge binding, idempotency, verdict and policy lookups — is
-implemented.
+pure deterministic logic.
 
-**Not wired yet:** ``backend/ledger`` and ``backend/audit``. ``ledger`` uses a
-placeholder sink; ``audit`` is an optional callable that is invoked once the
-audit module lands.
+``backend/ledger`` is wired: append-only, ``InMemoryLedger`` by default, swap
+in ``FileLedger`` when the result must survive a restart. ``backend/audit`` is
+an optional callable invoked once per outcome.
 """
 
 from __future__ import annotations
@@ -39,6 +39,8 @@ from jsonschema import Draft202012Validator
 from backend.canonical import canonical_bytes, draft_hash
 from backend.gateway import reason_codes as R
 from backend.gateway.errors import Rejection, rejected
+from backend.gateway.webauthn import verify_es256
+from backend.ledger import InMemoryLedger, Ledger
 from backend.models.draft import TransactionDraft
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,43 +75,12 @@ class DraftStore(Protocol):
     def get(self, draft_id: str) -> Optional[Any]: ...
 
 
-class Ledger(Protocol):
-    """Write side. Only the gateway posts to it."""
-
-    def post(self, draft: dict, *, idempotency_key: str) -> str: ...
-
-
-class InMemoryLedger:
-    """Placeholder until backend/ledger exists. Append-only, no deletes."""
-
-    def __init__(self) -> None:
-        self.entries: list[dict] = []
-
-    def post(self, draft: dict, *, idempotency_key: str) -> str:
-        transaction_id = f"tx-{len(self.entries) + 1:06d}"
-        self.entries.append(
-            {
-                "transaction_id": transaction_id,
-                "idempotency_key": idempotency_key,
-                "draft": draft,
-            }
-        )
-        return transaction_id
-
-
 @dataclass(frozen=True)
 class PolicyDecision:
     """What the policy engine decided. Pure deterministic input, no LLM."""
 
     decision: str
     reason: Optional[str] = None
-
-
-def _unimplemented_ecdsa(public_key: Any, signed: bytes, signature: bytes) -> bool:
-    raise NotImplementedError(
-        "ES256 (WebAuthn) verification is not implemented. "
-        "Inject a verify_ecdsa callable into ExecuteGateway."
-    )
 
 
 # ── Small helpers ─────────────────────────────────────────────────────
@@ -434,7 +405,7 @@ class ExecuteGateway:
         *,
         draft_store: Any,
         credentials: Optional[Mapping[str, Any]] = None,
-        verify_ecdsa: Callable[[Any, bytes, bytes], bool] = _unimplemented_ecdsa,
+        verify_ecdsa: Callable[[Any, bytes, bytes], bool] = verify_es256,
         idempotency: Optional[MutableMapping[str, tuple[str, dict]]] = None,
         verdicts: Optional[Mapping[str, str]] = None,
         policy: Optional[Callable[[dict, str], PolicyDecision]] = None,
@@ -447,7 +418,11 @@ class ExecuteGateway:
         # A Mapping is used as-is, by reference: a dict store stays live, so a
         # draft added after construction is still visible to the gateway.
         self.draft_store = draft_store
-        self.credentials = dict(credentials or {})
+        # By reference, so a credential registered after construction is
+        # usable. (Copying here silently broke registration in the API layer.)
+        self.credentials: MutableMapping[str, Any] = (
+            credentials if credentials is not None else {}
+        )
         self.verify_ecdsa = verify_ecdsa
         self.idempotency: MutableMapping[str, tuple[str, dict]] = (
             idempotency if idempotency is not None else {}

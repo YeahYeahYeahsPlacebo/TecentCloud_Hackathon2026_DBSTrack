@@ -39,3 +39,12 @@ class Rejection:
 def rejected(reason_code: str, message: str = "") -> Rejection:
     """Shorthand for constructing a Rejection."""
     return Rejection(reason_code=reason_code, message=message)
+
+
+def rejection_response(reason_code: str, message: str = "") -> dict:
+    """The wire shape, for endpoints that return a response body directly.
+
+    Endpoint methods answer with a plain dict — a 200 payload or a 422
+    rejection — so the HTTP layer only has to pick the status code.
+    """
+    return rejected(reason_code, message).to_response()
