@@ -36,9 +36,10 @@ from typing import Any, Callable, Mapping, MutableMapping, NamedTuple, Optional,
 import jsonschema
 from jsonschema import Draft202012Validator
 
+from backend.bank import BankError
 from backend.canonical import canonical_bytes, draft_hash
 from backend.gateway import reason_codes as R
-from backend.gateway.errors import Rejection, rejected
+from backend.gateway.errors import Rejection, rejected, rejection_response
 from backend.gateway.webauthn import verify_es256
 from backend.ledger import InMemoryLedger, Ledger
 from backend.models.draft import TransactionDraft
@@ -100,6 +101,33 @@ def b64url_decode(value: str) -> bytes:
 @lru_cache(maxsize=1)
 def _load_schema() -> dict:
     return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _transfer_spec(draft: Mapping[str, Any]) -> Optional[dict]:
+    """The arguments for ``Bank.transfer``, or None if the draft names no
+    complete transfer (unresolved payee, equity intent, missing amount).
+
+    Returns None rather than raising: a draft the bank cannot service is not a
+    gateway error, it is one the earlier checks already dealt with.
+    """
+    payee = draft.get("payee")
+    if not isinstance(payee, Mapping):
+        return None
+    destination = payee.get("id")
+    source = draft.get("source_account")
+    amount = draft.get("amount")
+    if not isinstance(amount, Mapping):
+        return None
+    value = amount.get("value")
+    currency = amount.get("currency")
+    if not source or not destination or value is None or not currency:
+        return None
+    return {
+        "source": source,
+        "destination": destination,
+        "amount": str(value),
+        "currency": currency,
+    }
 
 
 # ── Context threaded through the checks ───────────────────────────────
@@ -414,6 +442,7 @@ class ExecuteGateway:
         clock: Optional[Callable[[], datetime]] = None,
         rp_id: str = "localhost",
         origin: str = "http://localhost:8000",
+        bank: Optional[Any] = None,
     ) -> None:
         # A Mapping is used as-is, by reference: a dict store stays live, so a
         # draft added after construction is still visible to the gateway.
@@ -436,6 +465,9 @@ class ExecuteGateway:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.rp_id = rp_id
         self.origin = origin
+        # Optional mock bank. None means "no money moves" — every check still
+        # runs, the ledger still records, but no balance changes.
+        self.bank = bank
 
     def execute(self, request: dict) -> dict:
         """Run every check in order. Return the first rejection, or the result."""
@@ -452,9 +484,28 @@ class ExecuteGateway:
         return self._commit(ctx)
 
     def _commit(self, ctx: ExecuteContext) -> dict:
-        """All twelve checks passed. Post the stored draft and record the result."""
+        """All twelve checks passed. Move the money, then record the result.
+
+        Order matters: the bank moves the money *before* the ledger writes the
+        row. A transaction that is recorded but never moved is a lie the audit
+        log cannot detect; a transfer that moved but was never recorded is at
+        least recoverable from the accounts.
+        """
         assert ctx.draft is not None and ctx.draft_dict is not None
         key = ctx.request["idempotency_key"]
+
+        # Policy already blocked an unaffordable draft before signing. This
+        # second check covers the gap between then and now: the balance can
+        # move, so the transfer itself can still fail. When it does, nothing
+        # is recorded — no ledger row, no audit entry, no money moved.
+        if self.bank is not None:
+            spec = _transfer_spec(ctx.draft_dict)
+            if spec is not None:
+                try:
+                    self.bank.transfer(**spec)
+                except BankError as exc:
+                    return rejection_response(R.POLICY_BLOCKED, str(exc))
+
         transaction_id = self.ledger.post(ctx.draft_dict, idempotency_key=key)
         result = {
             "result": "executed",

@@ -50,12 +50,14 @@ class CredentialService:
         rp_id: str = "localhost",
         audit: Optional[Any] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        policy: Optional[Callable[[dict, str], Any]] = None,
     ) -> None:
         self.store = store
         self.credentials = credentials
         self.rp_id = rp_id
         self.audit = audit
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.policy = policy
 
     # ── POST /api/webauthn/challenge ──────────────────────────────────
 
@@ -83,6 +85,18 @@ class CredentialService:
             return rejection_response(
                 R.EXPIRED, f"draft expired at {draft.expires_at.isoformat()}"
             )
+
+        # Do not issue a challenge for a draft that policy has already
+        # blocked. A challenge is the server saying "I am willing to let you
+        # sign this"; issuing one for a draft step 12 would reject only spends
+        # the user's biometric on something that cannot succeed.
+        if self.policy is not None:
+            dumped = dump(draft)
+            decision = self.policy(dumped, draft_hash(dumped))
+            if getattr(decision, "decision", None) == "block":
+                return rejection_response(
+                    R.POLICY_BLOCKED, getattr(decision, "reason", "blocked by policy")
+                )
 
         digest = draft_hash(dump(draft))
         return {

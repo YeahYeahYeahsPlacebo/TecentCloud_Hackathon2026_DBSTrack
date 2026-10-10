@@ -27,10 +27,16 @@ from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 from backend.audit import AuditLog
 from backend.gateway.credential import CredentialService
+from backend.bank import seed_bank
 from backend.gateway.execute import ExecuteGateway
 from backend.gateway.message import MessageService
 from backend.ledger import InMemoryLedger
 from backend.policy import Limits, PolicyEngine
+
+
+_UNSET = object()
+"""Sentinel so ``bank=None`` ("no money moves") differs from omitting it
+("seed the default accounts")."""
 
 
 class GatewayAPI:
@@ -51,7 +57,13 @@ class GatewayAPI:
         known_payees: Any = (),
         rp_id: str = "localhost",
         origin: str = "http://localhost:8000",
+        bank: Any = _UNSET,
     ) -> None:
+        # Mock bank. Seeded by default so a fresh server has known balances.
+        # Pass your own Bank to control balances, or bank=None to run with no
+        # money moving at all. None and "not passed" mean different things,
+        # hence the sentinel rather than a plain default.
+        self.bank = seed_bank() if bank is _UNSET else bank
         self.store: MutableMapping[str, Any] = draft_store if draft_store is not None else {}
         self.credentials: MutableMapping[str, Any] = (
             credentials if credentials is not None else {}
@@ -61,7 +73,7 @@ class GatewayAPI:
         self.ledger = ledger if ledger is not None else InMemoryLedger()
         self.clock = clock
         self.known_payees = set(known_payees)
-        self.policy = policy or PolicyEngine(limits or Limits())
+        self.policy = policy or PolicyEngine(limits or Limits(), bank=self.bank)
 
         self.messages = MessageService(
             parser=parser,
@@ -80,6 +92,7 @@ class GatewayAPI:
             rp_id=rp_id,
             audit=self.audit,
             clock=clock,
+            policy=self._policy_call,
         )
         self.executor = ExecuteGateway(
             draft_store=self.store,
@@ -90,6 +103,7 @@ class GatewayAPI:
             clock=clock,
             rp_id=rp_id,
             origin=origin,
+            bank=self.bank,
         )
 
     def _known(self) -> set:
@@ -103,7 +117,11 @@ class GatewayAPI:
 
     def _policy_call(self, draft: Mapping[str, Any], digest: Optional[str]) -> Any:
         return self.policy.evaluate(
-            draft, digest, posted=self.ledger.entries, known_payees=self._known()
+            draft,
+            digest,
+            posted=self.ledger.entries,
+            known_payees=self._known(),
+            bank=self.bank,
         )
 
     # ── POST /api/message ─────────────────────────────────────────────

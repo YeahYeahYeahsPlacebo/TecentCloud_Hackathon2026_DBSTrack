@@ -184,11 +184,53 @@ def rule_new_payee_step_up(
     return None
 
 
+def rule_sufficient_funds(
+    draft: Mapping[str, Any], ctx: "PolicyInput"
+) -> Optional[PolicyDecision]:
+    """The account must be able to cover the amount.
+
+    Checked here — in policy, before signing — rather than only at transfer
+    time, so a user is never asked to sign a draft the bank would refuse.
+    Produces ``block``, which the gateway maps to ``policy_blocked``: no new
+    reason code, so the contract table stays intact.
+
+    Without a bank injected this rule stays silent. That is deliberate: the
+    policy engine is still usable standalone (tests, fixtures) with no mock
+    bank wired in.
+    """
+    if ctx.bank is None:
+        return None
+    payee = draft.get("payee")
+    if not isinstance(payee, Mapping):
+        return None  # unresolved payee: rule_unresolved already holds it
+    destination = payee.get("id")
+    source = draft.get("source_account")
+    if not source or not destination:
+        return None
+    amount, currency = _draft_amount(draft)
+    if ctx.bank.can_transfer(
+        source=source, destination=destination, amount=amount, currency=currency
+    ):
+        return None
+    try:
+        available = ctx.bank.balance(source)
+    except Exception:  # noqa: BLE001 - unknown account is still "cannot pay"
+        available = None
+    if available is None:
+        return PolicyDecision(BLOCK, f"source account {source!r} is unknown to the bank")
+    return PolicyDecision(
+        BLOCK,
+        f"insufficient funds: {source} has {available} {currency}, "
+        f"cannot send {amount}",
+    )
+
+
 RULES = (
     rule_unresolved,
     rule_per_transaction_limit,
     rule_daily_velocity,
     rule_new_payee_step_up,
+    rule_sufficient_funds,
 )
 
 
@@ -203,6 +245,9 @@ class PolicyInput:
     posted: tuple[Mapping[str, Any], ...] = ()
     known_payees: frozenset = frozenset()
     now: Optional[datetime] = None
+    # Optional mock bank. When present, the balance rule runs; when absent it
+    # is silent, so the engine still works with no bank wired in.
+    bank: Optional[Any] = None
 
     @property
     def at(self) -> datetime:
@@ -218,10 +263,12 @@ class PolicyEngine:
         *,
         rules: Iterable[Any] = RULES,
         clock: Optional[Any] = None,
+        bank: Optional[Any] = None,
     ) -> None:
         self.limits = limits
         self.rules = tuple(rules)
         self.clock = clock
+        self.bank = bank
 
     def evaluate(
         self,
@@ -230,6 +277,7 @@ class PolicyEngine:
         *,
         posted: Iterable[Mapping[str, Any]] = (),
         known_payees: Iterable[str] = (),
+        bank: Optional[Any] = None,
     ) -> PolicyDecision:
         """``digest`` is accepted for symmetry with the gateway's call shape;
         policy never keys off the hash, only off the draft's contents."""
@@ -239,6 +287,7 @@ class PolicyEngine:
             posted=posted,
             known_payees=frozenset(known_payees) | _payee_ids(posted),
             now=self.clock() if self.clock is not None else None,
+            bank=bank if bank is not None else self.bank,
         )
         return self.evaluate_with(draft, ctx)
 
