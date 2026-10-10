@@ -62,31 +62,17 @@ class UnconfiguredValidator:
             draft_hash=h,
         )
 
-    def __call__(
-        self,
-        draft: Any,
-        transcript: str,
-    ) -> dict:
-        """Call-compatible interface for Member 3's MessageService."""
-        if isinstance(draft, TransactionDraft):
-            d = draft
-        elif isinstance(draft, dict):
-            d = TransactionDraft.model_validate(draft)
-        else:
-            return {
-                "verdict": "freeze",
-                "discrepancies": [],
-                "reason": "validator_not_configured",
-                "draft_hash": "",
-            }
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """The callable form is intentionally disabled.
 
-        verdict = self.validate(d, transcript)
-        return {
-            "verdict": verdict.verdict,
-            "discrepancies": verdict.discrepancies,
-            "reason": verdict.reason,
-            "draft_hash": verdict.draft_hash,
-        }
+        ``__call__`` would drop the ``ClarificationRecord`` that
+        ``validate()`` needs to pass through.  Call ``validate()``
+        directly instead.
+        """
+        raise TypeError(
+            "Call validate(draft, transcript, clarification=record); "
+            "the callable form drops the ClarificationRecord."
+        )
 
 
 def get_validator(
