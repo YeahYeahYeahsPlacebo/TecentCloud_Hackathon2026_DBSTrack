@@ -50,6 +50,7 @@ from backend.parser.interface import (  # noqa: E402
     ParseResult,
     PendingQuestion,
 )
+from backend.parser.llm_parser import LlmParser  # noqa: E402
 from backend.parser.stub import parse  # noqa: E402
 
 SCHEMA_PATH = ROOT / "contract" / "draft.schema.json"
@@ -571,3 +572,250 @@ class TestPendingQuestionPartial:
         assert isinstance(item, ClarifyingQuestion)
         pending = result.pending[item.question_id]
         assert pending.original_transcript == transcript
+
+
+# ── End-to-end: LlmParser -> pending -> resolve_question -> draft ──────
+#
+# These tests reproduce the live-eval bug: the PendingQuestion built by
+# LlmParser had the wrong partial shape (missing payee), so
+# resolve_question failed with a pydantic ValidationError.  The tests
+# ensure the full round-trip works for amount, payee, and ticker
+# questions.
+
+
+def _llm_intent_json(**kwargs) -> str:
+    """Build a single-intent JSON reply for LlmParser extraction."""
+    defaults = {
+        "intent_type": "transfer",
+        "payee_mention": None,
+        "amount_text": None,
+        "amount_value": None,
+        "currency": None,
+        "source_account_mention": None,
+        "ticker_mention": None,
+        "order_type": None,
+        "uncertain_fields": [],
+    }
+    defaults.update(kwargs)
+    return json.dumps({"intents": [defaults]})
+
+
+def _make_llm_parser(*replies: str) -> LlmParser:
+    return LlmParser(
+        chat_client=FakeChatClient(list(replies)),
+        directory=FixtureDirectory(),
+    )
+
+
+class TestLlmParserEndToEndAmount:
+    """LlmParser -> 'Send some money to John Smith.' -> question (amount)
+    -> resolve_question('fifty dollars') -> schema-valid draft."""
+
+    def test_amount_question_then_answer_produces_draft(self):
+        first_reply = _llm_intent_json(
+            intent_type="transfer",
+            payee_mention="John Smith",
+            uncertain_fields=["amount"],
+        )
+        answer_reply = json.dumps({
+            "resolved": True,
+            "amount_text": "fifty dollars",
+            "amount_value": "50.00",
+        })
+        # LlmParser._extract may retry once, so give two copies.
+        parser = _make_llm_parser(first_reply, first_reply)
+        directory = FixtureDirectory()
+
+        # Step 1: parse the original transcript.
+        result = parser.parse("Send some money to John Smith.")
+        assert len(result.items) == 1
+        item = result.items[0]
+        assert isinstance(item, ClarifyingQuestion)
+        assert item.field == "amount"
+
+        # The pending must be populated.
+        assert item.question_id in result.pending
+        pending = result.pending[item.question_id]
+        assert pending.field == "amount"
+        assert pending.original_transcript == "Send some money to John Smith."
+
+        # The partial must carry the payee (the bug: it didn't).
+        assert "payee" in pending.partial, (
+            f"partial missing 'payee': {pending.partial}"
+        )
+        assert pending.partial["payee"]["id"] == "payee-001"
+        assert pending.partial["payee"]["display_name"] == "John Smith"
+
+        # Step 2: resolve the question with the answer.
+        answer_client = FakeChatClient([answer_reply])
+        resolved, record = resolve_question(
+            pending, "fifty dollars", answer_client, directory,
+        )
+        assert len(resolved.items) == 1
+        draft = resolved.items[0]
+        assert isinstance(draft, TransactionDraft)
+        assert draft.amount.value == "50.00"
+        assert draft.amount.currency == "SGD"
+        assert draft.payee is not None
+        assert draft.payee.id == "payee-001"
+        assert draft.payee.display_name == "John Smith"
+        assert draft.unresolved == []
+        assert draft.transcript == "Send some money to John Smith."
+        _validate_schema(draft)
+
+    def test_partial_has_no_none_values(self):
+        """The partial dict must not contain None values."""
+        first_reply = _llm_intent_json(
+            intent_type="transfer",
+            payee_mention="John Smith",
+            uncertain_fields=["amount"],
+        )
+        parser = _make_llm_parser(first_reply, first_reply)
+        result = parser.parse("Send some money to John Smith.")
+        item = result.items[0]
+        assert isinstance(item, ClarifyingQuestion)
+        pending = result.pending[item.question_id]
+        for key, value in pending.partial.items():
+            assert value is not None, f"partial[{key!r}] is None"
+
+
+class TestLlmParserEndToEndPayee:
+    """LlmParser -> 'Send fifty dollars to Alice.' -> question (payee)
+    -> resolve_question('John Smith') -> schema-valid draft."""
+
+    def test_payee_question_then_answer_produces_draft(self):
+        first_reply = _llm_intent_json(
+            intent_type="transfer",
+            payee_mention="Alice",
+            amount_text="fifty dollars",
+            amount_value="50.00",
+            currency="SGD",
+        )
+        answer_reply = json.dumps({
+            "resolved": True,
+            "payee_mention": "John Smith",
+        })
+        parser = _make_llm_parser(first_reply, first_reply)
+        directory = FixtureDirectory()
+
+        # Step 1: parse.
+        result = parser.parse("Send fifty dollars to Alice.")
+        assert len(result.items) == 1
+        item = result.items[0]
+        assert isinstance(item, ClarifyingQuestion)
+        assert item.field == "payee"
+
+        pending = result.pending[item.question_id]
+        # The partial must carry the amount (resolved before the
+        # payee question).
+        assert "amount" in pending.partial
+        assert pending.partial["amount"]["value"] == "50.00"
+
+        # Step 2: resolve.
+        answer_client = FakeChatClient([answer_reply])
+        resolved, _ = resolve_question(
+            pending, "John Smith", answer_client, directory,
+        )
+        assert len(resolved.items) == 1
+        draft = resolved.items[0]
+        assert isinstance(draft, TransactionDraft)
+        assert draft.payee is not None
+        assert draft.payee.id == "payee-001"
+        assert draft.payee.display_name == "John Smith"
+        assert draft.amount.value == "50.00"
+        assert draft.unresolved == []
+        _validate_schema(draft)
+
+
+class TestLlmParserEndToEndTicker:
+    """LlmParser -> equity with unresolvable ticker -> question (ticker)
+    -> resolve_question('DBS') -> schema-valid draft."""
+
+    def test_ticker_question_then_answer_produces_draft(self):
+        first_reply = _llm_intent_json(
+            intent_type="equity_purchase",
+            amount_text="one thousand dollars",
+            amount_value="1000.00",
+            currency="SGD",
+            ticker_mention="Unknown",
+            order_type="market",
+        )
+        answer_reply = json.dumps({
+            "resolved": True,
+            "ticker_mention": "DBS",
+        })
+        parser = _make_llm_parser(first_reply, first_reply)
+        directory = FixtureDirectory()
+
+        # Step 1: parse.
+        result = parser.parse(
+            "Buy one thousand dollars of Unknown shares at market price."
+        )
+        assert len(result.items) == 1
+        item = result.items[0]
+        assert isinstance(item, ClarifyingQuestion)
+        assert item.field == "ticker"
+
+        pending = result.pending[item.question_id]
+        # The partial should carry amount and order_type.
+        assert "amount" in pending.partial
+        assert pending.partial["amount"]["value"] == "1000.00"
+        assert pending.partial["order_type"] == "market"
+
+        # Step 2: resolve.
+        answer_client = FakeChatClient([answer_reply])
+        resolved, _ = resolve_question(
+            pending, "DBS", answer_client, directory,
+        )
+        assert len(resolved.items) == 1
+        draft = resolved.items[0]
+        assert isinstance(draft, TransactionDraft)
+        assert draft.intent_type.value == "equity_purchase"
+        assert draft.ticker == "D05.SI"
+        assert draft.order_type.value == "market"
+        assert draft.notional_amount == "1000.00"
+        assert draft.amount.value == "1000.00"
+        assert draft.unresolved == []
+        _validate_schema(draft)
+
+
+class TestLlmParserPartialShapeParity:
+    """The PendingQuestion.partial built by LlmParser and by the stub
+    must have the SAME shape."""
+
+    def test_amount_question_same_keys_as_stub(self):
+        # Stub
+        stub_result = parse("Send some money to John Smith.")
+        stub_item = stub_result.items[0]
+        assert isinstance(stub_item, ClarifyingQuestion)
+        stub_pending = stub_result.pending[stub_item.question_id]
+
+        # LLM
+        first_reply = _llm_intent_json(
+            intent_type="transfer",
+            payee_mention="John Smith",
+            uncertain_fields=["amount"],
+        )
+        llm_parser = _make_llm_parser(first_reply, first_reply)
+        llm_result = llm_parser.parse("Send some money to John Smith.")
+        llm_item = llm_result.items[0]
+        assert isinstance(llm_item, ClarifyingQuestion)
+        llm_pending = llm_result.pending[llm_item.question_id]
+
+        # Same keys.
+        assert set(stub_pending.partial.keys()) == set(llm_pending.partial.keys()), (
+            f"stub keys={set(stub_pending.partial.keys())} "
+            f"llm keys={set(llm_pending.partial.keys())}"
+        )
+
+        # Same payee shape.
+        assert "payee" in stub_pending.partial
+        assert "payee" in llm_pending.partial
+        assert set(stub_pending.partial["payee"].keys()) == set(
+            llm_pending.partial["payee"].keys()
+        )
+        assert stub_pending.partial["payee"]["id"] == llm_pending.partial["payee"]["id"]
+        assert (
+            stub_pending.partial["payee"]["display_name"]
+            == llm_pending.partial["payee"]["display_name"]
+        )

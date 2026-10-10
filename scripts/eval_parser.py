@@ -12,13 +12,18 @@ intent, payee, amount, and match.  At the end, a one-line summary.
 Never prints AppKeys or request bodies.
 
 Usage:
-    .venv/bin/python scripts/eval_parser.py
+    .venv/bin/python scripts/eval_parser.py [--delay SECONDS]
+
+Options:
+    --delay SECONDS   Wait this many seconds between live ADP calls
+                       to avoid hitting the rate limit.  Default: 3.
 """
 
 from __future__ import annotations
 
-import os
+import argparse
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -131,7 +136,8 @@ def _categorise_outcome(
         if isinstance(exc, ParserCannotHandle):
             reason = getattr(exc, "reason", "") or str(exc)
             return "declined", reason
-        return "error", type(exc).__name__
+        # Show the full error message (never keys) for error rows.
+        return "error", str(exc)[:200]
 
     if isinstance(item, TransactionDraft):
         return "draft", ""
@@ -303,7 +309,23 @@ def _print_clarify_table(
     return matched, len(cases_with_outcomes)
 
 
+def _delay(seconds: float) -> None:
+    """Wait between live ADP calls to avoid hitting the rate limit."""
+    if seconds > 0:
+        time.sleep(seconds)
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap.add_argument(
+        "--delay",
+        type=float,
+        default=3.0,
+        help="Seconds to wait between live ADP calls (default: 3).",
+    )
+    args = ap.parse_args()
+    delay = args.delay
+
     settings = load_llm_settings(env_path=str(ROOT / ".env"))
 
     client = AdpChatClient(
@@ -326,11 +348,15 @@ def main() -> int:
     print()
 
     # ── Parse cases ───────────────────────────────────────────────
-    print("=== Parse cases (LLM parser) ===")
+    print(f"=== Parse cases (LLM parser, delay={delay}s) ===")
     print()
 
     parse_results: list[tuple[str, str, str, str, str, str, str, str, str]] = []
-    for transcript, expect in CASES:
+    for i, (transcript, expect) in enumerate(CASES):
+        # Wait before every call except the first.
+        if i > 0:
+            _delay(delay)
+
         short = transcript if len(transcript) <= 50 else transcript[:47] + "..."
         exc: Exception | None = None
         item: object | None = None
@@ -367,11 +393,15 @@ def main() -> int:
     print()
 
     # ── Clarification cases ──────────────────────────────────────
-    print("=== Clarification cases (live LLM) ===")
+    print(f"=== Clarification cases (live LLM, delay={delay}s) ===")
     print()
 
     clarify_results: list[tuple[str, str, str, str, str]] = []
-    for transcript, answer, expect in CLARIFY_CASES:
+    for i, (transcript, answer, expect) in enumerate(CLARIFY_CASES):
+        # Wait before every call except the first.
+        if i > 0:
+            _delay(delay)
+
         # Parse the transcript first to get a PendingQuestion.
         try:
             parse_result = parser.parse(transcript)
@@ -397,6 +427,9 @@ def main() -> int:
                 short_answer, expect, "no pending", "", "FAIL"
             ))
             continue
+
+        # resolve_question makes a second live ADP call; wait before it.
+        _delay(delay)
 
         exc2: Exception | None = None
         resolved_item: object | None = None
