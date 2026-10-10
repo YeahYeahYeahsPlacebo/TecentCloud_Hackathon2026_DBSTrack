@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
-GUARDED_PACKAGES = ["backend/parser", "backend/validator"]
+GUARDED_PACKAGES = ["backend/parser", "backend/validator", "backend/llm"]
 FORBIDDEN_MODULES = ["backend.ledger", "backend.gateway"]
 
 
