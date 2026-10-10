@@ -76,8 +76,13 @@ body {
   padding: 10px;
   font-size: 15px;
   resize: none;
-  background: #f0f0f0;
-  color: var(--text-muted);
+  background: #fff;
+  color: var(--text);
+}
+#text-input:focus {
+  border-color: var(--primary);
+  outline: 2px solid var(--primary);
+  outline-offset: -1px;
 }
 #text-input:disabled { cursor: not-allowed; }
 
@@ -235,6 +240,23 @@ body {
 .badge-preview { background: #eceff1; color: #455a64; }
 .badge-warn { background: var(--warn-bg);  color: var(--warn); }
 .badge-danger { background: var(--danger-bg); color: var(--danger); }
+
+/* Demo label (scenario section) */
+.demo-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* Error card */
+.error-card {
+  border: 2px solid var(--danger);
+}
+.error-card .hint {
+  margin-top: 4px;
+}
 
 /* Action bar (disabled) */
 .action-bar {
@@ -404,4 +426,28 @@ body {
 .footer-note code {
   font-family: var(--mono);
   font-size: 10px;
+}
+
+/* Items summary line (multi-intent response) */
+.items-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  padding: 0 4px;
+}
+
+/* Question item card (no draft exists yet) */
+.question-card .question-text {
+  font-size: 15px;
+  line-height: 1.5;
+  padding: 12px 16px;
+  background: var(--warn-bg);
+  border-radius: 8px;
+  margin: 8px 0;
+  color: var(--text);
+}
+.question-card .hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 8px 0;
 }

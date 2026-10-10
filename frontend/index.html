@@ -13,32 +13,32 @@
   <!-- Header -->
   <header class="app-header">
     <h1>Transaction Drafts</h1>
-    <p class="subtitle">Fixture preview only · no live API · no signing or execution</p>
+    <p class="subtitle">Preview · signing and execution disabled</p>
   </header>
 
-  <!-- Page-wide preview banner -->
-  <div class="preview-banner">
-    This entire page is a <strong>fixture preview</strong>. The sample drafts
-    expired on 2026-10-03 and cannot be signed or executed. No draft is
-    constructed or mutated in the frontend.
+  <!-- API status banner -->
+  <div class="preview-banner" id="api-banner">
+    Text input calls <code>POST /api/message</code>. If the backend is not
+    running, Send will fail with a clear error. The buttons below load
+    sample fixtures as a demo fallback.
   </div>
 
   <!-- Text input -->
   <section class="input-section">
     <label for="text-input" class="input-label">Your message</label>
-    <textarea id="text-input" rows="2" placeholder="Type a message…" disabled></textarea>
-    <button id="send-btn" class="btn btn-primary" disabled>Send</button>
+    <textarea id="text-input" rows="2" placeholder="e.g. Send fifty dollars to John Smith."></textarea>
+    <button id="send-btn" class="btn btn-primary">Send</button>
     <p class="hint" id="input-hint">
-      Text input is disabled because the parser API (<code>/api/message</code>)
-      is not implemented yet. Use the sample-scenario buttons below to view
-      fixture drafts.
+      Send posts <code>{"transcript": "..."}</code> to
+      <code>/api/message</code>. The server returns the draft — the
+      frontend never constructs or mutates one.
     </p>
   </section>
 
-  <!-- Sample scenario buttons -->
+  <!-- Sample scenario buttons (demo fallback) -->
   <section class="scenarios">
-    <h2>Sample scenarios</h2>
-    <p class="hint">Each button loads a fixture draft for display. No draft is constructed or mutated in the frontend.</p>
+    <h2>Sample scenarios <span class="demo-label">(demo fallback)</span></h2>
+    <p class="hint">These buttons load local fixture files for preview when the backend is not available.</p>
     <div class="scenario-buttons">
       <button class="btn btn-scenario" data-scenario="clean_transfer">1. Clean Transfer</button>
       <button class="btn btn-scenario" data-scenario="ambiguous_payee">2. Ambiguous Payee (clarify)</button>
@@ -56,8 +56,9 @@
   <footer class="app-footer">
     <p class="footer-note">
       WebAuthn signing and execution are <strong>disabled</strong> in this
-      fixture-only prototype. The frontend never builds or mutates a draft
-      (CONTEXT.md core rule, hard constraint 1).
+      prototype. The frontend never builds or mutates a draft
+      (CONTEXT.md core rule, hard constraint 1). The text input sends
+      to <code>/api/message</code>; the sample buttons load local fixtures.
     </p>
   </footer>
 
