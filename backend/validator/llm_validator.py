@@ -161,19 +161,27 @@ def _compare(
     draft: TransactionDraft,
     extraction: _ExtractionResult,
     directory: PayeeDirectory,
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, bool]:
     """Compare the model's extraction with the draft.
 
-    Returns (discrepancies, reason). discrepancies is a list of field
-    names that disagree; reason is a plain-language sentence.
+    Returns ``(discrepancies, reason, should_freeze)``.
+
+    - ``discrepancies`` is a list of contract field names that
+      disagree (only ``intent_type``, ``amount``, ``payee``,
+      ``source_account``, ``ticker``, ``order_type``).
+    - ``reason`` is a plain-language sentence.
+    - ``should_freeze`` is True when the verdict should be ``freeze``
+      regardless of whether ``discrepancies`` is non-empty (e.g. the
+      transcript contains more than one request, or the model returned
+      zero intents).
     """
     # ── More than one intent -> freeze ───────────────────────────
     if len(extraction.intents) > 1:
-        return ["multiple_intents"], "The transcript describes multiple requests."
+        return [], "The transcript contains more than one request.", True
 
     # ── Zero intents -> fail closed ───────────────────────────────
     if len(extraction.intents) == 0:
-        return ["no_intents"], "The model extracted no intents."
+        return [], "The model extracted no intents.", True
 
     intent = extraction.intents[0]
     discrepancies: list[str] = []
@@ -266,7 +274,7 @@ def _compare(
                 )
 
     reason = " ".join(reasons) if reasons else "The draft matches the transcript."
-    return discrepancies, reason
+    return discrepancies, reason, bool(discrepancies)
 
 
 # ── LlmValidator ─────────────────────────────────────────────────────
@@ -320,9 +328,11 @@ class LlmValidator:
             )
 
         # ── Code compares the extraction with the draft ─────────
-        discrepancies, reason = _compare(draft, extraction, self._directory)
+        discrepancies, reason, should_freeze = _compare(
+            draft, extraction, self._directory
+        )
 
-        if discrepancies:
+        if should_freeze:
             return ValidatorVerdict(
                 verdict="freeze",
                 discrepancies=discrepancies,
@@ -354,40 +364,14 @@ class LlmValidator:
         # Unreachable: the loop either returns or raises.
         raise ValueError("extraction failed unexpectedly")
 
-    # ── Make the validator callable as validator(draft, transcript) ──
-    # so Member 3's MessageService can use it as
-    # validator(dumped, draft.transcript) without changes.
-    def __call__(
-        self,
-        draft: Any,
-        transcript: str,
-    ) -> dict:
-        """Call-compatible interface for Member 3's MessageService.
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """The callable form is intentionally disabled.
 
-        Member 3's code calls ``validator(dumped, transcript)`` where
-        ``dumped`` is a plain dict (the hashed object).  This wraps
-        :meth:`validate` so the existing signature works without
-        changes.
-
-        Returns a plain dict with ``verdict``, ``discrepancies``,
-        ``reason`` and ``draft_hash`` keys.
+        ``__call__`` would drop the ``ClarificationRecord`` that
+        ``validate()`` needs to pass through.  Call ``validate()``
+        directly instead.
         """
-        if isinstance(draft, TransactionDraft):
-            d = draft
-        elif isinstance(draft, dict):
-            d = TransactionDraft.model_validate(draft)
-        else:
-            return {
-                "verdict": "freeze",
-                "discrepancies": [],
-                "reason": "validator_unavailable",
-                "draft_hash": "",
-            }
-
-        verdict = self.validate(d, transcript)
-        return {
-            "verdict": verdict.verdict,
-            "discrepancies": verdict.discrepancies,
-            "reason": verdict.reason,
-            "draft_hash": verdict.draft_hash,
-        }
+        raise TypeError(
+            "Call validate(draft, transcript, clarification=record); "
+            "the callable form drops the ClarificationRecord."
+        )
