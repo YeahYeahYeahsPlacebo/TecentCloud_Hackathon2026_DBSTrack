@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Manual evaluation script for the LLM parser.
+Manual evaluation script for the parser and clarification flow.
 
 NOT run by pytest.  Loads real settings from .env, creates an LlmParser
 with the real dcta-parser ADP application, and runs a fixed set of
-transcripts through it.  Prints a table showing input, expected
-outcome, actual outcome, reason, intent, payee, amount, and unresolved.
+transcripts through it.  Then runs a live clarification section.
 
-Each case carries an ``expect`` string so mismatches are obvious.
-At the end a one-line summary is printed:
-    N cases, N matched expectation.
+Prints a table showing input, expected outcome, actual outcome, reason,
+intent, payee, amount, and match.  At the end, a one-line summary.
 
 Never prints AppKeys or request bodies.
 
@@ -29,14 +27,16 @@ sys.path.insert(0, str(ROOT))
 from backend.llm.adp_client import AdpChatClient  # noqa: E402
 from backend.llm.config import load_llm_settings  # noqa: E402
 from backend.models.draft import TransactionDraft  # noqa: E402
+from backend.parser.clarify import resolve_question  # noqa: E402
 from backend.parser.directory import FixtureDirectory  # noqa: E402
 from backend.parser.interface import (  # noqa: E402
     ClarifyingQuestion,
+    InvalidClarificationAnswer,
     ParserCannotHandle,
 )
 from backend.parser.llm_parser import LlmParser  # noqa: E402
 
-# Each case: (transcript, expect_description)
+# Each parse case: (transcript, expect_description)
 # The expect string describes the required outcome category so a human
 # can see mismatches at a glance.
 CASES: list[tuple[str, str]] = [
@@ -96,6 +96,25 @@ CASES: list[tuple[str, str]] = [
     ),
 ]
 
+# Each clarify case: (transcript, answer, expect_description)
+CLARIFY_CASES: list[tuple[str, str, str]] = [
+    (
+        "Send some money to John Smith.",
+        "fifty dollars",
+        "draft (transfer, John Smith, 50.00)",
+    ),
+    (
+        "Send some money to John Smith.",
+        "fifty, and also send 100 to Bob",
+        "rejected (second request)",
+    ),
+    (
+        "Send some money to John Smith.",
+        "fifty, and the payee is account 999",
+        "rejected (field already resolved)",
+    ),
+]
+
 
 def _categorise_outcome(
     exc: Exception | None,
@@ -103,10 +122,12 @@ def _categorise_outcome(
 ) -> tuple[str, str]:
     """Return (outcome_label, reason) for a parsed result or exception.
 
-    outcome_label is one of: draft, question, declined, error.
+    outcome_label is one of: draft, question, declined, rejected, error.
     reason is a short string explaining why.
     """
     if exc is not None:
+        if isinstance(exc, InvalidClarificationAnswer):
+            return "rejected", str(exc)[:60]
         if isinstance(exc, ParserCannotHandle):
             reason = getattr(exc, "reason", "") or str(exc)
             return "declined", reason
@@ -117,106 +138,6 @@ def _categorise_outcome(
     if isinstance(item, ClarifyingQuestion):
         return "question", item.field
     return "unknown", ""
-
-
-def main() -> int:
-    settings = load_llm_settings(env_path=str(ROOT / ".env"))
-
-    client = AdpChatClient(
-        app_key=settings.parser_app_key,
-        endpoint=settings.adp_endpoint,
-        timeout_seconds=settings.adp_timeout_seconds,
-    )
-    parser = LlmParser(chat_client=client, directory=FixtureDirectory())
-
-    # ── Print FixtureDirectory contents ───────────────────────────
-    print("FixtureDirectory payees:")
-    for p in FixtureDirectory().payees():
-        print(f"  {p.id}  {p.display_name:<20}  {p.masked_account}")
-    print()
-
-    # Column widths
-    w_input = 50
-    w_expect = 42
-    w_outcome = 10
-    w_reason = 22
-    w_intent = 16
-    w_payee = 14
-    w_amount = 10
-    w_match = 5
-
-    hdr = (
-        f"{'input':<{w_input}} "
-        f"{'expected':<{w_expect}} "
-        f"{'outcome':<{w_outcome}} "
-        f"{'reason':<{w_reason}} "
-        f"{'intent':<{w_intent}} "
-        f"{'payee':<{w_payee}} "
-        f"{'amount':<{w_amount}} "
-        f"{'match':<{w_match}}"
-    )
-    sep = "-" * len(hdr)
-
-    print(hdr)
-    print(sep)
-
-    matched = 0
-
-    for transcript, expect in CASES:
-        short = transcript if len(transcript) <= w_input else transcript[: w_input - 3] + "..."
-        exc: Exception | None = None
-        item: object | None = None
-
-        try:
-            result = parser.parse(transcript)
-            if len(result.items) > 0:
-                item = result.items[0]
-        except Exception as e:
-            exc = e
-
-        outcome, reason = _categorise_outcome(exc, item)
-
-        # Extract detail columns
-        if isinstance(item, TransactionDraft):
-            intent = item.intent_type.value
-            payee = item.payee.display_name if item.payee else "-"
-            amount = item.amount.value
-        elif isinstance(item, ClarifyingQuestion):
-            intent = "-"
-            payee = "-"
-            amount = "-"
-        else:
-            intent = "-"
-            payee = "-"
-            amount = "-"
-
-        # Determine if the outcome matches the expectation.
-        # We do a loose match based on keywords in the expect string.
-        match = _matches_expect(outcome, reason, expect, item)
-        if match:
-            matched += 1
-
-        match_str = "OK" if match else "FAIL"
-
-        # Truncate reason for column width
-        reason_short = reason if len(reason) <= w_reason else reason[: w_reason - 3] + "..."
-
-        print(
-            f"{short:<{w_input}} "
-            f"{expect:<{w_expect}} "
-            f"{outcome:<{w_outcome}} "
-            f"{reason_short:<{w_reason}} "
-            f"{intent!s:<{w_intent}} "
-            f"{payee:<{w_payee}} "
-            f"{amount:<{w_amount}} "
-            f"{match_str:<{w_match}}"
-        )
-
-    # ── Summary line ─────────────────────────────────────────────
-    print()
-    print(f"{len(CASES)} cases, {matched} matched expectation.")
-
-    return 0
 
 
 def _matches_expect(
@@ -231,6 +152,9 @@ def _matches_expect(
     eval table can be read at a glance.
     """
     e = expect.lower()
+
+    if "rejected" in e and outcome == "rejected":
+        return True
 
     if "declined" in e and outcome == "declined":
         return True
@@ -253,6 +177,8 @@ def _matches_expect(
             if "1000.00" in e and item.amount.value != "1000.00":
                 return False
             if "15.00" in e and item.amount.value != "15.00":
+                return False
+            if "9999.00" in e and item.amount.value != "9999.00":
                 return False
             if "john smith" in e and item.payee and "john smith" not in item.payee.display_name.lower():
                 return False
@@ -294,6 +220,216 @@ def _matches_expect(
         return False
 
     return False
+
+
+def _print_parse_table(
+    cases_with_outcomes: list[tuple[str, str, str, str, str, str, str, str, str]],
+) -> tuple[int, int]:
+    """Print the parse results table.  Returns (matched, total)."""
+    w_input = 50
+    w_expect = 42
+    w_outcome = 10
+    w_reason = 22
+    w_intent = 16
+    w_payee = 14
+    w_amount = 10
+    w_match = 5
+
+    hdr = (
+        f"{'input':<{w_input}} "
+        f"{'expected':<{w_expect}} "
+        f"{'outcome':<{w_outcome}} "
+        f"{'reason':<{w_reason}} "
+        f"{'intent':<{w_intent}} "
+        f"{'payee':<{w_payee}} "
+        f"{'amount':<{w_amount}} "
+        f"{'match':<{w_match}}"
+    )
+    sep = "-" * len(hdr)
+    print(hdr)
+    print(sep)
+
+    matched = 0
+    for short, expect, outcome, reason, intent, payee, amount, match_str, _ in cases_with_outcomes:
+        if match_str == "OK":
+            matched += 1
+        reason_short = reason if len(reason) <= w_reason else reason[: w_reason - 3] + "..."
+        print(
+            f"{short:<{w_input}} "
+            f"{expect:<{w_expect}} "
+            f"{outcome:<{w_outcome}} "
+            f"{reason_short:<{w_reason}} "
+            f"{intent!s:<{w_intent}} "
+            f"{payee:<{w_payee}} "
+            f"{amount:<{w_amount}} "
+            f"{match_str:<{w_match}}"
+        )
+    return matched, len(cases_with_outcomes)
+
+
+def _print_clarify_table(
+    cases_with_outcomes: list[tuple[str, str, str, str, str]],
+) -> tuple[int, int]:
+    """Print the clarification results table.  Returns (matched, total)."""
+    w_input = 50
+    w_expect = 42
+    w_outcome = 10
+    w_reason = 25
+    w_match = 5
+
+    hdr = (
+        f"{'answer':<{w_input}} "
+        f"{'expected':<{w_expect}} "
+        f"{'outcome':<{w_outcome}} "
+        f"{'reason':<{w_reason}} "
+        f"{'match':<{w_match}}"
+    )
+    sep = "-" * len(hdr)
+    print(hdr)
+    print(sep)
+
+    matched = 0
+    for short, expect, outcome, reason, match_str in cases_with_outcomes:
+        if match_str == "OK":
+            matched += 1
+        reason_short = reason if len(reason) <= w_reason else reason[: w_reason - 3] + "..."
+        print(
+            f"{short:<{w_input}} "
+            f"{expect:<{w_expect}} "
+            f"{outcome:<{w_outcome}} "
+            f"{reason_short:<{w_reason}} "
+            f"{match_str:<{w_match}}"
+        )
+    return matched, len(cases_with_outcomes)
+
+
+def main() -> int:
+    settings = load_llm_settings(env_path=str(ROOT / ".env"))
+
+    client = AdpChatClient(
+        app_key=settings.parser_app_key,
+        endpoint=settings.adp_endpoint,
+        timeout_seconds=settings.adp_timeout_seconds,
+    )
+    parser = LlmParser(chat_client=client, directory=FixtureDirectory())
+    directory = FixtureDirectory()
+
+    # ── Print FixtureDirectory contents ───────────────────────────
+    print("FixtureDirectory payees:")
+    for p in FixtureDirectory().payees():
+        print(f"  {p.id}  {p.display_name:<20}  {p.masked_account}")
+    print(f"  default_source_account: {FixtureDirectory().default_source_account()}")
+    print()
+    print("FixtureDirectory tickers:")
+    for mention, symbol in FixtureDirectory().tickers().items():
+        print(f"  {mention:<10}  → {symbol}")
+    print()
+
+    # ── Parse cases ───────────────────────────────────────────────
+    print("=== Parse cases (LLM parser) ===")
+    print()
+
+    parse_results: list[tuple[str, str, str, str, str, str, str, str, str]] = []
+    for transcript, expect in CASES:
+        short = transcript if len(transcript) <= 50 else transcript[:47] + "..."
+        exc: Exception | None = None
+        item: object | None = None
+        try:
+            result = parser.parse(transcript)
+            if len(result.items) > 0:
+                item = result.items[0]
+        except Exception as e:
+            exc = e
+
+        outcome, reason = _categorise_outcome(exc, item)
+
+        # Extract detail columns
+        if isinstance(item, TransactionDraft):
+            intent = item.intent_type.value
+            payee = item.payee.display_name if item.payee else "-"
+            amount = item.amount.value
+        elif isinstance(item, ClarifyingQuestion):
+            intent = "-"
+            payee = "-"
+            amount = "-"
+        else:
+            intent = "-"
+            payee = "-"
+            amount = "-"
+
+        match = _matches_expect(outcome, reason, expect, item)
+        match_str = "OK" if match else "FAIL"
+        parse_results.append((short, expect, outcome, reason, intent, payee, amount, match_str, ""))
+
+    matched, total = _print_parse_table(parse_results)
+    print()
+    print(f"{total} cases, {matched} matched expectation.")
+    print()
+
+    # ── Clarification cases ──────────────────────────────────────
+    print("=== Clarification cases (live LLM) ===")
+    print()
+
+    clarify_results: list[tuple[str, str, str, str, str]] = []
+    for transcript, answer, expect in CLARIFY_CASES:
+        # Parse the transcript first to get a PendingQuestion.
+        try:
+            parse_result = parser.parse(transcript)
+        except Exception:
+            parse_result = None
+
+        if (
+            parse_result is None
+            or not parse_result.items
+            or not isinstance(parse_result.items[0], ClarifyingQuestion)
+        ):
+            short_answer = answer if len(answer) <= 50 else answer[:47] + "..."
+            clarify_results.append((
+                short_answer, expect, "no question", "", "FAIL"
+            ))
+            continue
+
+        question = parse_result.items[0]
+        pending = parse_result.pending.get(question.question_id)
+        if pending is None:
+            short_answer = answer if len(answer) <= 50 else answer[:47] + "..."
+            clarify_results.append((
+                short_answer, expect, "no pending", "", "FAIL"
+            ))
+            continue
+
+        exc2: Exception | None = None
+        resolved_item: object | None = None
+        try:
+            result, record = resolve_question(pending, answer, client, directory)
+            if result.items:
+                resolved_item = result.items[0]
+        except Exception as e:
+            exc2 = e
+
+        outcome, reason = _categorise_outcome(exc2, resolved_item)
+
+        if isinstance(resolved_item, TransactionDraft):
+            reason = f"{resolved_item.amount.value} to "
+            if resolved_item.payee:
+                reason += resolved_item.payee.display_name
+
+        short_answer = answer if len(answer) <= 50 else answer[:47] + "..."
+        match = _matches_expect(outcome, reason, expect, resolved_item)
+        match_str = "OK" if match else "FAIL"
+        clarify_results.append((short_answer, expect, outcome, reason, match_str))
+
+    matched2, total2 = _print_clarify_table(clarify_results)
+    print()
+    print(f"{total2} cases, {matched2} matched expectation.")
+    print()
+
+    # ── Grand summary ────────────────────────────────────────────
+    grand_total = total + total2
+    grand_matched = matched + matched2
+    print(f"Grand total: {grand_total} cases, {grand_matched} matched expectation.")
+
+    return 0
 
 
 if __name__ == "__main__":

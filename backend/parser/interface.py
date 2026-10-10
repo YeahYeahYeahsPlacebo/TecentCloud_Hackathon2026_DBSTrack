@@ -24,11 +24,30 @@ required field (``intent_type``, ``source_account``, ``amount``,
 ``ticker``, ``quantity``, ``notional_amount``, ``order_type``), it does
 **not** produce a draft at all — it returns a :class:`ClarifyingQuestion`
 so the user can supply the missing value first.
+
+**Clarification support** (this module, :mod:`backend.parser.clarify`):
+
+- When the parser returns a :class:`ClarifyingQuestion`, it also
+  populates :attr:`ParseResult.pending` — a mapping from
+  ``question_id`` to :class:`PendingQuestion` — so the server can
+  correlate the answer with the original transcript and partial fields.
+- ``pending`` is **server-only** and must never be sent to the client.
+  The client only sees ``question_id``, ``field``, and ``question``
+  from each question item.
+- :func:`backend.parser.clarify.resolve_payee` resolves a payee
+  candidate pick on an existing draft (CONTRACT.md §4, first form).
+- :func:`backend.parser.clarify.resolve_question` resolves a free-text
+  answer to a :class:`ClarifyingQuestion` (CONTRACT.md §4, second form).
+- Single-use enforcement (marking a ``question_id`` as consumed,
+  refusing re-use) is the **server's** job — it holds storage.
+  The pure functions in :mod:`backend.parser.clarify` do not and
+  cannot enforce it.
 """
 
 from __future__ import annotations
 
-from typing import List, Union
+from datetime import datetime
+from typing import Any, Dict, List, Union
 
 from pydantic import BaseModel, ConfigDict
 
@@ -58,6 +77,70 @@ class ClarifyingQuestion(BaseModel):
 ParseItem = Union[TransactionDraft, ClarifyingQuestion]
 
 
+class PendingQuestion(BaseModel):
+    """
+    Server-only state for an unanswered :class:`ClarifyingQuestion`.
+
+    **Never sent to the client.**  The client only sees the
+    :class:`ClarifyingQuestion` item (``question_id``, ``field``,
+    ``question``).  This model exists so the server can:
+
+    - correlate an answer with the original transcript and the fields
+      already resolved, and
+    - hand the :func:`backend.parser.clarify.resolve_question` function
+      everything it needs in one value.
+
+    Attributes:
+        question_id: Matches the ``question_id`` of the
+            :class:`ClarifyingQuestion` the client saw.
+        field: The unresolved field the question asks about.
+        original_transcript: The user's original text, unchanged.  The
+            answer is never merged into it (CONTRACT.md §4 second form).
+        partial: The resolved fields so far, as a plain dict.  This is
+            the starting point for the draft once the answer fills in
+            the remaining field.
+        created_at: When the question was issued.
+        expires_at: When the question expires (same 5-minute window as
+            the draft the question was derived from).
+
+    Single-use enforcement (refusing a second answer for the same
+    ``question_id``) is the **server's** job — it holds storage.  This
+    model is a value object; it does not track consumption.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str
+    field: str
+    original_transcript: str
+    partial: Dict[str, Any]
+    created_at: datetime
+    expires_at: datetime
+
+
+class ClarificationRecord(BaseModel):
+    """
+    Audit record for a clarification answer.
+
+    Returned by :func:`backend.parser.clarify.resolve_question` alongside
+    the :class:`ParseResult` so the server can:
+
+    - record the question_id, field, original transcript, and answer in
+      the audit log, and
+    - pass both the transcript and the answer (separately, never merged)
+      to the validator (CONTRACT.md §4 second form).
+
+    The answer is never merged into ``original_transcript``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str
+    field: str
+    original_transcript: str
+    answer: str
+
+
 class ParseResult(BaseModel):
     """
     The return type of :func:`parse`.
@@ -67,6 +150,10 @@ class ParseResult(BaseModel):
             :class:`TransactionDraft` or a :class:`ClarifyingQuestion`.
         intents_detected: The number of distinct intents the parser found
             in the transcript.
+        pending: **Server-only.**  A mapping from ``question_id`` to
+            :class:`PendingQuestion` for every :class:`ClarifyingQuestion`
+            in ``items``.  Defaults to ``{}`` when there are no
+            questions.  **Must never be sent to the client.**
 
     Rule: ``len(items)`` must equal ``intents_detected``.  A parser that
     detects more intents than it returns items for has silently dropped
@@ -77,6 +164,7 @@ class ParseResult(BaseModel):
 
     items: List[ParseItem]
     intents_detected: int
+    pending: Dict[str, PendingQuestion] = {}
 
 
 class ParserCannotHandle(Exception):
@@ -102,6 +190,26 @@ class ParserCannotHandle(Exception):
     def __init__(self, message: str = "", *, reason: str = "") -> None:
         super().__init__(message)
         self.reason = reason or message
+
+
+class InvalidClarificationAnswer(Exception):
+    """
+    Raised by :func:`backend.parser.clarify.resolve_payee` and
+    :func:`backend.parser.clarify.resolve_question` when a clarification
+    answer is invalid.
+
+    This maps to the ``invalid_clarification_answer`` reason code in
+    CONTRACT.md §5.  The server catches it and returns a 422 rejection.
+
+    Common causes:
+
+    - The ``field`` is not in the stored draft's ``unresolved`` list.
+    - The draft or pending question has expired.
+    - The ``answer_id`` for a payee pick is not among the offered
+      ``payee_candidates``, or does not exist in the directory.
+    - The answer text contains a second request (multi-intent).
+    - The answer text tries to change a field that is already resolved.
+    """
 
 
 def parse(transcript: str) -> ParseResult:

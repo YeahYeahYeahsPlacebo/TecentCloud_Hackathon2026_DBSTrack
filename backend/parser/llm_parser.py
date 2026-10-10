@@ -53,6 +53,7 @@ from backend.parser.interface import (
     ClarifyingQuestion,
     ParserCannotHandle,
     ParseResult,
+    PendingQuestion,
 )
 
 # ── Prompt loading ────────────────────────────────────────────────────
@@ -269,6 +270,12 @@ class LlmParser:
 
         Code — not the model — resolves payees, validates amounts,
         and sets all draft fields.
+
+        Every :class:`ClarifyingQuestion` returned also populates
+        :attr:`ParseResult.pending` with a :class:`PendingQuestion`
+        carrying the original transcript and the fields resolved so
+        far, so the server can correlate an answer with the original
+        request (CONTRACT.md §4, second form).
         """
         # ── Transcript verification for *_mention fields ──────────
         mentions = {
@@ -286,35 +293,40 @@ class LlmParser:
         # ── Amount resolution ──────────────────────────────────────
         uncertain = set(intent.uncertain_fields)
         amount_value = intent.amount_value
+        intent_type = intent.intent_type
+
+        # Build the partial dict (fields resolved so far) for any
+        # ClarifyingQuestion we might return.
+        partial: dict[str, Any] = {
+            "intent_type": intent_type,
+            "source_account": self._directory.default_source_account(),
+        }
 
         # If amount_text fails the transcript check, treat as unresolved.
         if "amount_text" in transcript_failures:
-            return ParseResult(
-                items=[_make_question("amount",
-                    "How much would you like to send?")],
-                intents_detected=1,
+            return _make_question_result(
+                "amount", "How much would you like to send?",
+                transcript, partial,
             )
 
         # If amount is in uncertain_fields or missing, ask.
         if "amount" in uncertain or not amount_value:
-            return ParseResult(
-                items=[_make_question("amount",
-                    "How much would you like to send?")],
-                intents_detected=1,
+            return _make_question_result(
+                "amount", "How much would you like to send?",
+                transcript, partial,
             )
 
         # Validate the money pattern.
         if not _is_valid_money(amount_value):
-            return ParseResult(
-                items=[_make_question("amount",
-                    "How much would you like to send?")],
-                intents_detected=1,
+            return _make_question_result(
+                "amount", "How much would you like to send?",
+                transcript, partial,
             )
 
         currency = intent.currency or "SGD"
+        partial["amount"] = {"value": amount_value, "currency": currency}
 
         # ── Payee resolution (transfer / bill_payment) ─────────────
-        intent_type = intent.intent_type
         payee: Payee | None = None
         payee_candidates: list[PayeeCandidate] | None = None
         unresolved: list[str] = []
@@ -322,20 +334,18 @@ class LlmParser:
         if intent_type in ("transfer", "bill_payment"):
             # If payee_mention fails the transcript check, ask.
             if "payee_mention" in transcript_failures:
-                return ParseResult(
-                    items=[_make_question("payee",
-                        "Who would you like to send to?")],
-                    intents_detected=1,
+                return _make_question_result(
+                    "payee", "Who would you like to send to?",
+                    transcript, partial,
                 )
 
             matches = match_payees(intent.payee_mention, self._directory)
 
             if len(matches) == 0:
                 # Zero matches → ask the user.
-                return ParseResult(
-                    items=[_make_question("payee",
-                        "Who would you like to send the money to?")],
-                    intents_detected=1,
+                return _make_question_result(
+                    "payee", "Who would you like to send the money to?",
+                    transcript, partial,
                 )
 
             if len(matches) >= 2:
@@ -357,6 +367,11 @@ class LlmParser:
                     display_name=m.display_name,
                     masked_account=m.masked_account,
                 )
+                partial["payee"] = {
+                    "id": m.id,
+                    "display_name": m.display_name,
+                    "masked_account": m.masked_account,
+                }
 
         # ── Equity fields ──────────────────────────────────────────
         ticker: str | None = None
@@ -366,27 +381,27 @@ class LlmParser:
         if intent_type == "equity_purchase":
             # Ticker resolved only through the directory.
             if "ticker_mention" in transcript_failures:
-                return ParseResult(
-                    items=[_make_question("ticker",
-                        "Which stock would you like to buy?")],
-                    intents_detected=1,
+                return _make_question_result(
+                    "ticker", "Which stock would you like to buy?",
+                    transcript, partial,
                 )
 
             ticker = resolve_ticker(intent.ticker_mention, self._directory)
             if ticker is None:
-                return ParseResult(
-                    items=[_make_question("ticker",
-                        "Which stock would you like to buy?")],
-                    intents_detected=1,
+                return _make_question_result(
+                    "ticker", "Which stock would you like to buy?",
+                    transcript, partial,
                 )
+
+            partial["ticker"] = ticker
 
             if not order_type:
-                return ParseResult(
-                    items=[_make_question("order_type",
-                        "Market or limit order?")],
-                    intents_detected=1,
+                return _make_question_result(
+                    "order_type", "Market or limit order?",
+                    transcript, partial,
                 )
 
+            partial["order_type"] = order_type
             notional_amount = amount_value
 
         # ── Source account (product rule, not a guess) ─────────────
@@ -449,6 +464,35 @@ def _make_question(field: str, question: str) -> ClarifyingQuestion:
         question_id=_fresh_question_id(field),
         field=field,
         question=question,
+    )
+
+
+def _make_question_result(
+    field: str,
+    question: str,
+    transcript: str,
+    partial: dict[str, Any] | None = None,
+) -> ParseResult:
+    """Build a one-item ParseResult with a ClarifyingQuestion and its pending."""
+    qid = _fresh_question_id(field)
+    created, expires = _fresh_timestamps()
+    question_item = ClarifyingQuestion(
+        question_id=qid,
+        field=field,
+        question=question,
+    )
+    pending = PendingQuestion(
+        question_id=qid,
+        field=field,
+        original_transcript=transcript,
+        partial=partial or {},
+        created_at=created,
+        expires_at=expires,
+    )
+    return ParseResult(
+        items=[question_item],
+        intents_detected=1,
+        pending={qid: pending},
     )
 
 

@@ -49,6 +49,7 @@ from backend.parser.interface import (
     ClarifyingQuestion,
     ParserCannotHandle,
     ParseResult,
+    PendingQuestion,
 )
 
 # ── Multi-intent detection ─────────────────────────────────────────────
@@ -272,12 +273,48 @@ def _equity_purchase(transcript: str, amount_value: str) -> TransactionDraft:
     )
 
 
-def _clarifying_question(field: str, question: str) -> ClarifyingQuestion:
-    """Build a ClarifyingQuestion with a fresh question_id."""
-    return ClarifyingQuestion(
-        question_id=_fresh_question_id(field),
+def _clarifying_question(
+    field: str,
+    question: str,
+    transcript: str,
+    partial: dict | None = None,
+) -> tuple[ClarifyingQuestion, PendingQuestion]:
+    """Build a ClarifyingQuestion and its server-only PendingQuestion.
+
+    ``partial`` carries the fields already resolved from the transcript
+    (e.g. ``intent_type``, ``source_account``, ``payee``).  The answer
+    to the question fills the remaining field so a draft can be produced.
+    """
+    qid = _fresh_question_id(field)
+    created, expires = _fresh_timestamps()
+    question_item = ClarifyingQuestion(
+        question_id=qid,
         field=field,
         question=question,
+    )
+    pending = PendingQuestion(
+        question_id=qid,
+        field=field,
+        original_transcript=transcript,
+        partial=partial or {},
+        created_at=created,
+        expires_at=expires,
+    )
+    return question_item, pending
+
+
+def _question_result(
+    field: str,
+    question: str,
+    transcript: str,
+    partial: dict | None = None,
+) -> ParseResult:
+    """Build a one-item ParseResult with a ClarifyingQuestion and its pending."""
+    item, pending = _clarifying_question(field, question, transcript, partial)
+    return ParseResult(
+        items=[item],
+        intents_detected=1,
+        pending={item.question_id: pending},
     )
 
 
@@ -309,11 +346,16 @@ def parse(transcript: str) -> ParseResult:
     if any(kw in lower for kw in ("share", "stock", "buy")):
         amount = _parse_amount(transcript)
         if amount is None:
-            return ParseResult(
-                items=[_clarifying_question(
-                    "amount", "How much would you like to invest?"
-                )],
-                intents_detected=1,
+            return _question_result(
+                "amount",
+                "How much would you like to invest?",
+                transcript,
+                partial={
+                    "intent_type": "equity_purchase",
+                    "source_account": "acct-001-2345",
+                    "ticker": "D05.SI",
+                    "order_type": "market",
+                },
             )
         return ParseResult(
             items=[_equity_purchase(transcript, amount)],
@@ -326,11 +368,19 @@ def parse(transcript: str) -> ParseResult:
         if amount is None:
             # Per CONTRACT.md §2, amount cannot be in unresolved.
             # The parser must ask before producing any draft.
-            return ParseResult(
-                items=[_clarifying_question(
-                    "amount", "How much would you like to send?"
-                )],
-                intents_detected=1,
+            return _question_result(
+                "amount",
+                "How much would you like to send?",
+                transcript,
+                partial={
+                    "intent_type": "transfer",
+                    "source_account": "acct-001-2345",
+                    "payee": {
+                        "id": "payee-001",
+                        "display_name": "John Smith",
+                        "masked_account": "****1234",
+                    } if "john smith" in lower else None,
+                },
             )
 
         # "John Smith" (full name) → clean transfer
