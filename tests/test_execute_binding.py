@@ -1,15 +1,20 @@
 """
 Design-level tests for /api/execute (CONTRACT.md §4, "POST /api/execute").
 
-`StubGateway` below is NOT the gateway. It is a small reference model of the
-contract's check order, run against an in-memory stub store, so the binding
-rules can be tested before backend/gateway exists. Member 3 should point these
-tests at the real gateway once it exists and keep them passing.
+These run against the real gateway, ``backend.gateway.execute.ExecuteGateway``.
+They used to drive a ``StubGateway`` reference model while backend/gateway was
+still empty; CONTRACT.md §7 asks for the real one once it exists, and the stub
+has been retired rather than left to drift beside it.
 
 What is real here: draft hashing (backend.canonical), client_data_json
-parsing, the challenge comparison, and the rpIdHash / user-verified flag
-checks on authenticator_data. What is stubbed: the ECDSA signature check
-itself, via an injected `verify_ecdsa` callable.
+parsing, the challenge comparison, the rpIdHash / user-verified flag checks on
+authenticator_data, and the twelve-check order itself. What is stubbed: the
+ECDSA signature check, via an injected ``verify_ecdsa`` callable.
+
+Scope: checks 1-10, the binding rules — that a client-supplied draft body can
+never be swapped in, and that a signature over draft A is rejected for draft B.
+Checks 11 (validator) and 12 (policy) are exercised in
+test_gateway_skeleton.py; see ``Verdicts`` below.
 """
 
 import base64
@@ -25,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from backend.canonical import draft_hash  # noqa: E402
+from backend.gateway.execute import ExecuteGateway  # noqa: E402
 from backend.models.draft import TransactionDraft  # noqa: E402
 
 RP_ID = "localhost"
@@ -51,84 +57,32 @@ def challenge_for(draft: TransactionDraft) -> str:
     return b64url_encode(bytes.fromhex(hashed))
 
 
-def rejected(code: str) -> dict:
-    return {"result": "rejected", "reason_code": code}
+def assert_rejected(result: dict, code: str) -> None:
+    """CONTRACT.md §5: rejections carry result and reason_code (plus a message).
+
+    Compares the two fields the client branches on rather than the whole dict,
+    so the developer-facing message can change without breaking these.
+    """
+    assert result["result"] == "rejected", result
+    assert result["reason_code"] == code, result
 
 
-class StubGateway:
-    """Reference model of the /api/execute check order in CONTRACT.md."""
+def ledger_drafts(gw: ExecuteGateway) -> list[dict]:
+    """The drafts the gateway actually posted, in order."""
+    return [entry["draft"] for entry in gw.ledger.entries]
 
-    def __init__(self, store: dict, credentials: dict, verify_ecdsa, now: datetime):
-        self.store = store              # draft_id -> TransactionDraft (the server's own copy)
-        self.credentials = credentials  # credential_id -> public key (opaque here)
-        self.verify_ecdsa = verify_ecdsa
-        self.now = now
-        self.ledger: list[dict] = []
-        self.idempotency: dict[str, tuple[str, dict]] = {}
 
-    def execute(self, request: dict) -> dict:
-        # 1. Request shape. A `draft` body (or any unknown field) is refused,
-        #    never used: the gateway only ever executes its own stored copy.
-        if not isinstance(request, dict) or set(request) - REQUEST_FIELDS:
-            return rejected("malformed_request")
-        if not {"draft_id", "credential_id", "idempotency_key"} <= set(request):
-            return rejected("malformed_request")
-        if "assertion" not in request:
-            return rejected("missing_signature")
+class Verdicts(dict):
+    """Validator verdicts by draft hash, defaulting to "pass".
 
-        # 2. Load the server's own copy.
-        draft = self.store.get(request["draft_id"])
-        if draft is None:
-            return rejected("unknown_draft")
+    These tests cover checks 1-10. The validator gate is asserted to fail
+    closed in test_gateway_skeleton.py; defaulting to pass here keeps that
+    concern out of every binding test instead of making each one register a
+    verdict for every draft it happens to build.
+    """
 
-        # 3. Draft state, independent of any frontend check.
-        if draft.unresolved:
-            return rejected("unresolved_fields")
-        if self.now >= draft.expires_at:
-            return rejected("expired")
-
-        # 4. Assertion format.
-        assertion = request["assertion"]
-        if not isinstance(assertion, dict) or set(assertion) != ASSERTION_FIELDS:
-            return rejected("malformed_signature")
-        try:
-            authenticator_data = b64url_decode(assertion["authenticator_data"])
-            client_data_raw = b64url_decode(assertion["client_data_json"])
-            signature = b64url_decode(assertion["signature"])
-            b64url_decode(assertion["credential_id"])
-            client_data = json.loads(client_data_raw)
-        except ValueError:
-            return rejected("malformed_signature")
-        if assertion["credential_id"] != request["credential_id"] or len(authenticator_data) < 37:
-            return rejected("malformed_signature")
-
-        # 5. Challenge binding: the challenge must be OUR hash of OUR stored draft.
-        if client_data.get("challenge") != challenge_for(draft):
-            return rejected("hash_mismatch")
-
-        # 6. Everything else about the assertion.
-        if client_data.get("type") != "webauthn.get" or client_data.get("origin") != ORIGIN:
-            return rejected("signature_invalid")
-        if authenticator_data[:32] != hashlib.sha256(RP_ID.encode()).digest():
-            return rejected("signature_invalid")
-        if not authenticator_data[32] & FLAG_USER_VERIFIED:
-            return rejected("signature_invalid")
-        public_key = self.credentials.get(request["credential_id"])
-        signed = authenticator_data + hashlib.sha256(client_data_raw).digest()
-        if public_key is None or not self.verify_ecdsa(public_key, signed, signature):
-            return rejected("signature_invalid")
-
-        # 7. Idempotency on the caller-supplied key.
-        key = request["idempotency_key"]
-        if key in self.idempotency:
-            prior_draft_id, prior_result = self.idempotency[key]
-            return prior_result if prior_draft_id == draft.id else rejected("replayed")
-
-        # 8. Execute the stored draft. (Validator and policy are out of scope here.)
-        self.ledger.append(draft.model_dump(mode="json", exclude_none=True))
-        result = {"result": "executed", "transaction_id": f"tx-{len(self.ledger):06d}", "idempotency_key": key}
-        self.idempotency[key] = (draft.id, result)
-        return result
+    def get(self, key, default="pass"):
+        return dict.get(self, key, default)
 
 
 # ── Helpers that play the browser + authenticator ─────────────────────
@@ -157,14 +111,15 @@ def load_draft(name: str) -> TransactionDraft:
     return TransactionDraft.model_validate_json((ROOT / "fixtures" / "drafts" / name).read_text(encoding="utf-8"))
 
 
-def make_gateway() -> tuple[StubGateway, TransactionDraft]:
+def make_gateway() -> tuple[ExecuteGateway, TransactionDraft]:
     stored = load_draft("clean_transfer.json")
     ambiguous = load_draft("ambiguous_payee.json")
-    gw = StubGateway(
-        store={stored.id: stored, ambiguous.id: ambiguous},
+    gw = ExecuteGateway(
+        draft_store={stored.id: stored, ambiguous.id: ambiguous},
         credentials={CREDENTIAL_ID: "stub-public-key"},
         verify_ecdsa=fake_verify_ecdsa,
-        now=stored.created_at + timedelta(minutes=1),
+        verdicts=Verdicts(),
+        clock=lambda: stored.created_at + timedelta(minutes=1),
     )
     return gw, stored
 
@@ -187,16 +142,16 @@ def test_stored_draft_with_matching_challenge_executes_the_stored_copy():
     gw, stored = make_gateway()
     result = gw.execute(request_for(stored.id, make_assertion(challenge_for(stored))))
     assert result["result"] == "executed"
-    assert gw.ledger == [stored.model_dump(mode="json", exclude_none=True)]
+    assert ledger_drafts(gw) == [stored.model_dump(mode="json", exclude_none=True)]
 
 
 def test_request_carrying_a_different_draft_body_is_rejected_not_swapped_in():
     gw, stored = make_gateway()
     request = request_for(stored.id, make_assertion(challenge_for(stored)))
     request["draft"] = tampered_copy(stored)
-    assert gw.execute(request) == rejected("malformed_request")
-    assert gw.ledger == []
-    assert gw.store[stored.id].payee.id == "payee-001"  # stored copy untouched
+    assert_rejected(gw.execute(request), "malformed_request")
+    assert ledger_drafts(gw) == []
+    assert gw.draft_store[stored.id].payee.id == "payee-001"  # stored copy untouched
 
 
 def test_user_signing_a_client_built_draft_is_rejected_as_hash_mismatch():
@@ -205,38 +160,47 @@ def test_user_signing_a_client_built_draft_is_rejected_as_hash_mismatch():
     gw, stored = make_gateway()
     forged = TransactionDraft.model_validate(tampered_copy(stored))
     assert challenge_for(forged) != challenge_for(stored)
-    assert gw.execute(request_for(stored.id, make_assertion(challenge_for(forged)))) == rejected("hash_mismatch")
-    assert gw.ledger == []
+    assert_rejected(
+        gw.execute(request_for(stored.id, make_assertion(challenge_for(forged)))),
+        "hash_mismatch",
+    )
+    assert ledger_drafts(gw) == []
 
 
 def test_unknown_draft_id_is_rejected():
     gw, stored = make_gateway()
     request = request_for("99999999-9999-9999-9999-999999999999", make_assertion(challenge_for(stored)))
-    assert gw.execute(request) == rejected("unknown_draft")
+    assert_rejected(gw.execute(request), "unknown_draft")
 
 
 def test_unresolved_stored_draft_is_rejected_even_with_a_valid_assertion():
     gw, _ = make_gateway()
-    ambiguous = gw.store["22222222-2222-2222-2222-222222222222"]
-    assert gw.execute(request_for(ambiguous.id, make_assertion(challenge_for(ambiguous)))) == rejected("unresolved_fields")
-    assert gw.ledger == []
+    ambiguous = gw.draft_store["22222222-2222-2222-2222-222222222222"]
+    assert_rejected(
+        gw.execute(request_for(ambiguous.id, make_assertion(challenge_for(ambiguous)))),
+        "unresolved_fields",
+    )
+    assert ledger_drafts(gw) == []
 
 
 def test_expired_draft_is_rejected():
     gw, stored = make_gateway()
-    gw.now = stored.expires_at
-    assert gw.execute(request_for(stored.id, make_assertion(challenge_for(stored)))) == rejected("expired")
+    gw.clock = lambda: stored.expires_at
+    assert_rejected(
+        gw.execute(request_for(stored.id, make_assertion(challenge_for(stored)))),
+        "expired",
+    )
 
 
 def test_missing_and_malformed_assertions():
     gw, stored = make_gateway()
     request = request_for(stored.id, make_assertion(challenge_for(stored)))
     del request["assertion"]
-    assert gw.execute(request) == rejected("missing_signature")
+    assert_rejected(gw.execute(request), "missing_signature")
 
     bad = make_assertion(challenge_for(stored))
     bad["signature"] = "not base64url!"
-    assert gw.execute(request_for(stored.id, bad)) == rejected("malformed_signature")
+    assert_rejected(gw.execute(request_for(stored.id, bad)), "malformed_signature")
 
 
 def test_signature_invalid_covers_bad_signature_origin_type_and_missing_uv():
@@ -248,8 +212,8 @@ def test_signature_invalid_covers_bad_signature_origin_type_and_missing_uv():
         make_assertion(challenge, type_="webauthn.create"),
         make_assertion(challenge, flags=FLAG_USER_PRESENT),  # user present but not verified
     ]:
-        assert gw.execute(request_for(stored.id, assertion)) == rejected("signature_invalid")
-    assert gw.ledger == []
+        assert_rejected(gw.execute(request_for(stored.id, assertion)), "signature_invalid")
+    assert ledger_drafts(gw) == []
 
 
 def test_idempotency_key_replays_the_same_result_and_rejects_a_different_draft():
@@ -257,10 +221,13 @@ def test_idempotency_key_replays_the_same_result_and_rejects_a_different_draft()
     other = TransactionDraft.model_validate(
         {**stored.model_dump(mode="json", exclude_none=True), "id": "66666666-6666-6666-6666-666666666666", "nonce": "nonce-other"}
     )
-    gw.store[other.id] = other
+    gw.draft_store[other.id] = other
 
     first = gw.execute(request_for(stored.id, make_assertion(challenge_for(stored)), key="k1"))
     again = gw.execute(request_for(stored.id, make_assertion(challenge_for(stored)), key="k1"))
-    assert first == again and len(gw.ledger) == 1
-    assert gw.execute(request_for(other.id, make_assertion(challenge_for(other)), key="k1")) == rejected("replayed")
-    assert len(gw.ledger) == 1
+    assert first == again and len(ledger_drafts(gw)) == 1
+    assert_rejected(
+        gw.execute(request_for(other.id, make_assertion(challenge_for(other)), key="k1")),
+        "replayed",
+    )
+    assert len(ledger_drafts(gw)) == 1

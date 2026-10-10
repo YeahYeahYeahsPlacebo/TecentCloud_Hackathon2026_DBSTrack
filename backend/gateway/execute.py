@@ -426,16 +426,6 @@ CHECKS: tuple[Check, ...] = (
 # ── The gateway ───────────────────────────────────────────────────────
 
 
-class _DictStore:
-    """Minimal DraftStore over a dict, so the skeleton runs without a database."""
-
-    def __init__(self, drafts: Mapping[str, Any]) -> None:
-        self._drafts = dict(drafts)
-
-    def get(self, draft_id: str) -> Optional[Any]:
-        return self._drafts.get(draft_id)
-
-
 class ExecuteGateway:
     """Runs the twelve checks in order, then posts to the ledger."""
 
@@ -454,15 +444,17 @@ class ExecuteGateway:
         rp_id: str = "localhost",
         origin: str = "http://localhost:8000",
     ) -> None:
-        if isinstance(draft_store, Mapping):
-            draft_store = _DictStore(draft_store)
+        # A Mapping is used as-is, by reference: a dict store stays live, so a
+        # draft added after construction is still visible to the gateway.
         self.draft_store = draft_store
         self.credentials = dict(credentials or {})
         self.verify_ecdsa = verify_ecdsa
         self.idempotency: MutableMapping[str, tuple[str, dict]] = (
             idempotency if idempotency is not None else {}
         )
-        self.verdicts: Mapping[str, str] = dict(verdicts or {})
+        # Held by reference like the draft store, so a caller can inject a
+        # mapping with its own lookup policy instead of a plain dict.
+        self.verdicts: Mapping[str, str] = verdicts if verdicts is not None else {}
         self.policy = policy or (lambda draft, digest: PolicyDecision(POLICY_ALLOW))
         self.ledger: Ledger = ledger if ledger is not None else InMemoryLedger()
         self.audit = audit
