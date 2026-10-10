@@ -39,7 +39,7 @@ from backend.models.draft import (
     TransactionDraft,
     _check_money,
 )
-from backend.parser.directory import PayeeDirectory, TickerDirectory
+from backend.parser.directory import PayeeDirectory, match_payees, resolve_ticker
 from backend.parser.interface import (
     ClarificationRecord,
     ClarifyingQuestion,
@@ -189,7 +189,9 @@ def resolve_payee(
         )
 
     # ── Check: answer_id must exist in the directory ─────────────────
-    record = directory.get_payee_by_id(answer_id) if hasattr(directory, "get_payee_by_id") else None
+    record = next(
+        (p for p in directory.payees() if p.id == answer_id), None
+    )
     if record is None:
         raise InvalidClarificationAnswer(
             f"answer {answer_id!r} does not exist in the directory"
@@ -443,7 +445,7 @@ def resolve_question(
                 "payee_mention is empty in the model reply"
             )
 
-        matches = directory.find_payee(payee_mention) if hasattr(directory, "find_payee") else []
+        matches = match_payees(payee_mention, directory)
         if not matches:
             raise InvalidClarificationAnswer(
                 f"payee {payee_mention!r} not found in directory"
@@ -468,7 +470,7 @@ def resolve_question(
                 "ticker_mention is empty in the model reply"
             )
 
-        symbol = directory.resolve_ticker(ticker_mention) if hasattr(directory, "resolve_ticker") else None
+        symbol = resolve_ticker(ticker_mention, directory)
         if symbol is None:
             raise InvalidClarificationAnswer(
                 f"ticker {ticker_mention!r} not found in directory"

@@ -164,7 +164,8 @@ class TestResolvePayeeSuccess:
 
         assert resolved.payee is not None
         assert resolved.payee.id == "payee-102"
-        assert resolved.payee.display_name == "John Smith"
+        # Part 2's directory has payee-102 = John Lee (not John Smith).
+        assert resolved.payee.display_name == "John Lee"
         assert resolved.payee.masked_account == "****8892"
 
     def test_payee_pick_removes_payee_from_unresolved(self):
