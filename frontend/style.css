@@ -1,0 +1,453 @@
+/* ── DCTA frontend prototype styles ────────────────────────────
+   Mobile-first, single screen, view-only. No framework, no build step.
+   The .phone-frame caps width so the prototype looks like a phone.
+────────────────────────────────────────────────────────────── */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #f4f5f7;
+  --card-bg: #ffffff;
+  --primary: #d3242a;      /* DBS red */
+  --primary-dim: #fde8e9;
+  --text: #1a1a1a;
+  --text-muted: #6b6b6b;
+  --border: #e0e0e0;
+  --warn: #b8860b;
+  --warn-bg: #fff8e1;
+  --danger: #b00020;
+  --danger-bg: #fdecee;
+  --ok: #1b7a3d;
+  --ok-bg: #e8f5e9;
+  --radius: 12px;
+  --mono: "SF Mono", "Fira Code", "Menlo", monospace;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+.phone-frame {
+  max-width: 390px;        /* iPhone-ish width */
+  min-height: 100vh;
+  margin: 0 auto;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 16px;
+}
+
+/* Header */
+.app-header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+}
+.app-header .subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* Input section */
+.input-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.input-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+#text-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 15px;
+  resize: none;
+  background: #fff;
+  color: var(--text);
+}
+#text-input:focus {
+  border-color: var(--primary);
+  outline: 2px solid var(--primary);
+  outline-offset: -1px;
+}
+#text-input:disabled { cursor: not-allowed; }
+
+/* Buttons */
+.btn {
+  border: none;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+}
+.btn-scenario {
+  background: var(--primary-dim);
+  color: var(--primary);
+  border: 1px solid var(--primary);
+  text-align: left;
+}
+.btn-scenario.active {
+  background: var(--primary);
+  color: #fff;
+}
+
+/* Scenarios */
+.scenarios h2 {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.scenario-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.hint code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  background: #eceff1;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+/* Draft display */
+.draft-display {
+  flex: 1;
+}
+.draft-display .placeholder {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 14px;
+  padding: 32px 0;
+}
+
+/* Draft card */
+.card {
+  background: var(--card-bg);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+.card-header .intent {
+  font-size: 14px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.card-header .draft-id {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 14px;
+}
+.row .label {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.row .value {
+  font-weight: 600;
+  text-align: right;
+  word-break: break-all;
+}
+.row .value.mono { font-family: var(--mono); font-size: 13px; }
+
+.amount-row .value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.transcript {
+  background: #fafafa;
+  border-left: 3px solid var(--border);
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-style: italic;
+  border-radius: 0 6px 6px 0;
+}
+
+.meta {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
+.meta .hash-line {
+  word-break: break-all;
+}
+
+/* Status badges */
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.badge-preview { background: #eceff1; color: #455a64; }
+.badge-warn { background: var(--warn-bg);  color: var(--warn); }
+.badge-danger { background: var(--danger-bg); color: var(--danger); }
+
+/* Demo label (scenario section) */
+.demo-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* Error card */
+.error-card {
+  border: 2px solid var(--danger);
+}
+.error-card .hint {
+  margin-top: 4px;
+}
+
+/* Action bar (disabled) */
+.action-bar {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+.btn-action {
+  flex: 1;
+  background: #e0e0e0;
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+/* Clarification UI */
+.clarify-card {
+  border: 2px solid var(--warn);
+}
+.clarify-prompt {
+  font-size: 14px;
+  font-weight: 700;
+}
+.clarify-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Payee candidate buttons (real <button> elements) */
+.candidate-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: border-color 0.15s, background 0.15s;
+}
+.candidate-btn:hover,
+.candidate-btn:focus-visible {
+  border-color: var(--primary);
+  background: var(--primary-dim);
+  outline: 2px solid var(--primary);
+  outline-offset: -1px;
+}
+.candidate-btn.selected {
+  border-color: var(--primary);
+  background: var(--primary-dim);
+}
+.candidate-btn .candidate-name {
+  flex: 1;
+  font-weight: 600;
+  font-size: 15px;
+}
+.candidate-btn .candidate-acct {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.candidate-btn .candidate-check {
+  color: var(--primary);
+  font-weight: 700;
+  display: none;
+}
+
+/* Payee search field */
+.payee-search {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.filter-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+  background: #fff;
+}
+.filter-input:focus {
+  border-color: var(--primary);
+  outline: 2px solid var(--primary);
+  outline-offset: -1px;
+}
+.no-match {
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: center;
+  padding: 8px;
+}
+/* Ensure the `hidden` attribute overrides any display rule
+   (browsers honour hidden natively, but being explicit avoids
+   flex/display conflicts on .clarify-list and .no-match). */
+[hidden] { display: none !important; }
+
+/* Preview banner (page-wide) */
+.preview-banner {
+  background: #eceff1;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: #455a64;
+  line-height: 1.4;
+}
+
+/* Expiry notice */
+.expiry-notice {
+  background: var(--warn-bg);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--warn);
+  line-height: 1.4;
+}
+
+/* Technical details (collapsible) */
+.tech-details {
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+.tech-details summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.tech-details summary:hover {
+  color: var(--text);
+}
+.tech-details[open] summary {
+  margin-bottom: 8px;
+}
+
+/* Policy hold card */
+.policy-hold {
+  background: var(--warn-bg);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--warn);
+  font-weight: 500;
+}
+
+/* Account-display note */
+.acct-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: #eceff1;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+/* Footer */
+.app-footer {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.footer-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.footer-note code {
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+/* Items summary line (multi-intent response) */
+.items-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  padding: 0 4px;
+}
+
+/* Question item card (no draft exists yet) */
+.question-card .question-text {
+  font-size: 15px;
+  line-height: 1.5;
+  padding: 12px 16px;
+  background: var(--warn-bg);
+  border-radius: 8px;
+  margin: 8px 0;
+  color: var(--text);
+}
+.question-card .hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 8px 0;
+}

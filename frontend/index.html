@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DCTA Frontend Prototype</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div class="phone-frame">
+
+  <!-- Header -->
+  <header class="app-header">
+    <h1>Transaction Drafts</h1>
+    <p class="subtitle">Preview · signing and execution disabled</p>
+  </header>
+
+  <!-- API status banner -->
+  <div class="preview-banner" id="api-banner">
+    Text input calls <code>POST /api/message</code>. If the backend is not
+    running, Send will fail with a clear error. The buttons below load
+    sample fixtures as a demo fallback.
+  </div>
+
+  <!-- Text input -->
+  <section class="input-section">
+    <label for="text-input" class="input-label">Your message</label>
+    <textarea id="text-input" rows="2" placeholder="e.g. Send fifty dollars to John Smith."></textarea>
+    <button id="send-btn" class="btn btn-primary">Send</button>
+    <p class="hint" id="input-hint">
+      Send posts <code>{"transcript": "..."}</code> to
+      <code>/api/message</code>. The server returns the draft — the
+      frontend never constructs or mutates one.
+    </p>
+  </section>
+
+  <!-- Sample scenario buttons (demo fallback) -->
+  <section class="scenarios">
+    <h2>Sample scenarios <span class="demo-label">(demo fallback)</span></h2>
+    <p class="hint">These buttons load local fixture files for preview when the backend is not available.</p>
+    <div class="scenario-buttons">
+      <button class="btn btn-scenario" data-scenario="clean_transfer">1. Clean Transfer</button>
+      <button class="btn btn-scenario" data-scenario="ambiguous_payee">2. Ambiguous Payee (clarify)</button>
+      <button class="btn btn-scenario" data-scenario="equity_purchase">3. Equity Purchase</button>
+      <button class="btn btn-scenario" data-scenario="over_limit">4. Over Limit (policy hold)</button>
+    </div>
+  </section>
+
+  <!-- Draft display area -->
+  <section id="draft-display" class="draft-display">
+    <p class="placeholder">Select a scenario above to display its draft.</p>
+  </section>
+
+  <!-- Footer -->
+  <footer class="app-footer">
+    <p class="footer-note">
+      WebAuthn signing and execution are <strong>disabled</strong> in this
+      prototype. The frontend never builds or mutates a draft
+      (CONTEXT.md core rule, hard constraint 1). The text input sends
+      to <code>/api/message</code>; the sample buttons load local fixtures.
+    </p>
+  </footer>
+
+</div>
+
+<script src="js/canonical.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
