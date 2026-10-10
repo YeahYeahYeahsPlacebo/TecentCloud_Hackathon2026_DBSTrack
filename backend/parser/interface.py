@@ -88,7 +88,20 @@ class ParserCannotHandle(Exception):
     handles a small fixed set of single-intent sentences.  Raising here is
     better than returning a malformed or guessed draft, and better than
     silently dropping one of two detected intents.
+
+    The optional ``reason`` attribute is a short structured string that
+    identifies which check declined the request, e.g.
+    ``"model: N intents"``, ``"keyword guard"``, ``"invalid model output"``,
+    ``"unknown intent_type"``, ``"empty transcript"``.  It is purely
+    informational (for eval tables and logging) and does not change any
+    behaviour.
     """
+
+    reason: str = ""
+
+    def __init__(self, message: str = "", *, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason or message
 
 
 def parse(transcript: str) -> ParseResult:
