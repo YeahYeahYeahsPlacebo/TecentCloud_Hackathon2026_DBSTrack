@@ -276,6 +276,10 @@ class LlmParser:
         carrying the original transcript and the fields resolved so
         far, so the server can correlate an answer with the original
         request (CONTRACT.md §4, second form).
+
+        The ``partial`` dict shape is identical to the stub parser's
+        (see :class:`PendingQuestion` docstring for the shape contract).
+        Unresolved fields are **omitted**, never ``None``.
         """
         # ── Transcript verification for *_mention fields ──────────
         mentions = {
@@ -302,106 +306,124 @@ class LlmParser:
             "source_account": self._directory.default_source_account(),
         }
 
-        # If amount_text fails the transcript check, treat as unresolved.
-        if "amount_text" in transcript_failures:
-            return _make_question_result(
-                "amount", "How much would you like to send?",
-                transcript, partial,
-            )
-
-        # If amount is in uncertain_fields or missing, ask.
-        if "amount" in uncertain or not amount_value:
-            return _make_question_result(
-                "amount", "How much would you like to send?",
-                transcript, partial,
-            )
-
-        # Validate the money pattern.
-        if not _is_valid_money(amount_value):
-            return _make_question_result(
-                "amount", "How much would you like to send?",
-                transcript, partial,
-            )
-
-        currency = intent.currency or "SGD"
-        partial["amount"] = {"value": amount_value, "currency": currency}
-
         # ── Payee resolution (transfer / bill_payment) ─────────────
+        # Resolve the payee into partial, but do NOT return a question
+        # yet.  We want the partial to carry the amount too (if
+        # resolved) before we ask about the payee, so that
+        # resolve_question can build a valid transfer draft from
+        # partial + the payee answer.
         payee: Payee | None = None
         payee_candidates: list[PayeeCandidate] | None = None
         unresolved: list[str] = []
+        need_payee_question = False
 
         if intent_type in ("transfer", "bill_payment"):
-            # If payee_mention fails the transcript check, ask.
+            # If payee_mention fails the transcript check, mark for asking.
             if "payee_mention" in transcript_failures:
-                return _make_question_result(
-                    "payee", "Who would you like to send to?",
-                    transcript, partial,
-                )
+                need_payee_question = True
+            else:
+                matches = match_payees(intent.payee_mention, self._directory)
 
-            matches = match_payees(intent.payee_mention, self._directory)
-
-            if len(matches) == 0:
-                # Zero matches → ask the user.
-                return _make_question_result(
-                    "payee", "Who would you like to send the money to?",
-                    transcript, partial,
-                )
-
-            if len(matches) >= 2:
-                # Ambiguous → draft with payee in unresolved.
-                unresolved.append("payee")
-                payee_candidates = [
-                    PayeeCandidate(
+                if len(matches) == 0:
+                    # Zero matches → mark for asking.
+                    need_payee_question = True
+                elif len(matches) >= 2:
+                    # Ambiguous → draft with payee in unresolved.
+                    unresolved.append("payee")
+                    payee_candidates = [
+                        PayeeCandidate(
+                            id=m.id,
+                            display_name=m.display_name,
+                            masked_account=m.masked_account,
+                        )
+                        for m in matches
+                    ]
+                else:
+                    # Exactly one match → resolved payee.
+                    m = matches[0]
+                    payee = Payee(
                         id=m.id,
                         display_name=m.display_name,
                         masked_account=m.masked_account,
                     )
-                    for m in matches
-                ]
-            else:
-                # Exactly one match → resolved payee.
-                m = matches[0]
-                payee = Payee(
-                    id=m.id,
-                    display_name=m.display_name,
-                    masked_account=m.masked_account,
-                )
-                partial["payee"] = {
-                    "id": m.id,
-                    "display_name": m.display_name,
-                    "masked_account": m.masked_account,
-                }
+                    partial["payee"] = {
+                        "id": m.id,
+                        "display_name": m.display_name,
+                        "masked_account": m.masked_account,
+                    }
+
+        # ── Amount checks ──────────────────────────────────────────
+        # Resolve the amount into partial if it's valid.  If not, mark
+        # for asking — but don't return yet, so the partial carries the
+        # payee (if resolved) before we ask about the amount.
+        need_amount_question = False
+
+        if "amount_text" in transcript_failures:
+            need_amount_question = True
+        elif "amount" in uncertain or not amount_value:
+            need_amount_question = True
+        elif not _is_valid_money(amount_value):
+            need_amount_question = True
+        else:
+            currency = intent.currency or "SGD"
+            partial["amount"] = {"value": amount_value, "currency": currency}
+
+        # ── Ask in priority order: amount, then payee ──────────────
+        # Amount has priority because no draft can be produced without
+        # it (CONTRACT.md §2: "amount cannot be in unresolved").
+        if need_amount_question:
+            return _make_question_result(
+                "amount", "How much would you like to send?",
+                transcript, partial,
+            )
+
+        if need_payee_question:
+            return _make_question_result(
+                "payee", "Who would you like to send the money to?",
+                transcript, partial,
+            )
+
+        # Amount is resolved — extract the values.
+        currency = intent.currency or "SGD"
 
         # ── Equity fields ──────────────────────────────────────────
         ticker: str | None = None
         order_type: str | None = intent.order_type
         notional_amount: str | None = None
+        need_ticker_question = False
+        need_order_type_question = False
 
         if intent_type == "equity_purchase":
+            # Add order_type to partial before the ticker check so the
+            # partial carries it when we ask for the ticker.
+            if order_type:
+                partial["order_type"] = order_type
+            else:
+                need_order_type_question = True
+
             # Ticker resolved only through the directory.
             if "ticker_mention" in transcript_failures:
+                need_ticker_question = True
+            else:
+                ticker = resolve_ticker(intent.ticker_mention, self._directory)
+                if ticker is None:
+                    need_ticker_question = True
+                else:
+                    partial["ticker"] = ticker
+
+            # Ask in priority order: ticker, then order_type.
+            if need_ticker_question:
                 return _make_question_result(
                     "ticker", "Which stock would you like to buy?",
                     transcript, partial,
                 )
 
-            ticker = resolve_ticker(intent.ticker_mention, self._directory)
-            if ticker is None:
-                return _make_question_result(
-                    "ticker", "Which stock would you like to buy?",
-                    transcript, partial,
-                )
-
-            partial["ticker"] = ticker
-
-            if not order_type:
+            if need_order_type_question:
                 return _make_question_result(
                     "order_type", "Market or limit order?",
                     transcript, partial,
                 )
 
-            partial["order_type"] = order_type
             notional_amount = amount_value
 
         # ── Source account (product rule, not a guess) ─────────────

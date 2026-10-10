@@ -368,19 +368,26 @@ def parse(transcript: str) -> ParseResult:
         if amount is None:
             # Per CONTRACT.md §2, amount cannot be in unresolved.
             # The parser must ask before producing any draft.
+            # Build the partial dict.  If the user named "John Smith",
+            # carry the payee in partial so resolve_question can build
+            # a valid transfer draft from partial + the amount answer.
+            # Unresolved fields are omitted (never None) — matching
+            # the shape contract on PendingQuestion.
+            partial: dict = {
+                "intent_type": "transfer",
+                "source_account": "acct-001-2345",
+            }
+            if "john smith" in lower:
+                partial["payee"] = {
+                    "id": "payee-001",
+                    "display_name": "John Smith",
+                    "masked_account": "****1234",
+                }
             return _question_result(
                 "amount",
                 "How much would you like to send?",
                 transcript,
-                partial={
-                    "intent_type": "transfer",
-                    "source_account": "acct-001-2345",
-                    "payee": {
-                        "id": "payee-001",
-                        "display_name": "John Smith",
-                        "masked_account": "****1234",
-                    } if "john smith" in lower else None,
-                },
+                partial=partial,
             )
 
         # "John Smith" (full name) → clean transfer

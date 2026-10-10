@@ -103,6 +103,32 @@ class PendingQuestion(BaseModel):
         expires_at: When the question expires (same 5-minute window as
             the draft the question was derived from).
 
+    ``partial`` shape contract (identical for stub and LLM parsers):
+
+    ``partial`` is a plain ``dict[str, Any]`` with these conventions:
+
+    - ``intent_type``: ``str`` — always present (e.g. ``"transfer"``).
+    - ``source_account``: ``str`` — always present (the directory's
+      default source account).
+    - ``amount``: ``{"value": "50.00", "currency": "SGD"}`` — a plain
+      dict with a money-pattern ``value`` and a 3-letter ``currency``.
+      Present only when the amount is already resolved; absent when
+      the question is asking for the amount.
+    - ``payee``: ``{"id": "payee-001", "display_name": "John Smith",
+      "masked_account": "****1234"}`` — a plain dict matching the
+      ``Payee`` shape.  Present only when the payee is already
+      resolved; absent when the payee is unresolved or the question
+      is asking for the payee.
+    - ``ticker``: ``str`` (e.g. ``"D05.SI"``).  Present only for
+      equity purchases where the ticker is already resolved.
+    - ``order_type``: ``str`` (e.g. ``"market"``).  Present only for
+      equity purchases where the order type is already resolved.
+
+    **Unresolved fields are omitted, never ``None``.**  This mirrors
+    the draft model's own convention (``reject_explicit_nulls``) and
+    ensures ``_build_draft_from_partial`` can use ``partial.get(field)``
+    without distinguishing ``None`` from "not present".
+
     Single-use enforcement (refusing a second answer for the same
     ``question_id``) is the **server's** job — it holds storage.  This
     model is a value object; it does not track consumption.

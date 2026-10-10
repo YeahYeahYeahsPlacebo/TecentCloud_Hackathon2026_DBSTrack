@@ -46,6 +46,7 @@ This module contains no parser or validator logic — it is plumbing only.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -59,6 +60,10 @@ from backend.llm.interface import ChatReply, ModelCallError
 DEFAULT_ENDPOINT = "https://wss.lke.tencentcloud.com/adp/v2/chat"
 DEFAULT_TIMEOUT = 30
 
+# Wait this many seconds before retrying after an empty reply or a
+# rate-limit error from ADP.
+_RETRY_WAIT_SECONDS = 2
+
 # SSE event types that matter for text assembly and error handling.
 _EVENT_MESSAGE_ADDED = "message.added"
 _EVENT_TEXT_DELTA = "text.delta"
@@ -70,6 +75,15 @@ _EVENT_DONE = "done"
 # Message Type values that distinguish reasoning from reply content.
 _MSG_TYPE_THOUGHT = "thought"
 _MSG_TYPE_REPLY = "reply"
+
+# ADP error codes that indicate rate limiting.  Retrying after a short
+# wait often succeeds.  Codes observed in practice:
+#   460014 — request frequency limit (QPS exceeded)
+#   460015 — request frequency limit (daily quota)
+#
+# These codes are matched as strings so both int and str values from
+# JSON work correctly.
+_RATE_LIMIT_CODES: set[str] = {"460014", "460015"}
 
 
 # ── Request building ─────────────────────────────────────────────────
@@ -361,6 +375,13 @@ class AdpChatClient:
         Raises :class:`ModelCallError` on timeouts, HTTP errors, auth
         errors, malformed streams, server error events, and empty
         replies.
+
+        **Retry policy.** If ADP returns an empty reply (stream ended
+        with no reply text) or a rate-limit error event, the client
+        waits ``_RETRY_WAIT_SECONDS`` and retries once.  If the retry
+        also fails, the error is raised (fail closed).  All other
+        errors (timeouts, auth, HTTP non-200, non-rate-limit error
+        events) are raised immediately without retry.
         """
         reply, _ = self._ask_internal(message)
         return reply
@@ -370,6 +391,41 @@ class AdpChatClient:
 
         The raw stream is exposed so ``--debug`` tools can trace
         events without re-issuing the request.
+        """
+        try:
+            full_text, raw_stream, resp_conversation_id, request_id = (
+                self._attempt(message)
+            )
+        except ModelCallError as exc:
+            if not _should_retry(exc):
+                raise
+            # Retry once after a short wait.
+            time.sleep(_RETRY_WAIT_SECONDS)
+            full_text, raw_stream, resp_conversation_id, request_id = (
+                self._attempt(message)
+            )
+
+        return (
+            ChatReply(
+                text=full_text,
+                conversation_id=resp_conversation_id,
+                request_id=request_id,
+            ),
+            raw_stream,
+        )
+
+    def _attempt(
+        self,
+        message: str,
+    ) -> tuple[str, str, str, str]:
+        """One attempt: build request, call ADP, parse SSE.
+
+        Returns ``(full_text, raw_stream, resp_conversation_id,
+        request_id)`` on success, or raises :class:`ModelCallError`.
+
+        Never includes the AppKey or request body in the error
+        message.  Includes the HTTP status, and the error event's Code
+        and Message when available.
         """
         conversation_id = str(uuid.uuid4())
         visitor_id = str(uuid.uuid4())
@@ -383,6 +439,7 @@ class AdpChatClient:
             request_id=request_id,
         )
 
+        http_status: int | None = None
         try:
             client_kwargs: dict[str, Any] = {"timeout": self._timeout}
             if self._transport is not None:
@@ -394,6 +451,7 @@ class AdpChatClient:
                     json=body,
                     headers={"Content-Type": "application/json"},
                 ) as response:
+                    http_status = response.status_code
                     if response.status_code != 200:
                         raise ModelCallError(
                             f"ADP returned HTTP {response.status_code}"
@@ -432,16 +490,41 @@ class AdpChatClient:
             full_text = "".join(reply_deltas)
 
         if not full_text.strip():
+            # Include whatever ADP sent back: the HTTP status (known
+            # to be 200 at this point since non-200 raised above), and
+            # a note that no reply-announced message was found.  Never
+            # include the key or request body.
+            status_str = str(http_status) if http_status is not None else "unknown"
             raise ModelCallError(
-                "ADP returned no reply text "
-                "(no messages announced as Type 'reply')"
+                f"ADP returned no reply text "
+                f"(HTTP {status_str}, no messages announced as Type 'reply')"
             )
 
-        return (
-            ChatReply(
-                text=full_text,
-                conversation_id=resp_conversation_id or conversation_id,
-                request_id=request_id,
-            ),
-            raw_stream,
-        )
+        return full_text, raw_stream, resp_conversation_id or conversation_id, request_id
+
+
+def _should_retry(exc: ModelCallError) -> bool:
+    """Return True if the error is retryable (empty reply or rate-limit).
+
+    Empty replies and rate-limit error events are transient — retrying
+    after a short wait often succeeds.  All other errors (timeouts,
+    auth, HTTP non-200, non-rate-limit error events) are not retried.
+    """
+    msg = str(exc).lower()
+
+    # Empty reply — the stream ended without reply text.
+    if "no reply text" in msg:
+        return True
+
+    # Rate-limit error events carry the code in the message.
+    # _should_retry checks the message text because ModelCallError
+    # stores everything as a string.
+    if "rate" in msg or "frequency" in msg or "quota" in msg:
+        return True
+
+    # Check known rate-limit codes.
+    for code in _RATE_LIMIT_CODES:
+        if code in str(exc):
+            return True
+
+    return False

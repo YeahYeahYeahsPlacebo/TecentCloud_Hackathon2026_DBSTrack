@@ -723,3 +723,270 @@ class TestConfigLoader:
         assert settings.validator_model_label == "Tencent-Hy3"
         assert settings.adp_endpoint == DEFAULT_ENDPOINT
         assert settings.adp_timeout_seconds == 30
+
+
+# ── Retry logic for empty reply and rate-limit errors ────────────────
+#
+# ADP sometimes returns an empty reply (stream ends with no reply text)
+# or a rate-limit error event (Code 460014 / 460015).  The client must
+# retry once after a 2-second wait.  If the retry succeeds, return the
+# reply.  If the retry also fails, raise ModelCallError (fail closed).
+#
+# All tests patch time.sleep so they run instantly.
+
+
+class TestRetryOnEmptyReply:
+    """Empty reply on the first attempt → retry once → success."""
+
+    def test_retry_then_success_on_empty_reply(self, monkeypatch):
+        import backend.llm.adp_client as adp_module
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(
+            adp_module.time, "sleep",
+            lambda secs: sleep_calls.append(secs),
+        )
+
+        # First response: empty (no reply text).  Second: a real reply.
+        empty_sse = make_sse_stream(text_chunks=[], conversation_id="conv-1")
+        good_sse = make_sse_stream(
+            text_chunks=["Hello"], conversation_id="conv-2",
+        )
+        responses = [empty_sse, good_sse]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sse = responses.pop(0)
+            return httpx.Response(
+                200,
+                content=sse.encode("utf-8"),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        client = AdpChatClient(
+            app_key=DUMMY_KEY,
+            timeout_seconds=5,
+            _transport=httpx.MockTransport(handler),
+        )
+        reply = client.ask("Hi")
+        assert reply.text == "Hello"
+        # One sleep call with the retry wait.
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == 2
+
+    def test_retry_then_fail_on_empty_reply(self, monkeypatch):
+        import backend.llm.adp_client as adp_module
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(
+            adp_module.time, "sleep",
+            lambda secs: sleep_calls.append(secs),
+        )
+
+        # Both responses: empty (no reply text).
+        empty_sse = make_sse_stream(text_chunks=[], conversation_id="conv-1")
+        responses = [empty_sse, empty_sse]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sse = responses.pop(0)
+            return httpx.Response(
+                200,
+                content=sse.encode("utf-8"),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        client = AdpChatClient(
+            app_key=DUMMY_KEY,
+            timeout_seconds=5,
+            _transport=httpx.MockTransport(handler),
+        )
+        with pytest.raises(ModelCallError) as exc_info:
+            client.ask("Hi")
+        # The error message should include the HTTP status.
+        assert "200" in str(exc_info.value)
+        assert "no reply text" in str(exc_info.value).lower()
+        # One sleep call (the retry wait).
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == 2
+        # Key never in error.
+        assert DUMMY_KEY not in str(exc_info.value)
+
+
+class TestRetryOnRateLimit:
+    """Rate-limit error event on the first attempt → retry once."""
+
+    def test_retry_then_success_on_rate_limit(self, monkeypatch):
+        import backend.llm.adp_client as adp_module
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(
+            adp_module.time, "sleep",
+            lambda secs: sleep_calls.append(secs),
+        )
+
+        # First response: rate-limit error.  Second: a real reply.
+        rate_limit_sse = make_sse_stream(
+            error={"Code": 460014, "Message": "Request frequency limit."},
+        )
+        good_sse = make_sse_stream(
+            text_chunks=["OK"], conversation_id="conv-2",
+        )
+        responses = [rate_limit_sse, good_sse]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sse = responses.pop(0)
+            return httpx.Response(
+                200,
+                content=sse.encode("utf-8"),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        client = AdpChatClient(
+            app_key=DUMMY_KEY,
+            timeout_seconds=5,
+            _transport=httpx.MockTransport(handler),
+        )
+        reply = client.ask("Hi")
+        assert reply.text == "OK"
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == 2
+
+    def test_retry_then_fail_on_rate_limit(self, monkeypatch):
+        import backend.llm.adp_client as adp_module
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(
+            adp_module.time, "sleep",
+            lambda secs: sleep_calls.append(secs),
+        )
+
+        # Both responses: rate-limit error.
+        rate_limit_sse = make_sse_stream(
+            error={"Code": 460014, "Message": "Request frequency limit."},
+        )
+        responses = [rate_limit_sse, rate_limit_sse]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sse = responses.pop(0)
+            return httpx.Response(
+                200,
+                content=sse.encode("utf-8"),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        client = AdpChatClient(
+            app_key=DUMMY_KEY,
+            timeout_seconds=5,
+            _transport=httpx.MockTransport(handler),
+        )
+        with pytest.raises(ModelCallError) as exc_info:
+            client.ask("Hi")
+        assert "460014" in str(exc_info.value)
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == 2
+        assert DUMMY_KEY not in str(exc_info.value)
+
+
+class TestNoRetryOnOtherErrors:
+    """Non-retryable errors must NOT trigger a retry."""
+
+    def test_auth_error_no_retry(self, monkeypatch):
+        import backend.llm.adp_client as adp_module
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(
+            adp_module.time, "sleep",
+            lambda secs: sleep_calls.append(secs),
+        )
+
+        # Auth error (invalid key) — not retryable.
+        auth_error_sse = make_sse_stream(
+            error={"Code": 4505004, "Message": "APPKEY is invalid."},
+        )
+
+        call_count = [0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count[0] += 1
+            return httpx.Response(
+                200,
+                content=auth_error_sse.encode("utf-8"),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        client = AdpChatClient(
+            app_key=DUMMY_KEY,
+            timeout_seconds=5,
+            _transport=httpx.MockTransport(handler),
+        )
+        with pytest.raises(ModelCallError) as exc_info:
+            client.ask("Hi")
+        # No retry — only one call.
+        assert call_count[0] == 1
+        assert len(sleep_calls) == 0
+        assert "4505004" in str(exc_info.value)
+
+    def test_http_500_no_retry(self, monkeypatch):
+        import backend.llm.adp_client as adp_module
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(
+            adp_module.time, "sleep",
+            lambda secs: sleep_calls.append(secs),
+        )
+
+        call_count = [0]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count[0] += 1
+            return httpx.Response(
+                500,
+                content=b"Internal Server Error",
+                headers={"Content-Type": "text/plain"},
+            )
+
+        client = AdpChatClient(
+            app_key=DUMMY_KEY,
+            timeout_seconds=5,
+            _transport=httpx.MockTransport(handler),
+        )
+        with pytest.raises(ModelCallError) as exc_info:
+            client.ask("Hi")
+        assert call_count[0] == 1
+        assert len(sleep_calls) == 0
+        assert "500" in str(exc_info.value)
+
+
+class TestEmptyReplyErrorMessage:
+    """The empty-reply error message must include the HTTP status and
+    mention that no reply-announced message was found."""
+
+    def test_error_message_includes_http_status(self, monkeypatch):
+        import backend.llm.adp_client as adp_module
+
+        monkeypatch.setattr(adp_module.time, "sleep", lambda secs: None)
+
+        empty_sse = make_sse_stream(text_chunks=[], conversation_id="conv-x")
+        responses = [empty_sse, empty_sse]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sse = responses.pop(0)
+            return httpx.Response(
+                200,
+                content=sse.encode("utf-8"),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        client = AdpChatClient(
+            app_key=DUMMY_KEY,
+            timeout_seconds=5,
+            _transport=httpx.MockTransport(handler),
+        )
+        with pytest.raises(ModelCallError) as exc_info:
+            client.ask("Hi")
+        msg = str(exc_info.value)
+        # HTTP status 200 is in the message (both attempts returned 200).
+        assert "200" in msg
+        assert "no reply text" in msg.lower()
+        assert "Type 'reply'" in msg
+        # Key and request body never in the message.
+        assert DUMMY_KEY not in msg
