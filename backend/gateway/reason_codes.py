@@ -27,6 +27,19 @@ SCHEMA_INVALID = "schema_invalid"
 # ── /api/clarify ──
 INVALID_CLARIFICATION_ANSWER = "invalid_clarification_answer"
 
+# ── /api/message ──
+# CONTRACT.md §8 open question 4 is marked Resolved: before phase 5, a
+# transcript that describes more than one transaction must be rejected with no
+# draft drafted at all. These two codes are NOT yet in the §5 table — adding
+# them is a contract change and needs all three members to agree. The gateway
+# uses them because the alternative is an unhandled 500.
+MULTI_INTENT_UNSUPPORTED = "multi_intent_unsupported"
+
+# The same ParserCannotHandle covers "the stub does not recognise this
+# sentence", which is a different failure from "two intents". It gets its own
+# code so an eval table can tell the two apart.
+PARSER_CANNOT_HANDLE = "parser_cannot_handle"
+
 ALL_REASON_CODES: frozenset[str] = frozenset(
     {
         MALFORMED_REQUEST,
@@ -43,6 +56,8 @@ ALL_REASON_CODES: frozenset[str] = frozenset(
         STEP_UP_REQUIRED,
         SCHEMA_INVALID,
         INVALID_CLARIFICATION_ANSWER,
+        MULTI_INTENT_UNSUPPORTED,
+        PARSER_CANNOT_HANDLE,
     }
 )
 

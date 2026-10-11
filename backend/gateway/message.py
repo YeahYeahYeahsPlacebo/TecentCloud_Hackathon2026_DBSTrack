@@ -37,7 +37,7 @@ from backend.gateway import reason_codes as R
 from backend.gateway.errors import rejection_response
 from backend.models.draft import TransactionDraft
 from backend.parser.clarify import resolve_payee, resolve_question
-from backend.parser.interface import InvalidClarificationAnswer
+from backend.parser.interface import InvalidClarificationAnswer, ParserCannotHandle
 from backend.policy import PolicyEngine
 
 # CONTRACT.md §8 open question 3: the fixtures use 5 minutes, but the intended
@@ -51,6 +51,20 @@ CLARIFIED_CONFIDENCE = 0.9
 
 # Only payee may stay unresolved inside an existing draft (CONTRACT.md §2).
 RESOLVABLE_IN_PLACE = "payee"
+
+
+def _cannot_handle_code(exc: Exception) -> str:
+    """Pick the reason code for a :class:`ParserCannotHandle`.
+
+    ``exc.reason`` is informational ("model: 2 intents", "keyword guard"), so
+    it cannot be sent as a code. Anything that names a second intent is the
+    phase-5 refusal; everything else is "the parser does not know this one".
+    """
+    reason = getattr(exc, "reason", "") or ""
+    lowered = reason.lower()
+    if "intent" in lowered:
+        return R.MULTI_INTENT_UNSUPPORTED
+    return R.PARSER_CANNOT_HANDLE
 
 
 class ParserContractViolation(RuntimeError):
@@ -297,7 +311,16 @@ class MessageService:
         if not isinstance(transcript, str) or not transcript.strip():
             return rejection_response(R.MALFORMED_REQUEST, "'transcript' must be a non-empty string")
 
-        result = self.parser(transcript)
+        try:
+            result = self.parser(transcript)
+        except ParserCannotHandle as exc:
+            # CONTRACT.md §8 open question 4 (Resolved): before phase 5, a
+            # transcript describing more than one transaction is refused with
+            # nothing drafted. The parser raises rather than dropping one of
+            # two intents; the gateway is what turns that into a rejection,
+            # because "reject with a reason code" is a gateway job.
+            return rejection_response(_cannot_handle_code(exc), str(exc) or "parser cannot handle this transcript")
+
         if len(result.items) != result.intents_detected:
             raise ParserContractViolation(
                 f"parser returned {len(result.items)} item(s) but detected "
