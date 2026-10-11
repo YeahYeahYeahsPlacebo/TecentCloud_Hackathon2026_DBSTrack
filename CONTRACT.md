@@ -663,6 +663,7 @@ developer log, not necessarily for the user.
 | `backend/validator/` | Member 1 | Read-only comparison of transcript vs. draft; no tools, no ledger access. |
 | `frontend/` | Member 2 | Display drafts, collect signatures, voice input. Never build or edit a draft. |
 | `backend/gateway/` | Member 3 | Verify signatures, enforce idempotency, reject or execute. |
+| `backend/bank/` | Member 3 | Mock bank: accounts, balances and payee records. Only the gateway imports it. Parser and validator must never import it (tests/test_import_boundaries.py). |
 | `backend/ledger/` | Member 3 | The ledger. Only the gateway writes to it. |
 | `backend/audit/` | Member 3 | Hash-chained audit log with `verify_chain()`. |
 | `backend/policy/` | Member 3 | Pure deterministic policy engine. No LLM. |
