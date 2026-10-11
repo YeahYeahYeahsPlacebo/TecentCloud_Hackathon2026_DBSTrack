@@ -51,6 +51,7 @@ class CredentialService:
         audit: Optional[Any] = None,
         clock: Optional[Callable[[], datetime]] = None,
         policy: Optional[Callable[[dict, str], Any]] = None,
+        verdicts: Optional[Mapping[str, str]] = None,
     ) -> None:
         self.store = store
         self.credentials = credentials
@@ -58,6 +59,7 @@ class CredentialService:
         self.audit = audit
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.policy = policy
+        self.verdicts: Mapping[str, str] = verdicts if verdicts is not None else {}
 
     # ── POST /api/webauthn/challenge ──────────────────────────────────
 
@@ -86,19 +88,32 @@ class CredentialService:
                 R.EXPIRED, f"draft expired at {draft.expires_at.isoformat()}"
             )
 
-        # Do not issue a challenge for a draft that policy has already
-        # blocked. A challenge is the server saying "I am willing to let you
-        # sign this"; issuing one for a draft step 12 would reject only spends
-        # the user's biometric on something that cannot succeed.
+        dumped = dump(draft)
+        digest = draft_hash(dumped)
+
+        # Do not issue a challenge for a draft the server already knows it will
+        # refuse. A challenge is the server saying "I am willing to let you
+        # sign this"; issuing one for a draft that check 11 or 12 will reject
+        # only spends the user's biometric on something that cannot succeed.
+        #
+        # Both gates are the same argument as each other. Neither is listed in
+        # CONTRACT.md §4 for this endpoint, which only names
+        # unknown/unresolved/expired — this is added deliberately, and is the
+        # kind of thing to flag in review.
+        verdict = self.verdicts.get(digest)
+        if verdict is not None and verdict != "pass":
+            return rejection_response(
+                R.VALIDATOR_FROZEN,
+                f"validator verdict for this draft is {verdict!r}, not 'pass'",
+            )
+
         if self.policy is not None:
-            dumped = dump(draft)
-            decision = self.policy(dumped, draft_hash(dumped))
+            decision = self.policy(dumped, digest)
             if getattr(decision, "decision", None) == "block":
                 return rejection_response(
                     R.POLICY_BLOCKED, getattr(decision, "reason", "blocked by policy")
                 )
 
-        digest = draft_hash(dump(draft))
         return {
             "draft_id": draft.id,
             "draft_hash": digest,
