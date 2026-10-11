@@ -451,3 +451,34 @@ body {
   color: var(--text-muted);
   margin: 8px 0;
 }
+
+/* ── Payee clarification actions ─────────────────────────── */
+.clarify-actions {
+  display: flex;
+  gap: 8px;
+}
+.clarify-confirm-btn {
+  flex: 1;
+}
+/* Loading state for confirm button */
+.clarify-confirm-btn:disabled {
+  opacity: 0.55;
+}
+
+/* Clarify status area (loading / error messages) */
+.clarify-status {
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 4px 0;
+}
+.clarify-status.clarify-loading {
+  background: #eceff1;
+  color: #455a64;
+}
+.clarify-status.clarify-error {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid var(--danger);
+}
