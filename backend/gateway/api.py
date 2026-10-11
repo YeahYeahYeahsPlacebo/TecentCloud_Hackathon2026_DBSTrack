@@ -48,7 +48,10 @@ class GatewayAPI:
         parser: Callable[[str], Any],
         draft_store: Optional[MutableMapping[str, Any]] = None,
         credentials: Optional[MutableMapping[str, Any]] = None,
-        validator: Optional[Callable[[Mapping[str, Any], str], Mapping[str, Any]]] = None,
+        # Any object with a ``validate(draft, transcript, clarification=...)``
+        # method (backend/validator), or a plain callable
+        # ``(draft_dict, transcript)``. The placeholder is used when omitted.
+        validator: Optional[Any] = None,
         policy: Optional[PolicyEngine] = None,
         limits: Optional[Limits] = None,
         audit: Optional[AuditLog] = None,
@@ -93,6 +96,7 @@ class GatewayAPI:
             audit=self.audit,
             clock=clock,
             policy=self._policy_call,
+            verdicts=self.verdicts,
         )
         self.executor = ExecuteGateway(
             draft_store=self.store,

@@ -127,7 +127,7 @@ class MessageService:
         self.store[draft.id] = draft
         dumped = dump(draft)
         digest = draft_hash(dumped)
-        verdict = dict(self.validator(dumped, draft.transcript))
+        verdict = self._run_validator(draft, dumped, digest)
         if self.verdicts is not None:
             # Recorded by hash so /api/execute check 11 can find it. Without
             # this the gateway's fail-closed default would reject everything
@@ -145,6 +145,68 @@ class MessageService:
             "validator": verdict,
             "policy": decision.to_response(),
         }
+
+    def _run_validator(
+        self,
+        draft: TransactionDraft,
+        dumped: Mapping[str, Any],
+        digest: str,
+        clarification: Optional[Any] = None,
+    ) -> dict:
+        """Run the validator and return a plain dict for the response.
+
+        Two shapes are supported:
+
+        * **The real interface** (``backend/validator``):
+          ``validator.validate(draft, transcript, clarification=...)``, which
+          returns a ``ValidatorVerdict`` model. Its ``__call__`` is
+          *deliberately disabled* — it raises, because the callable form would
+          drop the ``ClarificationRecord``. So it must be detected and called
+          as a method, not invoked.
+        * **A plain callable**: ``validator(draft_dict, transcript)`` returning
+          a mapping. This is the placeholder and what the tests inject.
+
+        Either way the verdict string is what check 11 reads, and anything
+        other than ``"pass"`` is rejected there — so a validator that fails to
+        produce a verdict fails closed rather than passing silently.
+        """
+        validator = self.validator
+
+        if hasattr(validator, "validate"):
+            result = validator.validate(
+                draft, draft.transcript, clarification=clarification
+            )
+            payload = (
+                result.model_dump()
+                if hasattr(result, "model_dump")
+                else dict(result)
+            )
+            payload = self._bind_verdict(payload, digest)
+            return payload
+
+        return dict(validator(dumped, draft.transcript))
+
+    @staticmethod
+    def _bind_verdict(payload: Mapping[str, Any], digest: str) -> dict:
+        """Refuse a verdict that was produced for a different draft.
+
+        ``ValidatorVerdict`` carries the hash of the draft it actually
+        checked. That exists so the gateway can bind the verdict to that exact
+        draft (CONTRACT.md §4, check 11). If it disagrees with the hash we
+        computed, the verdict is about something else — treat it as a freeze
+        rather than recording a pass we cannot attribute.
+        """
+        bound = payload.get("draft_hash")
+        if bound and bound != digest:
+            return {
+                **dict(payload),
+                "verdict": "freeze",
+                "reason": (
+                    f"verdict was produced for draft {bound}, "
+                    f"not the stored draft {digest}"
+                ),
+            }
+        return dict(payload)
 
     def _question_item(self, question: Any) -> dict:
         return {
