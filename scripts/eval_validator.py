@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,7 +33,7 @@ from backend.llm.config import load_llm_settings  # noqa: E402
 from backend.models.draft import TransactionDraft  # noqa: E402
 from backend.parser.directory import FixtureDirectory  # noqa: E402
 from backend.parser.interface import ClarificationRecord  # noqa: E402
-from backend.validator.llm_validator import LlmValidator  # noqa: E402
+from backend.validator.llm_validator import UNAVAILABLE, LlmValidator  # noqa: E402
 
 DIRECTORY = FixtureDirectory()
 
@@ -209,28 +210,30 @@ def _build_cases() -> list[dict]:
 
 
 def _print_table(
-    rows: list[tuple[str, str, str, str, str]],
+    rows: list[tuple[str, str, str, str, str, str]],
 ) -> tuple[int, int]:
     """Print the results table. Returns (matched, total)."""
     w_name = 50
     w_expected = 10
     w_verdict = 10
-    w_disc = 30
+    w_disc = 24
     w_match = 5
+    w_reason = 70
 
     hdr = (
         f"{'case':<{w_name}} "
         f"{'expected':<{w_expected}} "
         f"{'verdict':<{w_verdict}} "
         f"{'discrepancies':<{w_disc}} "
-        f"{'match':<{w_match}}"
+        f"{'match':<{w_match}} "
+        f"{'reason (unavailable only)':<{w_reason}}"
     )
     sep = "-" * len(hdr)
     print(hdr)
     print(sep)
 
     matched = 0
-    for name, expected, verdict, disc, match_str in rows:
+    for name, expected, verdict, disc, match_str, reason in rows:
         if match_str == "OK":
             matched += 1
         name_short = name if len(name) <= w_name else name[: w_name - 3] + "..."
@@ -240,7 +243,8 @@ def _print_table(
             f"{expected:<{w_expected}} "
             f"{verdict:<{w_verdict}} "
             f"{disc_short:<{w_disc}} "
-            f"{match_str:<{w_match}}"
+            f"{match_str:<{w_match}} "
+            f"{reason[:w_reason]}"
         )
     return matched, len(rows)
 
@@ -258,6 +262,12 @@ def main() -> int:
         type=float,
         default=3.0,
         help="Seconds to wait between live ADP calls (default: 3).",
+    )
+    ap.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Run the whole case list this many times (default: 1).",
     )
     args = ap.parse_args()
     delay = args.delay
@@ -277,33 +287,54 @@ def main() -> int:
     print()
 
     cases = _build_cases()
-    rows: list[tuple[str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    unavailable: Counter[str] = Counter()
+    first_call = True
 
-    for i, case in enumerate(cases):
-        # Wait before every call except the first.
-        if i > 0:
-            _delay(delay)
+    for run in range(1, args.repeat + 1):
+        if args.repeat > 1:
+            print(f"--- run {run}/{args.repeat} ---")
+        for case in cases:
+            # Wait before every call except the first.
+            if not first_call:
+                _delay(delay)
+            first_call = False
 
-        draft = case["draft"]
-        transcript = case["transcript"]
-        expected = case["expected"]
-        clarification = case.get("clarification")
+            draft = case["draft"]
+            transcript = case["transcript"]
+            expected = case["expected"]
+            clarification = case.get("clarification")
+            reason = ""
 
-        try:
-            verdict = validator.validate(draft, transcript, clarification=clarification)
-            v = verdict.verdict
-            disc = ", ".join(verdict.discrepancies) if verdict.discrepancies else ""
-        except Exception as e:
-            # Never print the full error if it might contain keys.
-            v = "error"
-            disc = str(type(e).__name__)
+            try:
+                verdict = validator.validate(
+                    draft, transcript, clarification=clarification,
+                )
+                v = verdict.verdict
+                disc = ", ".join(verdict.discrepancies) if verdict.discrepancies else ""
+                if verdict.reason.startswith(UNAVAILABLE):
+                    reason = verdict.reason
+                    unavailable[verdict.reason] += 1
+            except Exception as e:
+                # The type name only: never print a message that might
+                # carry a key.
+                v = "error"
+                disc = str(type(e).__name__)
 
-        match = "OK" if v == expected else "FAIL"
-        rows.append((case["name"], expected, v, disc, match))
+            match = "OK" if v == expected else "FAIL"
+            label = case["name"] if args.repeat == 1 else f"[{run}] {case['name']}"
+            rows.append((label, expected, v, disc, match, reason))
 
     matched, total = _print_table(rows)
     print()
     print(f"{total} cases, {matched} matched expectation.")
+    print()
+    if unavailable:
+        print(f"validator_unavailable: {sum(unavailable.values())} of {total} calls")
+        for cause, count in unavailable.most_common():
+            print(f"  {count} x {cause}")
+    else:
+        print("validator_unavailable: 0 calls")
 
     return 0
 

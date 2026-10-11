@@ -394,7 +394,10 @@ class TestFailClosed:
         verdict = validator.validate(draft, "Send fifty dollars to John Smith.")
 
         assert verdict.verdict == "freeze"
-        assert verdict.reason == "validator_unavailable"
+        assert verdict.reason == (
+            "validator_unavailable: ModelCallError "
+            "(FakeChatClient configured to raise)"
+        )
         assert verdict.draft_hash == _expected_hash(draft)
 
     def test_malformed_json_twice_freezes(self):
@@ -405,7 +408,7 @@ class TestFailClosed:
         verdict = validator.validate(draft, "Send fifty dollars to John Smith.")
 
         assert verdict.verdict == "freeze"
-        assert verdict.reason == "validator_unavailable"
+        assert verdict.reason == "validator_unavailable: invalid JSON after retry"
 
     def test_extra_fields_freezes(self):
         draft = _make_transfer_draft()
@@ -424,7 +427,10 @@ class TestFailClosed:
         verdict = validator.validate(draft, "Send fifty dollars to John Smith.")
 
         assert verdict.verdict == "freeze"
-        assert verdict.reason == "validator_unavailable"
+        assert verdict.reason == (
+            "validator_unavailable: reply did not match the schema after "
+            "retry (intents.0.extra_field: extra_forbidden)"
+        )
 
 
 # ── Prompt independence: draft never in the prompt ───────────────────
