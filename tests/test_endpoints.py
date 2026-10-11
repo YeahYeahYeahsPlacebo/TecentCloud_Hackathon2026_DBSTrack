@@ -10,22 +10,38 @@ These tests use a fake parser so they do not break when the real one changes.
 import hashlib
 import json
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from backend.canonical import draft_hash  # noqa: E402
 from backend.gateway.api import GatewayAPI  # noqa: E402
+from backend.gateway.message import MessageService, dump  # noqa: E402
 from backend.gateway.execute import (  # noqa: E402
     FLAG_USER_PRESENT,
     FLAG_USER_VERIFIED,
     b64url_encode,
 )
-from backend.gateway.message import CLARIFIED_CONFIDENCE, ParserContractViolation  # noqa: E402
+from backend.gateway.message import (  # noqa: E402
+    CLARIFIED_CONFIDENCE,
+    ParserContractViolation,
+    ServerNotConfigured,
+    ValidatorUnusable,
+    require_validator,
+)
 from backend.gateway.webauthn import der_to_raw_signature, public_key_to_pem  # noqa: E402
+from backend.llm.fake_client import FakeChatClient  # noqa: E402
 from backend.models.draft import TransactionDraft  # noqa: E402
-from backend.parser.interface import ClarifyingQuestion, ParseResult  # noqa: E402
+from backend.parser.directory import FixtureDirectory  # noqa: E402
+from backend.parser.interface import (  # noqa: E402
+    ClarifyingQuestion,
+    ParseResult,
+    PendingQuestion,
+)
+from gateway_fakes import FakeValidator, passing_validator  # noqa: E402
+import pytest  # noqa: E402
 from cryptography.hazmat.primitives import hashes  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 
@@ -53,12 +69,44 @@ def clean_and_now():
     return clean, clean.created_at + timedelta(minutes=1)
 
 
-def make_api(*items, now=None, known_payees=()):
+def live(draft, *, minutes_alive=1, window=5):
+    """Re-stamp a frozen fixture onto the real wall clock.
+
+    The fixtures are dated 2026-10-03. Member 1's ``resolve_payee`` and
+    ``resolve_question`` check expiry against ``datetime.now()``, not against
+    the gateway's injected clock, so a frozen fixture reads as expired and
+    every clarification test would pass for the wrong reason ("expired"
+    instead of the branch the test names). Shifting the window onto now keeps
+    the assertion honest.
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    data = draft.model_dump(mode="json", exclude_none=True)
+    data["created_at"] = now - timedelta(minutes=minutes_alive)
+    data["expires_at"] = now + timedelta(minutes=window)
+    return TransactionDraft.model_validate(data)
+
+
+def make_api(
+    *items,
+    now=None,
+    known_payees=(),
+    validator=None,
+    directory=None,
+    client=None,
+    parser=None,
+):
     clean, default_now = clean_and_now()
     return GatewayAPI(
-        parser=FakeParser(*items) if items else FakeParser(clean),
+        parser=parser
+        if parser is not None
+        else (FakeParser(*items) if items else FakeParser(clean)),
         clock=lambda: now or default_now,
         known_payees=known_payees,
+        validator=validator if validator is not None else passing_validator(),
+        # /api/clarify resolves payees through the directory, not from the
+        # candidate fields on the draft.
+        directory=directory if directory is not None else FixtureDirectory(),
+        client=client,
     )
 
 
@@ -70,7 +118,8 @@ def test_message_returns_a_draft_item_with_validator_and_policy_attached():
     assert response["intents_detected"] == 1
     item = response["items"][0]
     assert item["kind"] == "draft"
-    assert item["validator"] == {"verdict": "pass", "discrepancies": []}
+    assert item["validator"]["verdict"] == "pass"
+    assert item["validator"]["discrepancies"] == []
     assert item["policy"] == {"decision": "allow", "reason": None}
 
 
@@ -109,6 +158,71 @@ def test_message_rejects_an_empty_transcript():
     assert response["reason_code"] == "malformed_request"
 
 
+def test_the_gateway_has_no_default_that_can_pass(monkeypatch):
+    """The most important item from review: with no VALIDATOR_BACKEND=llm,
+    nothing the server does may produce a pass. It freezes and says why."""
+    monkeypatch.delenv("VALIDATOR_BACKEND", raising=False)
+    monkeypatch.delenv("DCTA_ALLOW_UNVALIDATED", raising=False)
+    clean, now = clean_and_now()
+    api = GatewayAPI(parser=FakeParser(clean), clock=lambda: now)  # no validator
+    draft_id = api.message({"transcript": "hi"})["items"][0]["draft"]["id"]
+
+    item = api.messages.message({"transcript": "hi"})["items"][0]
+    assert item["validator"]["verdict"] == "freeze"
+    assert item["validator"]["reason"] == "validator_not_configured"
+    assert api.challenge({"draft_id": draft_id})["reason_code"] == "validator_frozen"
+
+    # Check 11 is the last line of defence, so prove it holds even against a
+    # perfectly valid signature over the right draft: everything before it
+    # passes, and the freeze still stops the transaction.
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    credential_id = api.register(
+        {"user_id": "user-001", "public_key": public_key_to_pem(private_key.public_key())}
+    )["credential_id"]
+    challenge = b64url_encode(
+        bytes.fromhex(draft_hash(dump(api.store[draft_id])))
+    )
+    result = api.execute(
+        {
+            "draft_id": draft_id,
+            "credential_id": credential_id,
+            "idempotency_key": "idem-1",
+            "assertion": sign_assertion(private_key, credential_id, challenge),
+        }
+    )
+    assert result["reason_code"] == "validator_frozen"
+    assert api.ledger.entries == []
+
+
+def test_DCTA_ALLOW_UNVALIDATED_is_the_only_way_to_get_a_pass(monkeypatch):
+    """Opt-in, explicit, and labelled in the verdict — not a silent default."""
+    monkeypatch.delenv("VALIDATOR_BACKEND", raising=False)
+    monkeypatch.setenv("DCTA_ALLOW_UNVALIDATED", "true")
+    clean, now = clean_and_now()
+    api = GatewayAPI(parser=FakeParser(clean), clock=lambda: now)
+    item = api.message({"transcript": "hi"})["items"][0]
+    assert item["validator"]["verdict"] == "pass"
+    assert "unvalidated" in item["validator"]["reason"]
+
+
+def test_a_missing_or_wrongly_shaped_validator_is_refused_at_startup():
+    with pytest.raises(ValidatorUnusable):
+        require_validator(None)
+    # A plain callable cannot carry the ClarificationRecord, so it is refused
+    # rather than invoked. There is no callable fallback anywhere.
+    with pytest.raises(ValidatorUnusable):
+        require_validator(lambda draft, transcript: {"verdict": "pass"})
+
+    class CallableOnly:
+        def __call__(self, draft, transcript):
+            return {"verdict": "pass"}
+
+    with pytest.raises(ValidatorUnusable):
+        MessageService(
+            parser=FakeParser(), store={}, validator=CallableOnly()
+        )
+
+
 def test_a_parser_that_drops_an_intent_is_a_bug_not_a_rejection():
     """len(items) must equal intents_detected. There is no reason code for this,
     so it must fail loudly rather than show the user a short list."""
@@ -134,7 +248,7 @@ def clarify_request(api, draft_id, answer):
 
 
 def test_clarify_produces_a_new_draft_with_a_new_id_and_nonce():
-    ambiguous = load("ambiguous_payee.json")
+    ambiguous = live(load("ambiguous_payee.json"))
     api = make_api(ambiguous, now=ambiguous.created_at + timedelta(minutes=1))
     original_id = api.message({"transcript": "Send fifty dollars to John."})["items"][0]["draft"]["id"]
 
@@ -142,10 +256,14 @@ def test_clarify_produces_a_new_draft_with_a_new_id_and_nonce():
     resolved = response["items"][0]["draft"]
     assert resolved["id"] != original_id
     assert resolved["nonce"] != ambiguous.nonce
+    # The directory is authoritative, not the candidate fields on the draft:
+    # the fixture offers payee-102 as "John Smith", the directory says
+    # "John Lee", and the directory wins.
+    record = next(p for p in FixtureDirectory().payees() if p.id == "payee-102")
     assert resolved["payee"] == {
         "id": "payee-102",
-        "display_name": "John Smith",
-        "masked_account": "****8892",
+        "display_name": record.display_name,
+        "masked_account": record.masked_account,
     }
     assert resolved["unresolved"] == []
     assert "payee_candidates" not in resolved
@@ -154,7 +272,7 @@ def test_clarify_produces_a_new_draft_with_a_new_id_and_nonce():
 
 def test_clarify_leaves_the_original_draft_unresolved_and_unusable():
     """CONTRACT.md §4: the old id stays unresolved and can never be executed."""
-    ambiguous = load("ambiguous_payee.json")
+    ambiguous = live(load("ambiguous_payee.json"))
     api = make_api(ambiguous, now=ambiguous.created_at + timedelta(minutes=1))
     original_id = api.message({"transcript": "Send fifty dollars to John."})["items"][0]["draft"]["id"]
 
@@ -164,14 +282,25 @@ def test_clarify_leaves_the_original_draft_unresolved_and_unusable():
 
 
 def test_clarify_rejects_an_answer_that_was_not_offered():
-    ambiguous = load("ambiguous_payee.json")
+    ambiguous = live(load("ambiguous_payee.json"))
     api = make_api(ambiguous, now=ambiguous.created_at + timedelta(minutes=1))
     draft_id = api.message({"transcript": "Send fifty dollars to John."})["items"][0]["draft"]["id"]
 
     response = clarify_request(api, draft_id, "payee-999")
     assert response["reason_code"] == "invalid_clarification_answer"
+    assert "not one of the offered" in response["message"]
     assert api.store[draft_id].unresolved == ["payee"]  # draft unchanged
     assert len(api.store) == 1  # nothing new was stored
+
+
+def test_clarify_rejects_an_expired_draft():
+    """resolve_payee checks expiry itself, against the real clock."""
+    ambiguous = live(load("ambiguous_payee.json"), minutes_alive=10, window=-5)
+    api = make_api(ambiguous, now=ambiguous.created_at + timedelta(minutes=1))
+    draft_id = api.message({"transcript": "Send fifty dollars to John."})["items"][0]["draft"]["id"]
+    response = clarify_request(api, draft_id, "payee-102")
+    assert response["reason_code"] == "invalid_clarification_answer"
+    assert "expired" in response["message"]
 
 
 def test_clarify_rejects_a_field_that_is_not_unresolved():
@@ -198,10 +327,156 @@ def test_clarify_rejects_an_unknown_draft():
     assert response["reason_code"] == "unknown_draft"
 
 
-def test_the_question_form_of_clarify_is_refused_not_half_implemented():
-    """CONTRACT.md §4 marks it proposed and not committed."""
+def test_an_unknown_question_id_is_refused():
+    """A question_id the server never issued has no pending state to resolve."""
     response = make_api().clarify({"question_id": "q-amount-001", "answer": "fifty"})
     assert response["reason_code"] == "invalid_clarification_answer"
+
+
+# ── POST /api/clarify, question form (CONTRACT.md §4, second form) ────
+
+
+def pending_question(field="amount", transcript="Send some money to John Smith."):
+    """A PendingQuestion as Member 1's parser would hand it to us."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    return PendingQuestion(
+        question_id=f"q-{field}-001",
+        field=field,
+        original_transcript=transcript,
+        partial={
+            "intent_type": "transfer",
+            "source_account": "acct-001-2345",
+            "payee": {
+                "id": "payee-001",
+                "display_name": "John Smith",
+                "masked_account": "****1234",
+            },
+        },
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+    )
+
+
+def asking_parser(pending):
+    """A parser that asks one question instead of producing a draft."""
+
+    class _Asking:
+        def __call__(self, transcript):
+            return ParseResult(
+                items=[
+                    ClarifyingQuestion(
+                        question_id=pending.question_id,
+                        field=pending.field,
+                        question=f"What {pending.field}?",
+                    )
+                ],
+                intents_detected=1,
+                pending={pending.question_id: pending},
+            )
+
+    return _Asking()
+
+
+def amount_reply():
+    return json.dumps(
+        {"resolved": True, "amount_text": "fifty dollars", "amount_value": "50.00"}
+    )
+
+
+def test_the_question_form_produces_a_draft_and_never_sends_pending():
+    pending = pending_question()
+    api = make_api(
+        parser=asking_parser(pending), client=FakeChatClient([amount_reply()])
+    )
+    offered = api.message({"transcript": pending.original_transcript})
+    item = offered["items"][0]
+    assert item["kind"] == "question"
+    # PendingQuestion carries the original transcript and the partial draft.
+    # It is server-only: nothing here may leak it.
+    assert "pending" not in offered and "pending" not in item
+    assert set(item) == {"kind", "question_id", "field", "question"}
+
+    answered = api.clarify(
+        {"question_id": pending.question_id, "answer": "fifty dollars"}
+    )
+    draft = answered["items"][0]["draft"]
+    assert draft["amount"] == {"value": "50.00", "currency": "SGD"}
+    assert draft["payee"]["id"] == "payee-001"
+    assert draft["unresolved"] == []
+    # CONTRACT.md §4: the answer is never merged into the transcript.
+    assert draft["transcript"] == pending.original_transcript
+    assert "fifty" not in draft["transcript"]
+
+
+def test_a_question_id_is_single_use():
+    """Answering twice must not work — the second finds nothing to resolve."""
+    pending = pending_question()
+    api = make_api(
+        parser=asking_parser(pending),
+        client=FakeChatClient([amount_reply(), amount_reply()]),
+    )
+    api.message({"transcript": pending.original_transcript})
+
+    first = api.clarify({"question_id": pending.question_id, "answer": "fifty dollars"})
+    assert first["items"][0]["kind"] == "draft"
+    # Consumed on use, so the id is gone from server state.
+    assert pending.question_id not in api.messages.pending
+
+    again = api.clarify({"question_id": pending.question_id, "answer": "fifty dollars"})
+    assert again["reason_code"] == "invalid_clarification_answer"
+    assert "already answered" in again["message"]
+
+
+def test_the_clarification_record_reaches_the_validator_separately():
+    """validate() gets the answer as its own argument, not inside the
+    transcript, so the validator can compare the two."""
+    pending = pending_question()
+    validator = passing_validator()
+    api = make_api(
+        parser=asking_parser(pending),
+        client=FakeChatClient([amount_reply()]),
+        validator=validator,
+    )
+    api.message({"transcript": pending.original_transcript})
+    api.clarify({"question_id": pending.question_id, "answer": "fifty dollars"})
+
+    draft, transcript, record = validator.calls[-1]
+    assert transcript == pending.original_transcript
+    assert record.question_id == pending.question_id
+    assert record.field == "amount"
+    assert record.original_transcript == pending.original_transcript
+    assert record.answer == "fifty dollars"
+
+
+def test_a_second_request_inside_an_answer_is_refused():
+    pending = pending_question()
+    api = make_api(
+        parser=asking_parser(pending), client=FakeChatClient([amount_reply()])
+    )
+    api.message({"transcript": pending.original_transcript})
+    response = api.clarify(
+        {
+            "question_id": pending.question_id,
+            "answer": "fifty dollars and also transfer $20 to Jane",
+        }
+    )
+    assert response["reason_code"] == "invalid_clarification_answer"
+
+
+def test_clarify_without_a_directory_fails_loudly_not_as_a_rejection():
+    """No directory means no authoritative payee. That is our problem, not the
+    user's, so it must not come back as a 422 that blames the answer."""
+    ambiguous = live(load("ambiguous_payee.json"))
+    store = {}
+    service = MessageService(
+        parser=FakeParser(ambiguous),
+        store=store,
+        validator=passing_validator(),
+        directory=None,  # the gateway itself defaults to a real one
+    )
+    draft_id = service.message({"transcript": "hi"})["items"][0]["draft"]["id"]
+    with pytest.raises(ServerNotConfigured):
+        service.clarify({"draft_id": draft_id, "field": "payee", "answer": "payee-102"})
 
 
 # ── POST /api/webauthn/challenge ──────────────────────────────────────
@@ -344,7 +619,13 @@ def test_a_signature_for_another_draft_is_rejected_end_to_end():
             "nonce": "nonce-other-001",
         }
     )
-    api = GatewayAPI(parser=FakeParser(clean, other), clock=lambda: now)
+    # A passing validator: this test is about signature binding, so nothing
+    # before check 9 may reject.
+    api = GatewayAPI(
+        parser=FakeParser(clean, other),
+        clock=lambda: now,
+        validator=passing_validator(),
+    )
     credential_id = api.register(
         {"user_id": "user-001", "public_key": public_key_to_pem(private_key.public_key())}
     )["credential_id"]

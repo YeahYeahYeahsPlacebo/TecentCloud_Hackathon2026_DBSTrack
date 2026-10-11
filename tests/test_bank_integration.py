@@ -28,6 +28,7 @@ from backend.gateway.execute import (  # noqa: E402
 from backend.gateway.webauthn import der_to_raw_signature, public_key_to_pem  # noqa: E402
 from backend.models.draft import Money, Payee, TransactionDraft  # noqa: E402
 from backend.parser.interface import ParseResult  # noqa: E402
+from gateway_fakes import FakeValidator, passing_validator  # noqa: E402
 from cryptography.hazmat.primitives import hashes  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 
@@ -48,13 +49,14 @@ class FakeParser:
         return ParseResult(items=self.items, intents_detected=len(self.items))
 
 
-def make_api(*items, bank=_UNSET, now=None):
+def make_api(*items, bank=_UNSET, now=None, validator=None):
     clean = load("clean_transfer.json")
     at = now or clean.created_at + timedelta(minutes=1)
     return GatewayAPI(
         parser=FakeParser(*items) if items else FakeParser(clean),
         clock=lambda: at,
         bank=bank,
+        validator=validator if validator is not None else passing_validator(),
     )
 
 

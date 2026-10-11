@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.canonical import draft_hash  # noqa: E402
 from backend.gateway.api import GatewayAPI  # noqa: E402
+from backend.gateway.message import ValidatorUnusable  # noqa: E402
 from backend.gateway.execute import (  # noqa: E402
     FLAG_USER_PRESENT,
     FLAG_USER_VERIFIED,
@@ -247,27 +248,39 @@ def test_a_verdict_with_no_hash_is_still_accepted():
     assert response["items"][0]["validator"]["verdict"] == "pass"
 
 
-# ── The old callable form still works ──────────────────────────────────
+# ── Nothing that cannot check a draft may produce a pass ───────────────
 
 
-def test_a_plain_callable_validator_is_still_supported():
-    """Tests and the placeholder use ``validator(draft_dict, transcript)``."""
-    seen = {}
+def test_a_plain_callable_validator_is_refused_not_invoked():
+    """The callable form cannot carry a ClarificationRecord, and its only
+    other possible outcomes are a crash or an unchecked pass. So it is
+    refused at startup instead of being called."""
 
     def callable_validator(draft_dict, transcript):
-        seen["dict"] = draft_dict
-        seen["transcript"] = transcript
-        return {"verdict": "pass", "discrepancies": []}
+        raise AssertionError("a callable validator must never be invoked")
 
-    api = make_api(callable_validator)
-    response = api.message({"transcript": "Send fifty dollars to John Smith."})
-    assert response["items"][0]["validator"]["verdict"] == "pass"
-    assert isinstance(seen["dict"], dict)
+    with pytest.raises(ValidatorUnusable):
+        make_api(callable_validator)
 
 
-def test_the_default_is_still_the_explicit_placeholder():
-    """Omitting a validator must not quietly become 'always pass' without
-    saying so — the placeholder is named and documented as a placeholder."""
+def test_omitting_the_validator_freezes_it_never_passes(monkeypatch):
+    """The default is ``get_validator()``: without VALIDATOR_BACKEND=llm it
+    returns UnconfiguredValidator, which freezes with
+    ``validator_not_configured``. There is no placeholder."""
+    monkeypatch.delenv("VALIDATOR_BACKEND", raising=False)
+    monkeypatch.delenv("DCTA_ALLOW_UNVALIDATED", raising=False)
     api = make_api()
-    response = api.message({"transcript": "Send fifty dollars to John Smith."})
-    assert response["items"][0]["validator"]["verdict"] == "pass"
+    item = api.message({"transcript": "Send fifty dollars to John Smith."})["items"][0]
+    assert item["validator"]["verdict"] == "freeze"
+    assert item["validator"]["reason"] == "validator_not_configured"
+
+
+def test_the_dev_escape_hatch_says_so_in_the_verdict(monkeypatch):
+    """DCTA_ALLOW_UNVALIDATED=true is the only way to get a pass out of an
+    unconfigured validator, and it labels itself in the reason."""
+    monkeypatch.delenv("VALIDATOR_BACKEND", raising=False)
+    monkeypatch.setenv("DCTA_ALLOW_UNVALIDATED", "true")
+    api = make_api()
+    item = api.message({"transcript": "Send fifty dollars to John Smith."})["items"][0]
+    assert item["validator"]["verdict"] == "pass"
+    assert "unvalidated" in item["validator"]["reason"]

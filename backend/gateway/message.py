@@ -12,12 +12,17 @@ client has one response shape across both endpoints. Each item is either:
 
 Two things this module deliberately does not own:
 
-- **The parser** is injected. ``backend/parser`` belongs to Member 1 and the
-  real LLM implementation lands there; this module only consumes its result.
-- **The validator** is injected and defaults to a placeholder that returns
-  ``pass``. ``backend/validator`` belongs to Member 1 and is still empty, so a
-  real verdict cannot be produced yet. The placeholder is explicit rather than
-  silently optimistic — see :func:`placeholder_validator`.
+- **The parser** is injected. ``backend/parser`` belongs to Member 1; this
+  module only consumes its result.
+- **The validator** is injected and **required**. There is no default that can
+  produce ``pass``: a validator that has not been configured returns
+  ``freeze`` / ``validator_not_configured`` (``UnconfiguredValidator``), so an
+  unconfigured server refuses to execute rather than waving drafts through.
+  ``DCTA_ALLOW_UNVALIDATED=true`` opts into a pass, explicitly, for local dev.
+
+A validator must expose ``validate(draft, transcript, clarification=None)``.
+Anything else is a wiring error and fails loudly at construction — see
+:func:`require_validator`.
 """
 
 from __future__ import annotations
@@ -31,6 +36,8 @@ from backend.canonical import draft_hash
 from backend.gateway import reason_codes as R
 from backend.gateway.errors import rejection_response
 from backend.models.draft import TransactionDraft
+from backend.parser.clarify import resolve_payee, resolve_question
+from backend.parser.interface import InvalidClarificationAnswer
 from backend.policy import PolicyEngine
 
 # CONTRACT.md §8 open question 3: the fixtures use 5 minutes, but the intended
@@ -55,13 +62,54 @@ class ParserContractViolation(RuntimeError):
     """
 
 
-def placeholder_validator(draft: Mapping[str, Any], transcript: str) -> dict:
-    """Stands in for Member 1's validator until backend/validator lands.
+class ValidatorUnusable(RuntimeError):
+    """The injected validator does not have the required interface.
 
-    Returns ``pass`` with no discrepancies, which is what every example in
-    CONTRACT.md §4 shows. It is a placeholder: it has not checked anything.
+    Raised at construction rather than at request time: a misconfigured server
+    should refuse to start, not serve requests and fail on the first one. It
+    also replaces what used to be a callable fallback — a validator without
+    ``validate()`` can no longer be invoked at all, because the only thing
+    such a call could produce is either a crash or an unchecked ``pass``.
     """
-    return {"verdict": "pass", "discrepancies": []}
+
+
+class ServerNotConfigured(RuntimeError):
+    """The server cannot answer this request because it is not wired up.
+
+    Distinct from a rejection: a rejection means *the user's request* was
+    refused and gets a reason code (CONTRACT.md §5). This means *we* are
+    missing something — a payee directory, a chat client — so there is no
+    reason code that describes it and no safe way to answer. Like
+    :class:`ParserContractViolation`, it is a 500, not a 422.
+    """
+
+
+def require_validator(validator: Any) -> Any:
+    """Return *validator* if it can validate a draft, else raise.
+
+    The interface (``backend/validator/interface.py``) is::
+
+        validator.validate(draft: TransactionDraft, transcript: str,
+                           clarification: ClarificationRecord | None = None)
+            -> ValidatorVerdict
+
+    Its ``__call__`` is deliberately disabled, so duck-typing on ``validate``
+    is the only correct way to detect it.
+    """
+    if validator is None:
+        raise ValidatorUnusable(
+            "no validator was injected. Build one with "
+            "backend.validator.factory.get_validator() — there is no "
+            "default that returns pass."
+        )
+    if not callable(getattr(validator, "validate", None)):
+        raise ValidatorUnusable(
+            f"validator {type(validator).__name__} has no callable validate(). "
+            "Expected validate(draft, transcript, clarification=None) -> "
+            "ValidatorVerdict. A plain callable is not accepted: it cannot "
+            "carry the ClarificationRecord, and there is no safe way to call it."
+        )
+    return validator
 
 
 def dump(draft: TransactionDraft) -> dict:
@@ -94,17 +142,30 @@ class MessageService:
         ledger: Optional[Any] = None,
         known_payees: Any = (),
         verdicts: Optional[MutableMapping[str, str]] = None,
+        directory: Optional[Any] = None,
+        client: Optional[Any] = None,
     ) -> None:
         self.parser = parser
         self.store = store
         self.verdicts = verdicts
-        self.validator = validator or placeholder_validator
+        # No default that can return "pass". A missing or wrongly shaped
+        # validator is a wiring error and is caught here, at construction.
+        self.validator = require_validator(validator)
         self.policy = policy or PolicyEngine()
         self.audit = audit
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.window = window
         self.ledger = ledger
         self.known_payees = set(known_payees)
+        # For /api/clarify: resolve_payee needs the directory to fetch the
+        # authoritative payee record, and resolve_question needs a chat client
+        # for the narrow answer-extraction prompt.
+        self.directory = directory
+        self.client = client
+        # Server-only, keyed by question_id. A PendingQuestion carries the
+        # original transcript and the partial draft — it is never serialised
+        # into any response. Consumed once: answering deletes it.
+        self.pending: dict[str, Any] = {}
 
     # ── What the policy engine is allowed to see ──────────────────────
 
@@ -121,13 +182,19 @@ class MessageService:
         return known
 
     def _attach(
-        self, draft: TransactionDraft
+        self, draft: TransactionDraft, clarification: Optional[Any] = None
     ) -> dict:
-        """Store the draft and fold the server-side verdict and decision in."""
+        """Store the draft and fold the server-side verdict and decision in.
+
+        ``clarification`` is the ``ClarificationRecord`` returned alongside a
+        resolved question. It goes to the validator so it can compare the
+        answer against the draft — the answer is never merged into the
+        transcript.
+        """
         self.store[draft.id] = draft
         dumped = dump(draft)
         digest = draft_hash(dumped)
-        verdict = self._run_validator(draft, dumped, digest)
+        verdict = self._run_validator(draft, dumped, digest, clarification=clarification)
         if self.verdicts is not None:
             # Recorded by hash so /api/execute check 11 can find it. Without
             # this the gateway's fail-closed default would reject everything
@@ -155,36 +222,39 @@ class MessageService:
     ) -> dict:
         """Run the validator and return a plain dict for the response.
 
-        Two shapes are supported:
+        The only supported shape is the one ``backend/validator`` exposes::
 
-        * **The real interface** (``backend/validator``):
-          ``validator.validate(draft, transcript, clarification=...)``, which
-          returns a ``ValidatorVerdict`` model. Its ``__call__`` is
-          *deliberately disabled* — it raises, because the callable form would
-          drop the ``ClarificationRecord``. So it must be detected and called
-          as a method, not invoked.
-        * **A plain callable**: ``validator(draft_dict, transcript)`` returning
-          a mapping. This is the placeholder and what the tests inject.
+            validator.validate(draft, transcript, clarification=...)
+                -> ValidatorVerdict
 
-        Either way the verdict string is what check 11 reads, and anything
-        other than ``"pass"`` is rejected there — so a validator that fails to
-        produce a verdict fails closed rather than passing silently.
+        Its ``__call__`` is deliberately disabled and raises, so it must be
+        called as a method. A validator without ``validate()`` is refused
+        (``ValidatorUnusable``) rather than invoked — there is no callable
+        fallback, because such a call could only crash or produce an unchecked
+        ``pass``.
+
+        The verdict string is what check 11 reads, and anything other than
+        ``"pass"`` is rejected there, so a validator that fails to produce a
+        verdict fails closed rather than passing silently.
         """
         validator = self.validator
 
-        if hasattr(validator, "validate"):
-            result = validator.validate(
-                draft, draft.transcript, clarification=clarification
+        if not callable(getattr(validator, "validate", None)):
+            # Not reachable via the constructor, which rejects such a validator
+            # up front. Kept as a hard error rather than a fallback: the only
+            # thing a callable-form call could produce is a crash or an
+            # unchecked pass, and neither is acceptable here.
+            raise ValidatorUnusable(
+                f"validator {type(validator).__name__} has no validate() method; "
+                "refusing to produce a verdict. Fix the wiring — this path "
+                "fails closed and never passes."
             )
-            payload = (
-                result.model_dump()
-                if hasattr(result, "model_dump")
-                else dict(result)
-            )
-            payload = self._bind_verdict(payload, digest)
-            return payload
 
-        return dict(validator(dumped, draft.transcript))
+        result = validator.validate(draft, draft.transcript, clarification=clarification)
+        payload = (
+            result.model_dump() if hasattr(result, "model_dump") else dict(result)
+        )
+        return self._bind_verdict(payload, digest)
 
     @staticmethod
     def _bind_verdict(payload: Mapping[str, Any], digest: str) -> dict:
@@ -234,6 +304,11 @@ class MessageService:
                 f"{result.intents_detected} intent(s)"
             )
 
+        # Server-only. ParseResult.pending is a mapping of question_id ->
+        # PendingQuestion; the client sees only the ClarifyingQuestion.
+        for question_id, pending_state in (result.pending or {}).items():
+            self.pending[question_id] = pending_state
+
         items = []
         for item in result.items:
             if isinstance(item, TransactionDraft):
@@ -254,17 +329,90 @@ class MessageService:
     # ── POST /api/clarify ─────────────────────────────────────────────
 
     def clarify(self, request: Mapping[str, Any]) -> dict:
+        """Two forms (CONTRACT.md §4), both owned by ``backend/parser``.
+
+        1. ``{question_id, answer}`` — a free-text reply to a
+           ``ClarifyingQuestion``. Calls ``resolve_question``.
+        2. ``{draft_id, field, answer}`` — picking one of a draft's
+           ``payee_candidates``. Calls ``resolve_payee``.
+
+        Both may raise ``InvalidClarificationAnswer``, which is a 422 with
+        ``invalid_clarification_answer`` — not a 500. Neither modifies the
+        stored draft: each returns a new one.
+        """
         if not isinstance(request, Mapping):
             return rejection_response(R.MALFORMED_REQUEST, "request body must be a JSON object")
 
-        # The question form is proposed but not committed (CONTRACT.md §4),
-        # so it is refused rather than half-implemented.
         if "question_id" in request:
+            return self._clarify_question(request)
+        return self._clarify_payee(request)
+
+    # ── Form 1: answering a clarifying question ────────────────────────
+
+    def _clarify_question(self, request: Mapping[str, Any]) -> dict:
+        missing = [f for f in ("question_id", "answer") if f not in request]
+        if missing:
+            return rejection_response(R.MALFORMED_REQUEST, f"missing field(s): {missing}")
+
+        question_id = request["question_id"]
+        pending_state = self.pending.get(question_id)
+        if pending_state is None:
             return rejection_response(
                 R.INVALID_CLARIFICATION_ANSWER,
-                "the question form of /api/clarify is proposed but not committed",
+                f"no pending question with id {question_id!r} — it was never "
+                f"issued, already answered, or expired",
             )
 
+        if self.directory is None or self.client is None:
+            # Not the user's fault, so not a rejection: there is no reason
+            # code for "the server cannot answer this". Fail loudly instead
+            # of returning a 422 that blames the answer.
+            missing = [
+                name
+                for name, value in (("directory", self.directory), ("client", self.client))
+                if value is None
+            ]
+            raise ServerNotConfigured(
+                f"cannot resolve a free-text answer: {', '.join(missing)} is "
+                "not configured on this server. Pass directory= and client= "
+                "when building the gateway."
+            )
+
+        try:
+            parsed, record = resolve_question(
+                pending_state, request["answer"], self.client, self.directory
+            )
+        except InvalidClarificationAnswer as exc:
+            return rejection_response(R.INVALID_CLARIFICATION_ANSWER, str(exc))
+
+        # Single use: the question cannot be answered twice, and a replayed
+        # answer finds nothing to resolve.
+        self.pending.pop(question_id, None)
+
+        self._record(
+            "clarify",
+            {
+                "question_id": record.question_id,
+                "field": record.field,
+                "answer": record.answer,
+            },
+        )
+
+        items = []
+        for item in parsed.items:
+            if isinstance(item, TransactionDraft):
+                items.append(self._attach(item, clarification=record))
+            else:
+                items.append(self._question_item(item))
+        # A follow-up question carries its own pending state.
+        for new_id, new_pending in (parsed.pending or {}).items():
+            self.pending[new_id] = new_pending
+
+        return {"intents_detected": parsed.intents_detected, "items": items}
+
+    # ── Form 2: picking a payee candidate ──────────────────────────────
+
+    def _clarify_payee(self, request: Mapping[str, Any]) -> dict:
         missing = [f for f in ("draft_id", "field", "answer") if f not in request]
         if missing:
             return rejection_response(R.MALFORMED_REQUEST, f"missing field(s): {missing}")
@@ -276,11 +424,6 @@ class MessageService:
             )
 
         field = request["field"]
-        if field not in stored.unresolved:
-            return rejection_response(
-                R.INVALID_CLARIFICATION_ANSWER,
-                f"{field!r} is not in this draft's unresolved list {stored.unresolved}",
-            )
         if field != RESOLVABLE_IN_PLACE:
             # CONTRACT.md §2: only payee may be unresolved while a draft exists.
             return rejection_response(
@@ -289,38 +432,23 @@ class MessageService:
                 f"only {RESOLVABLE_IN_PLACE!r} can",
             )
 
-        answer = request["answer"]
-        candidate = next(
-            (c for c in (stored.payee_candidates or []) if c.id == answer), None
-        )
-        if candidate is None:
-            return rejection_response(
-                R.INVALID_CLARIFICATION_ANSWER,
-                f"answer {answer!r} is not one of the offered payee_candidates",
+        if self.directory is None:
+            # Same reasoning as the question form: the answer may be perfectly
+            # valid, we just cannot check it against anything. Not a 422.
+            raise ServerNotConfigured(
+                "cannot resolve a payee: no directory is configured on this "
+                "server. Pass directory= when building the gateway — the "
+                "candidate fields on the draft are not authoritative."
             )
 
-        # A clarification produces a NEW draft with a NEW id and a NEW nonce.
-        # The old draft is never modified in place, so the old id can never be
-        # executed — the gateway loads by id.
-        now = _now_whole_seconds(self.clock)
-        data = dump(stored)
-        data.pop("payee_candidates", None)  # omitted once the payee is resolved
-        data.update(
-            {
-                "id": str(uuid.uuid4()),
-                "nonce": _new_nonce(),
-                "created_at": now,
-                "expires_at": now + self.window,
-                "unresolved": [f for f in stored.unresolved if f != field],
-                "payee": {
-                    "id": candidate.id,
-                    "display_name": candidate.display_name,
-                    "masked_account": candidate.masked_account,
-                },
-                "confidence": CLARIFIED_CONFIDENCE,
-            }
-        )
-        resolved = TransactionDraft.model_validate(data)
+        try:
+            resolved = resolve_payee(stored, request["answer"], self.directory)
+        except InvalidClarificationAnswer as exc:
+            return rejection_response(R.INVALID_CLARIFICATION_ANSWER, str(exc))
+
+        # The parser is not involved in a clarification, so the server raises
+        # the confidence itself (CONTRACT.md §4: 0.4 -> 0.9). Not hashed.
+        resolved = resolved.model_copy(update={"confidence": CLARIFIED_CONFIDENCE})
 
         self._record(
             "clarify",
@@ -328,7 +456,7 @@ class MessageService:
                 "from_draft_id": stored.id,
                 "to_draft_id": resolved.id,
                 "field": field,
-                "answer": answer,
+                "answer": request["answer"],
             },
         )
         return {"intents_detected": 1, "items": [self._attach(resolved)]}

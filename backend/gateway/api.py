@@ -31,7 +31,9 @@ from backend.bank import seed_bank
 from backend.gateway.execute import ExecuteGateway
 from backend.gateway.message import MessageService
 from backend.ledger import InMemoryLedger
+from backend.parser.directory import FixtureDirectory
 from backend.policy import Limits, PolicyEngine
+from backend.validator.factory import get_validator
 
 
 _UNSET = object()
@@ -49,8 +51,11 @@ class GatewayAPI:
         draft_store: Optional[MutableMapping[str, Any]] = None,
         credentials: Optional[MutableMapping[str, Any]] = None,
         # Any object with a ``validate(draft, transcript, clarification=...)``
-        # method (backend/validator), or a plain callable
-        # ``(draft_dict, transcript)``. The placeholder is used when omitted.
+        # method (backend/validator). Omit it and the gateway builds one via
+        # ``get_validator()``: VALIDATOR_BACKEND=llm selects the real
+        # validator, anything else gives one that freezes. There is no
+        # placeholder and no callable fallback — nothing here can produce a
+        # pass that was not actually checked.
         validator: Optional[Any] = None,
         policy: Optional[PolicyEngine] = None,
         limits: Optional[Limits] = None,
@@ -61,6 +66,8 @@ class GatewayAPI:
         rp_id: str = "localhost",
         origin: str = "http://localhost:8000",
         bank: Any = _UNSET,
+        directory: Optional[Any] = None,
+        client: Optional[Any] = None,
     ) -> None:
         # Mock bank. Seeded by default so a fresh server has known balances.
         # Pass your own Bank to control balances, or bank=None to run with no
@@ -77,17 +84,31 @@ class GatewayAPI:
         self.clock = clock
         self.known_payees = set(known_payees)
         self.policy = policy or PolicyEngine(limits or Limits(), bank=self.bank)
+        # Built once, here. VALIDATOR_BACKEND=llm selects the real validator;
+        # anything else gives UnconfiguredValidator, which returns
+        # freeze/validator_not_configured and never pass. There is no default
+        # that can produce pass without saying so.
+        self.validator = validator if validator is not None else get_validator()
+        # /api/clarify resolves payees and free-text answers through Member 1's
+        # functions, which need a directory (and, for the question form, a chat
+        # client). The fixture directory is the default for the same reason the
+        # validator factory defaults to it: a server with no directory cannot
+        # resolve anything, and says so loudly rather than guessing.
+        self.directory = directory if directory is not None else FixtureDirectory()
+        self.client = client
 
         self.messages = MessageService(
             parser=parser,
             store=self.store,
-            validator=validator,
+            validator=self.validator,
             policy=self.policy,
             audit=self.audit,
             clock=clock,
             ledger=self.ledger,
             known_payees=self.known_payees,
             verdicts=self.verdicts,
+            directory=self.directory,
+            client=self.client,
         )
         self.webauthn = CredentialService(
             store=self.store,
