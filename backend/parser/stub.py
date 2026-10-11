@@ -52,6 +52,9 @@ from backend.parser.interface import (
     PendingQuestion,
 )
 
+# Maximum transcript length.  Mirrors the LLM parser's limit.
+_MAX_TRANSCRIPT_LEN = 500
+
 # ── Multi-intent detection ─────────────────────────────────────────────
 # The stub handles one intent per call.  _is_multi_intent checks three
 # signals; ANY one is sufficient to decline:
@@ -98,6 +101,8 @@ _DIGIT_AMOUNT_RE = re.compile(r"(?:\$|\b)(\d+\.\d{2})\b", re.ASCII)
 # Count every occurrence of "dollar" or "dollars" as one amount mention.
 _DOLLAR_WORD_RE = re.compile(r"\bdollars?\b", re.IGNORECASE)
 _DOLLAR_SIGN_RE = re.compile(r"\$", re.ASCII)
+# A digit amount immediately followed by "dollar(s)": one amount, not two.
+_DIGIT_AMOUNT_DOLLARS_RE = re.compile(r"\d+\.\d{2}\s*dollars?\b", re.ASCII)
 
 # ── Known amounts ──────────────────────────────────────────────────────
 # The stub recognises a small set of word-numbers and "$XX.XX" patterns.
@@ -127,8 +132,11 @@ def _count_amount_mentions(lower: str) -> int:
     dollar_sign_amounts = len(_DIGIT_AMOUNT_RE.findall(lower))
 
     # Each "dollar"/"dollars" word is one mention (covers "fifty dollars",
-    # "one thousand dollars", etc.).
+    # "one thousand dollars", etc.) -- except one that directly follows
+    # a digit amount ("50.50 dollars"), which is the SAME amount and was
+    # already counted above.  Two separate amounts still count twice.
     dollar_words = len(_DOLLAR_WORD_RE.findall(lower))
+    dollar_words -= len(_DIGIT_AMOUNT_DOLLARS_RE.findall(lower))
 
     # A bare "$" not followed by digits (e.g. "fifty $") is rare but
     # count it via _DOLLAR_SIGN_RE minus those already captured.
@@ -330,6 +338,10 @@ def parse(transcript: str) -> ParseResult:
     """
     if not transcript or not transcript.strip():
         raise ParserCannotHandle("empty transcript")
+
+    # ── Length limit ────────────────────────────────────────────────
+    if len(transcript) > _MAX_TRANSCRIPT_LEN:
+        raise ParserCannotHandle("request too long", reason="request too long")
 
     # ── Multi-intent guard ───────────────────────────────────────────
     # The stub handles one intent only.  If the transcript describes

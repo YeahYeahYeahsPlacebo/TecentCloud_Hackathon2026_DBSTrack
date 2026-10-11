@@ -39,7 +39,19 @@ from backend.models.draft import (
     TransactionDraft,
     _check_money,
 )
-from backend.parser.directory import PayeeDirectory, match_payees, resolve_ticker
+from backend.llm.text import sanitise
+from backend.parser.amount_rules import (
+    has_excess_decimals,
+    is_negative_amount,
+    is_negative_value,
+    resolve_currency,
+)
+from backend.parser.directory import (
+    PayeeDirectory,
+    match_account_suffix,
+    match_payees,
+    resolve_ticker,
+)
 from backend.parser.interface import (
     ClarificationRecord,
     ClarifyingQuestion,
@@ -54,9 +66,12 @@ _DRAFT_WINDOW = timedelta(minutes=5)
 
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "answer_v1.txt"
 
-# Markers stripped from user-supplied answer text before insertion into
-# the prompt.  The user text is data, never instructions (CONTEXT.md #5).
-_MARKERS = ("<<<ANSWER>>>", "<<<END>>>", "<<<TRANSCRIPT>>>", "<<<FIELD>>>")
+# Maximum clarification-answer length.  Longer answers are rejected with
+# InvalidClarificationAnswer before anything else looks at them.
+_MAX_ANSWER_LEN = 200
+
+# "... to Bob": naming a recipient inside an answer for another field.
+_TO_RECIPIENT_RE = re.compile(r"\bto\s+[^\W\d_]", re.IGNORECASE)
 
 # Money pattern for validating amount answers.
 _MONEY_RE = re.compile(r"^(0|[1-9][0-9]*)\.[0-9]{2}$", re.ASCII)
@@ -101,18 +116,6 @@ def _fresh_nonce() -> str:
 def _fresh_timestamps() -> tuple[datetime, datetime]:
     now = datetime.now(timezone.utc).replace(microsecond=0)
     return now, now + _DRAFT_WINDOW
-
-
-def _strip_markers(text: str) -> str:
-    """Remove all template markers from user text.
-
-    The user text is data (CONTEXT.md #5).  Markers are stripped so the
-    user cannot break out of the delimited block in the prompt.
-    """
-    result = text
-    for marker in _MARKERS:
-        result = result.replace(marker, "")
-    return result
 
 
 def _is_expired(expires_at: datetime, now: datetime | None = None) -> bool:
@@ -230,16 +233,16 @@ def _build_answer_prompt(
 ) -> str:
     """Build the narrow answer-extraction prompt.
 
-    The answer is placed between <<<ANSWER>>> and <<<END>>> markers,
-    with any template markers in the answer stripped first.
+    The answer is placed between <<<ANSWER>>> and <<<END>>> markers.
+    *transcript* and *answer* are the sanitised texts produced once in
+    :func:`resolve_question`, so they contain no markers.
     """
     template = _load_prompt_template()
-    clean_answer = _strip_markers(answer)
     return (
         template
         .replace("<<<FIELD>>>", field)
         .replace("<<<TRANSCRIPT>>>", transcript)
-        .replace("<<<USER_ANSWER>>>", clean_answer)
+        .replace("<<<USER_ANSWER>>>", answer)
     )
 
 
@@ -275,10 +278,13 @@ def _detect_second_request(answer: str) -> bool:
 def _detect_field_change_attempt(
     field: str,
     answer: str,
+    directory: Any = None,
 ) -> bool:
     """Return True if the answer tries to change a field other than ``field``.
 
-    Heuristic: looks for keywords associated with other fields.
+    Heuristic: looks for keywords associated with other fields.  For a
+    non-payee question, naming a recipient ("to Bob") or any word of a
+    saved payee's name also counts, because the payee is already fixed.
     """
     lower = answer.lower()
 
@@ -288,6 +294,13 @@ def _detect_field_change_attempt(
         for kw in payee_keywords:
             if kw in lower:
                 return True
+        if _TO_RECIPIENT_RE.search(answer):
+            return True
+        if directory is not None:
+            words = set(re.findall(r"[^\W\d_]+", lower))
+            for p in directory.payees():
+                if words & set(p.display_name.lower().split()):
+                    return True
 
     # If we're asking about payee but the answer mentions amount.
     if field != "amount":
@@ -357,15 +370,31 @@ def resolve_question(
             f"question {pending.question_id!r} has expired"
         )
 
-    # ── Check: answer must not contain a second request ──────────────
-    if _detect_second_request(answer):
+    # ── 1. Length limit, on the answer exactly as received ───────────
+    # Rejects before anything else reads the answer.  Sanitising only
+    # ever shortens text, so the cleaned answer is within the limit too.
+    if len(answer) > _MAX_ANSWER_LEN:
+        raise InvalidClarificationAnswer(
+            f"answer exceeds {_MAX_ANSWER_LEN} characters"
+        )
+
+    # ── 2. Sanitise once ─────────────────────────────────────────────
+    # The cleaned texts are used for every check below and for the
+    # prompt.  The raw answer is kept only in the audit record.
+    clean_answer = sanitise(answer)
+    clean_transcript = sanitise(pending.original_transcript)
+
+    if not clean_answer.strip():
+        raise InvalidClarificationAnswer("answer is empty")
+
+    # ── 3. Second request / change to an already-resolved field ──────
+    if _detect_second_request(clean_answer):
         raise InvalidClarificationAnswer(
             "answer contains a second request; "
             "only the asked field may be answered"
         )
 
-    # ── Check: answer must not change an already-resolved field ──────
-    if _detect_field_change_attempt(pending.field, answer):
+    if _detect_field_change_attempt(pending.field, clean_answer, directory):
         raise InvalidClarificationAnswer(
             f"answer attempts to change a field other than "
             f"{pending.field!r}, which is already resolved"
@@ -375,8 +404,44 @@ def resolve_question(
     transcript = pending.original_transcript
     partial = dict(pending.partial)
 
-    # ── Build the prompt and call the model ──────────────────────────
-    prompt = _build_answer_prompt(field, transcript, answer)
+    # A negative amount is asked again, never drafted and never sent
+    # to the model (whose reply could drop the sign).
+    if field == "amount" and is_negative_amount(clean_answer):
+        return _reask(
+            pending, answer, partial,
+            "The amount can't be negative. How much would you like to send?",
+        )
+
+    # More than two decimal places is asked again, never rounded and
+    # never sent to the model (which might round it).
+    if field == "amount" and has_excess_decimals(clean_answer):
+        return _reask(
+            pending, answer, partial,
+            "Please give the amount with at most two decimal places. "
+            "How much would you like to send?",
+        )
+
+    # An answer that is only a masked-account suffix ("account ending
+    # 8892") is resolved by code against the candidate list (the
+    # directory), without the model.  It must select exactly one payee.
+    if field == "payee":
+        by_suffix = match_account_suffix(clean_answer, directory)
+        if by_suffix is not None:
+            if len(by_suffix) != 1:
+                raise InvalidClarificationAnswer(
+                    "account suffix matches "
+                    f"{len(by_suffix)} candidate payees, expected exactly 1"
+                )
+            only = by_suffix[0]
+            partial["payee"] = {
+                "id": only.id,
+                "display_name": only.display_name,
+                "masked_account": only.masked_account,
+            }
+            return _finish(pending, answer, partial)
+
+    # ── 4. Build the prompt and call the model ───────────────────────
+    prompt = _build_answer_prompt(field, clean_transcript, clean_answer)
     reply = client.ask(prompt)
     reply_data = _parse_model_reply(reply.text)
 
@@ -388,43 +453,23 @@ def resolve_question(
 
     # ── Handle unclear answer → new question for the same field ──────
     if not reply_data.get("resolved"):
-        qid = _fresh_question_id(field)
-        created, expires = _fresh_timestamps()
-        question_item = ClarifyingQuestion(
-            question_id=qid,
-            field=field,
-            question=f"Could you clarify the {field}?",
-        )
-        new_pending = PendingQuestion(
-            question_id=qid,
-            field=field,
-            original_transcript=transcript,
-            partial=partial,
-            created_at=created,
-            expires_at=expires,
-        )
-        result = ParseResult(
-            items=[question_item],
-            intents_detected=1,
-            pending={qid: new_pending},
-        )
-        record = ClarificationRecord(
-            question_id=pending.question_id,
-            field=field,
-            original_transcript=transcript,
-            answer=answer,
-        )
-        return result, record
+        return _reask(pending, answer, partial, f"Could you clarify the {field}?")
 
     # ── Field resolved → build the draft ─────────────────────────────
     if field == "amount":
         amount_value = reply_data.get("amount_value")
         amount_text = reply_data.get("amount_text", "")
 
-        # amount_text must appear in the answer (CONTRACT rule).
-        if amount_text and amount_text.lower() not in answer.lower():
+        # amount_text must appear in the (sanitised) answer.
+        if amount_text and amount_text.lower() not in clean_answer.lower():
             raise InvalidClarificationAnswer(
                 f"amount_text {amount_text!r} does not appear in the answer"
+            )
+
+        if is_negative_value(amount_value):
+            return _reask(
+                pending, answer, partial,
+                "The amount can't be negative. How much would you like to send?",
             )
 
         # amount_value must match the money pattern.
@@ -433,10 +478,16 @@ def resolve_question(
                 f"amount_value {amount_value!r} does not match the money pattern"
             )
 
-        partial["amount"] = {
-            "value": amount_value,
-            "currency": "SGD",
-        }
+        # Currency rule (amount_rules): the user's own words across the
+        # transcript and the answer; never the model's.
+        currency = resolve_currency(clean_transcript, clean_answer)
+        if currency is None:
+            return _reask(
+                pending, answer, partial,
+                "Which currency did you mean? How much would you like to send?",
+            )
+
+        partial["amount"] = {"value": amount_value, "currency": currency}
 
     elif field == "payee":
         payee_mention = reply_data.get("payee_mention", "")
@@ -445,7 +496,8 @@ def resolve_question(
                 "payee_mention is empty in the model reply"
             )
 
-        matches = match_payees(payee_mention, directory)
+        # Name AND any account digits the user said must agree.
+        matches = match_payees(payee_mention, directory, context=clean_answer)
         if not matches:
             raise InvalidClarificationAnswer(
                 f"payee {payee_mention!r} not found in directory"
@@ -493,6 +545,16 @@ def resolve_question(
         )
 
     # ── Build the draft from partial ─────────────────────────────────
+    return _finish(pending, answer, partial)
+
+
+def _finish(
+    pending: PendingQuestion,
+    answer: str,
+    partial: dict[str, Any],
+) -> Tuple[ParseResult, ClarificationRecord]:
+    """Build the draft from the resolved partial and the audit record."""
+    transcript = pending.original_transcript
     draft = _build_draft_from_partial(partial, transcript)
     result = ParseResult(
         items=[draft],
@@ -501,8 +563,40 @@ def resolve_question(
     )
     record = ClarificationRecord(
         question_id=pending.question_id,
-        field=field,
+        field=pending.field,
         original_transcript=transcript,
+        answer=answer,
+    )
+    return result, record
+
+
+def _reask(
+    pending: PendingQuestion,
+    answer: str,
+    partial: dict[str, Any],
+    question: str,
+) -> Tuple[ParseResult, ClarificationRecord]:
+    """Return a fresh question for the same field (no draft)."""
+    field = pending.field
+    qid = _fresh_question_id(field)
+    created, expires = _fresh_timestamps()
+    new_pending = PendingQuestion(
+        question_id=qid,
+        field=field,
+        original_transcript=pending.original_transcript,
+        partial=partial,
+        created_at=created,
+        expires_at=expires,
+    )
+    result = ParseResult(
+        items=[ClarifyingQuestion(question_id=qid, field=field, question=question)],
+        intents_detected=1,
+        pending={qid: new_pending},
+    )
+    record = ClarificationRecord(
+        question_id=pending.question_id,
+        field=field,
+        original_transcript=pending.original_transcript,
         answer=answer,
     )
     return result, record
@@ -540,10 +634,14 @@ def _build_draft_from_partial(
             raise InvalidClarificationAnswer(
                 "cannot build equity draft: no amount/notional_amount"
             )
-        data["amount"] = {
-            "value": amount_value,
-            "currency": "SGD",
-        }
+        currency = partial.get("amount", {}).get("currency") or resolve_currency(
+            sanitise(transcript)
+        )
+        if currency is None:
+            raise InvalidClarificationAnswer(
+                "cannot build equity draft: currency is unclear"
+            )
+        data["amount"] = {"value": amount_value, "currency": currency}
         data["notional_amount"] = amount_value
         data["ticker"] = partial.get("ticker", "D05.SI")
         data["order_type"] = partial.get("order_type", "market")

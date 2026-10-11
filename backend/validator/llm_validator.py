@@ -7,6 +7,11 @@ CODE compares that extraction with the draft. The model never edits,
 repairs or suggests changes to a draft.
 
 The validator:
+  0. Sanitises the transcript and any clarification answer once
+     (backend.llm.text.sanitise) and uses that text for everything
+     below.  A transcript over 500 characters, a negative amount, or an
+     amount with more than two decimal places freezes without calling
+     the model.
   1. Sends the transcript (isolated between markers) to the VALIDATOR
      ADP application (Tencent Hy3), never the parser's.
   2. Validates the model's JSON reply with a strict Pydantic model
@@ -15,13 +20,20 @@ The validator:
   3. Code compares the extraction with the draft:
      - more than one intent -> freeze ("multiple requests")
      - intent_type differs -> discrepancy "intent_type"
-     - amount_value differs from draft.amount.value -> "amount"
-     - payee: match_payees must include the draft's payee id, else "payee"
+     - amount_value differs from draft.amount.value, or is negative
+       -> "amount"
+     - currency (product rule in backend.parser.amount_rules, never
+       the model's currency field) unclear or different -> "amount"
+     - payee: match_payees (name AND any account digits said) must
+       include the draft's payee id, else "payee"
      - source account: must match the draft's if mentioned
      - ticker and order_type for equity drafts
   4. Any discrepancy -> freeze, listing the fields.
   5. Fail closed: ModelCallError, invalid JSON after retry, extra fields,
-     or zero intents -> freeze with reason "validator_unavailable".
+     or zero intents -> freeze with reason
+     "validator_unavailable: <redacted cause>", e.g.
+     "validator_unavailable: ModelCallError (ADP returned HTTP 429)" or
+     "validator_unavailable: invalid JSON after retry".
 
 This module contains no ledger or gateway imports (CONTEXT.md
 constraint 2, enforced by tests/test_import_boundaries.py).
@@ -37,8 +49,16 @@ from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from backend.canonical import draft_hash
+from backend.llm.failure import describe_failure
 from backend.llm.interface import ChatClient, ModelCallError
+from backend.llm.text import sanitise
 from backend.models.draft import TransactionDraft
+from backend.parser.amount_rules import (
+    has_excess_decimals,
+    is_negative_amount,
+    is_negative_value,
+    resolve_currency,
+)
 from backend.parser.directory import PayeeDirectory, match_payees, resolve_ticker
 from backend.parser.interface import ClarificationRecord
 from backend.validator.interface import ValidatorVerdict
@@ -47,21 +67,24 @@ from backend.validator.interface import ValidatorVerdict
 
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "verify_v1.txt"
 
+# Verdict reason prefix when the model could not answer (fail closed).
+# The full reason is "validator_unavailable: <redacted cause>".
+UNAVAILABLE = "validator_unavailable"
+
+# Maximum transcript length, measured on the sanitised transcript.
+# Longer transcripts freeze with reason "transcript too long".
+_MAX_TRANSCRIPT_LEN = 500
+
 # Markers that delimit user-supplied text so the model treats it as data
-# (CONTEXT.md constraint 5).
-_TRANSCRIPT_MARKER_OPEN = "<<<TRANSCRIPT>>>"
-_TRANSCRIPT_MARKER_CLOSE = "<<<END>>>"
+# (CONTEXT.md constraint 5).  User text has them removed by
+# :func:`backend.llm.text.sanitise` before it reaches _build_prompt.
 _ANSWER_MARKER_OPEN = "<<<ANSWER>>>"
 _ANSWER_MARKER_CLOSE = "<<<END>>>"
 _FIELD_MARKER = "<<<FIELD>>>"
 
-_ALL_MARKERS = (
-    _TRANSCRIPT_MARKER_OPEN,
-    _TRANSCRIPT_MARKER_CLOSE,
-    _ANSWER_MARKER_OPEN,
-    _ANSWER_MARKER_CLOSE,
-    _FIELD_MARKER,
-)
+# Template placeholders, filled in a single pass so user text that
+# happens to contain "{answer_block}" is never expanded.
+_PLACEHOLDER_RE = re.compile(r"\{transcript\}|\{answer_block\}")
 
 # ── Strict extraction model (extra fields forbidden) ─────────────────
 
@@ -91,47 +114,37 @@ class _ExtractionResult(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
-def _strip_markers(text: str) -> str:
-    """Remove all template markers from user text.
-
-    The user text is data (CONTEXT.md constraint 5). Markers are stripped
-    so the user cannot break out of the delimited block in the prompt.
-    """
-    result = text
-    for marker in _ALL_MARKERS:
-        result = result.replace(marker, "")
-    return result
-
-
 def _build_prompt(
-    transcript: str,
+    clean_transcript: str,
     clarification: Optional[ClarificationRecord] = None,
+    clean_answer: Optional[str] = None,
 ) -> str:
-    """Load the prompt template and insert the sanitised transcript.
+    """Load the prompt template and insert the transcript.
+
+    *clean_transcript* and *clean_answer* are the sanitised texts
+    produced once in :meth:`LlmValidator.validate`; the same texts are
+    used for every check.
 
     If a ClarificationRecord is given, the user's answer goes in a
     SEPARATE <<<ANSWER>>> ... <<<END>>> block, labelled with the field it
     answered. Never merged with the transcript.
     """
     template = _PROMPT_PATH.read_text(encoding="utf-8")
-    safe_transcript = _strip_markers(transcript)
 
     if clarification is not None:
-        safe_answer = _strip_markers(clarification.answer)
+        if clean_answer is None:
+            clean_answer = sanitise(clarification.answer)
         answer_block = (
             f"\nClarification answer for field <<<FIELD>>>{clarification.field}<<<FIELD>>>:\n"
             f"{_ANSWER_MARKER_OPEN}\n"
-            f"{safe_answer}\n"
+            f"{clean_answer}\n"
             f"{_ANSWER_MARKER_CLOSE}\n"
         )
     else:
         answer_block = ""
 
-    return (
-        template
-        .replace("{transcript}", safe_transcript)
-        .replace("{answer_block}", answer_block)
-    )
+    values = {"{transcript}": clean_transcript, "{answer_block}": answer_block}
+    return _PLACEHOLDER_RE.sub(lambda m: values[m.group(0)], template)
 
 
 def _parse_reply(text: str) -> _ExtractionResult:
@@ -161,8 +174,12 @@ def _compare(
     draft: TransactionDraft,
     extraction: _ExtractionResult,
     directory: PayeeDirectory,
+    user_texts: tuple[str, ...] = (),
 ) -> tuple[list[str], str, bool]:
     """Compare the model's extraction with the draft.
+
+    *user_texts* are the sanitised transcript and (if any) the
+    clarification answer; the currency rule is applied to them.
 
     Returns ``(discrepancies, reason, should_freeze)``.
 
@@ -196,7 +213,12 @@ def _compare(
         )
 
     # ── amount ──────────────────────────────────────────────────
-    if intent.amount_value is not None:
+    if is_negative_value(intent.amount_value):
+        discrepancies.append("amount")
+        reasons.append(
+            f"The amount that was said ({intent.amount_value}) is negative."
+        )
+    elif intent.amount_value is not None:
         if intent.amount_value != draft.amount.value:
             discrepancies.append("amount")
             reasons.append(
@@ -213,10 +235,30 @@ def _compare(
             f"{draft.amount.value}."
         )
 
+    # ── currency (product rule in amount_rules, never the model's) ─
+    said_currency = resolve_currency(*user_texts)
+    if said_currency is None:
+        if "amount" not in discrepancies:
+            discrepancies.append("amount")
+        reasons.append(
+            "The currency that was said is unclear or not supported."
+        )
+    elif said_currency != draft.amount.currency:
+        if "amount" not in discrepancies:
+            discrepancies.append("amount")
+        reasons.append(
+            f"The currency in the draft ({draft.amount.currency}) does not "
+            f"match what was said ({said_currency})."
+        )
+
     # ── payee (skip if payee is unresolved) ─────────────────────
     if "payee" not in draft.unresolved:
         if intent.payee_mention is not None:
-            matches = match_payees(intent.payee_mention, directory)
+            # Same rule as the parser: name AND account digits.  The
+            # clue may sit after the mention in the user's own text.
+            matches = match_payees(
+                intent.payee_mention, directory, context="\n".join(user_texts),
+            )
             match_ids = {m.id for m in matches}
             if draft.payee is not None and draft.payee.id not in match_ids:
                 discrepancies.append("payee")
@@ -310,26 +352,78 @@ class LlmValidator:
 
         Returns a :class:`ValidatorVerdict` with ``verdict`` ``"pass"`` or
         ``"freeze"``.  Fail closed: any model error results in a freeze
-        with reason ``"validator_unavailable"``.
+        with reason ``"validator_unavailable: <redacted cause>"``.
         """
         h = draft_hash(draft.model_dump(mode="json", exclude_none=True))
 
-        # ── Ask the model to extract ─────────────────────────────
-        prompt = _build_prompt(transcript, clarification)
+        # ── Sanitise once, at entry ──────────────────────────────
+        # The cleaned transcript and answer are used for the prompt,
+        # the length check, the negative-amount check and the
+        # currency rule.
+        clean_transcript = sanitise(transcript or "")
+        clean_answer = (
+            sanitise(clarification.answer) if clarification is not None else None
+        )
 
-        try:
-            extraction = self._extract(prompt)
-        except (ModelCallError, json.JSONDecodeError, ValidationError, ValueError):
+        # A transcript longer than _MAX_TRANSCRIPT_LEN characters
+        # causes an immediate freeze — it is never sent to the model.
+        if len(clean_transcript) > _MAX_TRANSCRIPT_LEN:
             return ValidatorVerdict(
                 verdict="freeze",
                 discrepancies=[],
-                reason="validator_unavailable",
+                reason="transcript too long",
+                draft_hash=h,
+            )
+
+        # ── Negative amount -> freeze, no model call ─────────────
+        # The amount comes from the answer when the amount was the
+        # clarified field, otherwise from the transcript.
+        amount_text = (
+            clean_answer
+            if clarification is not None and clarification.field == "amount"
+            else clean_transcript
+        )
+        if is_negative_amount(amount_text):
+            return ValidatorVerdict(
+                verdict="freeze",
+                discrepancies=["amount"],
+                reason="The amount that was said is negative.",
+                draft_hash=h,
+            )
+
+        # ── More than two decimals -> freeze, no model call ──────
+        # A draft can only carry a rounded amount; the user said more.
+        if has_excess_decimals(amount_text):
+            return ValidatorVerdict(
+                verdict="freeze",
+                discrepancies=["amount"],
+                reason=(
+                    "The amount that was said has more than two decimal "
+                    "places and cannot be rounded."
+                ),
+                draft_hash=h,
+            )
+
+        # ── Ask the model to extract ─────────────────────────────
+        prompt = _build_prompt(clean_transcript, clarification, clean_answer)
+
+        try:
+            extraction = self._extract(prompt)
+        except (ModelCallError, json.JSONDecodeError, ValidationError, ValueError) as exc:
+            # Fail closed, and say why (redacted: no key, no bodies).
+            return ValidatorVerdict(
+                verdict="freeze",
+                discrepancies=[],
+                reason=f"{UNAVAILABLE}: {describe_failure(exc)}",
                 draft_hash=h,
             )
 
         # ── Code compares the extraction with the draft ─────────
+        user_texts = (clean_transcript,) + (
+            (clean_answer,) if clean_answer is not None else ()
+        )
         discrepancies, reason, should_freeze = _compare(
-            draft, extraction, self._directory
+            draft, extraction, self._directory, user_texts
         )
 
         if should_freeze:

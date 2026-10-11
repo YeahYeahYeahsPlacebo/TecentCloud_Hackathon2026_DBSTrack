@@ -37,11 +37,18 @@ from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from backend.llm.interface import ChatClient
+from backend.llm.text import sanitise
 from backend.models.draft import (
     Money,
     Payee,
     PayeeCandidate,
     TransactionDraft,
+)
+from backend.parser.amount_rules import (
+    has_excess_decimals,
+    is_negative_amount,
+    is_negative_value,
+    resolve_currency,
 )
 from backend.parser.directory import (
     PayeeDirectory,
@@ -60,10 +67,9 @@ from backend.parser.interface import (
 
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "extract_v1.txt"
 
-# Markers that delimit the transcript so the model treats it as data
-# (CONTEXT.md constraint 5).
-_TRANSCRIPT_MARKER_OPEN = "<<<TRANSCRIPT>>>"
-_TRANSCRIPT_MARKER_CLOSE = "<<<END>>>"
+# Maximum transcript length, measured on the sanitised transcript.
+# Longer transcripts are declined before the model is called.
+_MAX_TRANSCRIPT_LEN = 500
 
 # ── Strict extraction model (extra fields forbidden) ─────────────────
 
@@ -126,25 +132,17 @@ def _fresh_timestamps() -> tuple[datetime, datetime]:
     return now, now + timedelta(minutes=5)
 
 
-# ── Transcript sanitisation (constraint 5) ──────────────────────────
+# ── Prompt building (constraint 5) ──────────────────────────────────
 
 
-def _strip_markers(transcript: str) -> str:
-    """Remove any occurrence of the transcript markers from *transcript*.
+def _build_prompt(clean_transcript: str) -> str:
+    """Load the prompt template and insert the transcript.
 
-    This prevents a malicious transcript from closing the delimited
-    block early and injecting instructions.
+    *clean_transcript* is the output of :func:`sanitise`, produced once
+    in :meth:`LlmParser.parse`; the same text is used for every check.
     """
-    cleaned = transcript.replace(_TRANSCRIPT_MARKER_OPEN, "")
-    cleaned = cleaned.replace(_TRANSCRIPT_MARKER_CLOSE, "")
-    return cleaned
-
-
-def _build_prompt(transcript: str) -> str:
-    """Load the prompt template and insert the sanitised transcript."""
     template = _PROMPT_PATH.read_text(encoding="utf-8")
-    safe = _strip_markers(transcript)
-    return template.replace("{transcript}", safe)
+    return template.replace("{transcript}", clean_transcript)
 
 
 # ── Stub keyword multi-intent check (imported as second signal) ─────
@@ -156,7 +154,8 @@ from backend.parser.stub import _is_multi_intent  # noqa: E402
 
 
 def _in_transcript(mention: str | None, transcript: str) -> bool:
-    """Check that *mention* appears in *transcript* (case-insensitive)."""
+    """Check that *mention* appears in the sanitised *transcript*
+    (case-insensitive)."""
     if not mention or not mention.strip():
         return False
     return mention.strip().lower() in transcript.lower()
@@ -195,11 +194,23 @@ class LlmParser:
         multi-intent requests, malformed model replies (after one
         retry), or unknown intent types.
         """
-        if not transcript or not transcript.strip():
+        # ── 0. Sanitise once, at entry ─────────────────────────────
+        # ``clean`` is used for the prompt and for every check below
+        # (emptiness, length, verbatim mentions, multi-intent keywords,
+        # currency, negative amount).  The raw ``transcript`` is only
+        # stored, unchanged, in the draft / pending question.
+        clean = sanitise(transcript or "")
+        if not clean.strip():
             raise ParserCannotHandle("empty transcript", reason="empty transcript")
 
+        if len(clean) > _MAX_TRANSCRIPT_LEN:
+            raise ParserCannotHandle(
+                "request too long",
+                reason="request too long",
+            )
+
         # ── 1. Ask the model to extract ────────────────────────────
-        extraction = self._extract(transcript)
+        extraction = self._extract(clean)
 
         # ── 2. Multi-intent guard (two signals) ───────────────────
         if len(extraction.intents) > 1:
@@ -210,7 +221,7 @@ class LlmParser:
             )
 
         # Independent second signal: keyword-based check from stub.
-        if _is_multi_intent(transcript):
+        if _is_multi_intent(clean):
             raise ParserCannotHandle(
                 "Multiple intents detected in the transcript. "
                 "Please send one request at a time.",
@@ -232,15 +243,15 @@ class LlmParser:
             )
 
         # ── 4. Code builds the draft ───────────────────────────────
-        return self._build_result(transcript, intent)
+        return self._build_result(transcript, clean, intent)
 
-    def _extract(self, transcript: str) -> _ExtractionResult:
+    def _extract(self, clean_transcript: str) -> _ExtractionResult:
         """Send the prompt to the model and validate the reply.
 
         Retries once on malformed/invalid JSON, then raises
         :class:`ParserCannotHandle`.
         """
-        prompt = _build_prompt(transcript)
+        prompt = _build_prompt(clean_transcript)
 
         for attempt in range(2):
             reply = self._client.ask(prompt)
@@ -264,12 +275,14 @@ class LlmParser:
     def _build_result(
         self,
         transcript: str,
+        clean: str,
         intent: _ExtractedIntent,
     ) -> ParseResult:
         """Build a :class:`ParseResult` from the extracted intent.
 
         Code — not the model — resolves payees, validates amounts,
-        and sets all draft fields.
+        and sets all draft fields.  Every check uses the sanitised
+        ``clean`` text; the raw ``transcript`` is only stored.
 
         Every :class:`ClarifyingQuestion` returned also populates
         :attr:`ParseResult.pending` with a :class:`PendingQuestion`
@@ -291,7 +304,7 @@ class LlmParser:
         # Build a set of fields that fail the transcript check.
         transcript_failures: set[str] = set()
         for field_name, value in mentions.items():
-            if value and not _in_transcript(value, transcript):
+            if value and not _in_transcript(value, clean):
                 transcript_failures.add(field_name)
 
         # ── Amount resolution ──────────────────────────────────────
@@ -322,7 +335,12 @@ class LlmParser:
             if "payee_mention" in transcript_failures:
                 need_payee_question = True
             else:
-                matches = match_payees(intent.payee_mention, self._directory)
+                # The account clue can sit after the mention in the
+                # transcript (the model often returns just the name), so
+                # the sanitised transcript is the context.
+                matches = match_payees(
+                    intent.payee_mention, self._directory, context=clean,
+                )
 
                 if len(matches) == 0:
                     # Zero matches → mark for asking.
@@ -356,16 +374,40 @@ class LlmParser:
         # Resolve the amount into partial if it's valid.  If not, mark
         # for asking — but don't return yet, so the partial carries the
         # payee (if resolved) before we ask about the amount.
+        # The currency comes from the user's words by the product rule
+        # in amount_rules — never from the model's ``currency`` field.
         need_amount_question = False
+        amount_question = "How much would you like to send?"
+        currency = resolve_currency(clean)
 
-        if "amount_text" in transcript_failures:
+        if is_negative_amount(clean) or is_negative_value(amount_value):
+            # Never drop a sign: a negative amount is asked again.
+            need_amount_question = True
+            amount_question = (
+                "The amount can't be negative. "
+                "How much would you like to send?"
+            )
+        elif has_excess_decimals(clean):
+            # Never round: "50.555" is asked again, whatever the model
+            # returned for it.
+            need_amount_question = True
+            amount_question = (
+                "Please give the amount with at most two decimal places. "
+                "How much would you like to send?"
+            )
+        elif "amount_text" in transcript_failures:
             need_amount_question = True
         elif "amount" in uncertain or not amount_value:
             need_amount_question = True
         elif not _is_valid_money(amount_value):
             need_amount_question = True
+        elif currency is None:
+            need_amount_question = True
+            amount_question = (
+                "Which currency did you mean? "
+                "How much would you like to send?"
+            )
         else:
-            currency = intent.currency or "SGD"
             partial["amount"] = {"value": amount_value, "currency": currency}
 
         # ── Ask in priority order: amount, then payee ──────────────
@@ -373,7 +415,7 @@ class LlmParser:
         # it (CONTRACT.md §2: "amount cannot be in unresolved").
         if need_amount_question:
             return _make_question_result(
-                "amount", "How much would you like to send?",
+                "amount", amount_question,
                 transcript, partial,
             )
 
@@ -382,9 +424,6 @@ class LlmParser:
                 "payee", "Who would you like to send the money to?",
                 transcript, partial,
             )
-
-        # Amount is resolved — extract the values.
-        currency = intent.currency or "SGD"
 
         # ── Equity fields ──────────────────────────────────────────
         ticker: str | None = None
