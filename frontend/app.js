@@ -15,9 +15,10 @@
 (function () {
   "use strict";
 
-  // API endpoint for the message parser (CONTRACT.md §4).
-  // Relative to frontend/index.html → /api/message on the same origin.
+  // API endpoints (CONTRACT.md §4).
+  // Relative to frontend/index.html → same origin.
   var API_MESSAGE_URL = "/api/message";
+  var API_CLARIFY_URL = "/api/clarify";
 
   // Fixture filenames relative to frontend/index.html.
   // Used only by the demo-fallback scenario buttons.
@@ -35,7 +36,23 @@
   var inputHint = null;
 
   // Module-level reference to the current draft's payee_candidates.
+  // Kept for fixture-preview backward compatibility (single-card fixture
+  // renders). Server ambiguous-payee cards now carry their own candidates
+  // in a data attribute and closure-scoped state — see
+  // renderServerAmbiguousPayeeInto.
   var currentCandidates = [];
+
+  // Page/message generation counter. Incremented ONLY on new
+  // /api/message requests and fixture loads — NOT on /api/clarify.
+  // Each ambiguous-payee card captures the current messageGen at
+  // creation time and stores it in data-message-gen. When a clarify
+  // response arrives, if the card's messageGen doesn't match the
+  // global, the entire display has been replaced by a newer message —
+  // the clarify response is stale and must be discarded.
+  // Per-card /api/clarify requests use data-clarify-seq on the card
+  // element itself, so confirming card A does not make card B's
+  // in-flight clarify response stale.
+  var messageGen = 0;
 
   // ── Initialization ─────────────────────────────────────────
   function init() {
@@ -98,10 +115,13 @@
       return;
     }
 
-    // Clear any previous scenario-button highlight.
+    // Clear any previous scenario-button highlight and stale server state.
     Array.prototype.forEach.call(scenarioBtns, function (b) {
       b.classList.remove("active");
     });
+    // Increment the message generation so any in-flight /api/clarify
+    // response for a previous card is treated as stale.
+    messageGen++;
 
     // Loading state.
     sendBtn.disabled = true;
@@ -109,6 +129,9 @@
     textInput.disabled = true;
     setHint("Sending to /api/message…");
     displayEl.innerHTML = '<p class="placeholder">Loading…</p>';
+
+    // Capture the generation so we can detect stale /api/message responses.
+    var myGen = messageGen;
 
     fetch(API_MESSAGE_URL, {
       method: "POST",
@@ -130,6 +153,10 @@
           });
       })
       .then(function (result) {
+        // Stale response guard: a newer /api/message request has
+        // been issued since this one started. Discard the result.
+        if (myGen !== messageGen) return;
+
         if (result.ok) {
           renderApiResponse(result.body, transcript);
         } else {
@@ -137,10 +164,13 @@
         }
       })
       .catch(function (err) {
+        if (myGen !== messageGen) return;
         // Network failure, connection refused, CORS, or JSON parse error.
         renderApiError(0, null, transcript, err.message);
       })
       .then(function () {
+        // Only restore input state if we are still the latest request.
+        if (myGen !== messageGen) return;
         // Always restore input state.
         sendBtn.disabled = false;
         sendBtn.textContent = "Send";
@@ -513,9 +543,20 @@
   }
 
   function renderServerAmbiguousPayeeInto(draft, hash, validator, policy, el) {
-    currentCandidates = draft.payee_candidates || [];
+    var candidates = draft.payee_candidates || [];
+    var draftId = draft.id || "";
+    var candidateIds = candidates.map(function (c) { return c.id; }).join(",");
+    // Per-card in-flight flag stored on the DOM element so each card
+    // is fully independent — no module-level shared state.
+    var cardUid = "card-" + Math.random().toString(36).slice(2, 10);
 
-    var html = '<div class="card clarify-card">';
+    var html = '<div class="card clarify-card" ' +
+               'data-draft-id="' + escapeHtml(draftId) + '" ' +
+               'data-card-uid="' + escapeHtml(cardUid) + '" ' +
+               'data-candidate-ids="' + escapeHtml(candidateIds) + '" ' +
+               'data-clarify-in-flight="false" ' +
+               'data-message-gen="' + messageGen + '" ' +
+               'data-clarify-seq="0">';
 
     html += '<div class="card-header">';
     html +=   '<span class="intent">' + escapeHtml(draft.intent_type) + "</span>";
@@ -544,41 +585,47 @@
     // Clarification prompt
     html += '<p class="clarify-prompt">Which payee did you mean?</p>';
 
-    // Search field
+    // Search field — uses class-based selectors, not id, so multiple
+    // cards can coexist without ID collisions.
     html += '<div class="payee-search">';
-    html +=   '<label for="payee-filter" class="input-label">Search offered payees</label>';
-    html +=   '<input type="text" id="payee-filter" class="filter-input" ' +
+    html +=   '<label class="input-label">Search offered payees</label>';
+    html +=   '<input type="text" class="filter-input js-payee-filter" ' +
               'placeholder="Filter by name or account suffix…" ' +
               'autocomplete="off" />';
     html += '</div>';
 
     // Candidate list
-    html += '<div class="clarify-list" id="clarify-list">';
-    html += renderCandidateButtons(currentCandidates);
+    html += '<div class="clarify-list js-clarify-list">';
+    html += renderCandidateButtons(candidates);
     html += '</div>';
 
     // No-match message
-    html += '<p class="no-match" id="no-match" hidden>No matching offered payee.</p>';
+    html += '<p class="no-match js-no-match" hidden>No matching offered payee.</p>';
 
-    // Note: selecting a candidate here is UI preview only.
-    // In the real system, /api/clarify returns a NEW draft.
-    html += '<p class="hint">' +
-            'Selecting a candidate is a UI preview only — it does not ' +
-            'mutate the draft or submit a clarification. In the real ' +
-            'system, <code>/api/clarify</code> returns a new server-created ' +
-            'draft with a new id and nonce.' +
-            '</p>';
+    // Clarify status area (loading / error messages)
+    html += '<div class="clarify-status js-clarify-status" hidden></div>';
 
-    // Technical details
-    html += technicalDetailsHtml(draft, hash);
+    // Confirm Selection button — submits the selected candidate id to
+    // /api/clarify. Disabled until a candidate is selected.
+    html += '<div class="clarify-actions">';
+    html +=   '<button type="button" class="btn btn-primary clarify-confirm-btn js-clarify-confirm" disabled>';
+    html +=     'Confirm selection';
+    html +=   '</button>';
+    html += '</div>';
+
+    // Signing and execution remain disabled.
     html += disabledActionBar();
 
     html += "</div>";
     el.innerHTML = html;
 
-    wireCandidateButtons();
-    wirePayeeFilter();
-    setHint("Draft received from /api/message. Selecting a payee is preview only.");
+    // Wire all interactions scoped to THIS card only. The card root
+    // is the .clarify-card element inside el.
+    var cardEl = el.querySelector(".clarify-card");
+    wireCandidateButtons(cardEl);
+    wirePayeeFilter(cardEl);
+    wireClarifyConfirmBtn(cardEl);
+    setHint("Draft received from /api/message. Select a payee, then confirm to submit to /api/clarify.");
   }
 
   // Render validator verdict and policy decision rows.
@@ -617,6 +664,9 @@
   function loadFixture(key) {
     var url = FIXTURES[key];
     if (!url) return;
+    // Fixture loads must never carry server draft state into clarify.
+    // Increment the generation so any in-flight /api/clarify is stale.
+    messageGen++;
     displayEl.innerHTML = '<p class="placeholder">Loading…</p>';
 
     fetch(url)
@@ -750,9 +800,12 @@
     html += '<p class="clarify-prompt">Which "John" did you mean?</p>';
 
     // ── Search field (filters only the offered payee_candidates) ──
+    // Uses class-based selectors (no id) so it does not collide with
+    // any server-rendered cards. The fixture card has NO Confirm
+    // button and never calls /api/clarify.
     html += '<div class="payee-search">';
-    html +=   '<label for="payee-filter" class="input-label">Search offered payees</label>';
-    html +=   '<input type="text" id="payee-filter" class="filter-input" ' +
+    html +=   '<label class="input-label">Search offered payees</label>';
+    html +=   '<input type="text" class="filter-input js-payee-filter" ' +
               'placeholder="Filter by name or account suffix…" ' +
               'autocomplete="off" />';
     html += '</div>';
@@ -761,12 +814,12 @@
     // The filter toggles the `hidden` attribute on existing buttons
     // rather than destroying and re-creating them. This avoids stale
     // state and listener issues on repeated search/clear cycles.
-    html += '<div class="clarify-list" id="clarify-list">';
+    html += '<div class="clarify-list js-clarify-list">';
     html += renderCandidateButtons(currentCandidates);
     html += '</div>';
 
     // No-match message (hidden until search yields zero results)
-    html += '<p class="no-match" id="no-match" hidden>' +
+    html += '<p class="no-match js-no-match" hidden>' +
             'No matching offered payee.' +
             '</p>';
 
@@ -794,11 +847,10 @@
     html += "</div>";
     displayEl.innerHTML = html;
 
-    // Wire candidate buttons (keyboard + mouse + touch)
-    wireCandidateButtons();
-    // Wire search filter — reads from currentCandidates, not a closure
-    // param, so it always uses the original immutable list.
-    wirePayeeFilter();
+    // Wire candidate buttons scoped to displayEl (fixture is single-card).
+    // No Confirm button is rendered and no /api/clarify call is possible.
+    wireCandidateButtons(displayEl);
+    wirePayeeFilter(displayEl);
   }
 
   function renderOverLimit(draft, hash) {
@@ -875,13 +927,19 @@
     return html;
   }
 
-  function wireCandidateButtons() {
-    var buttons = displayEl.querySelectorAll(".candidate-btn");
+  // Wire candidate buttons scoped to a specific card root element.
+  // This ensures that when multiple ambiguous-payee cards are on
+  // screen, clicking a candidate on card A only affects card A's
+  // selection state and confirm button — not card B's.
+  function wireCandidateButtons(scopeEl) {
+    var root = scopeEl || displayEl;
+    var buttons = root.querySelectorAll(".candidate-btn");
     // Use Array.prototype.forEach for NodeList compatibility.
     Array.prototype.forEach.call(buttons, function (btn) {
       // click works for mouse and touch; button natively receives
       // keyboard Enter/Space, so no separate keydown handler needed.
       btn.addEventListener("click", function () {
+        // Deselect all candidates within THIS card only.
         Array.prototype.forEach.call(buttons, function (b) {
           b.classList.remove("selected");
           b.setAttribute("aria-pressed", "false");
@@ -890,6 +948,10 @@
         btn.classList.add("selected");
         btn.setAttribute("aria-pressed", "true");
         btn.querySelector(".candidate-check").style.display = "inline";
+
+        // Enable this card's Confirm button only.
+        var confirmBtn = root.querySelector(".js-clarify-confirm");
+        if (confirmBtn) confirmBtn.disabled = false;
       });
     });
   }
@@ -907,14 +969,17 @@
   // original, immutable payee_candidates from the fetched fixture
   // JSON. The frontend never modifies this array.
 
-  function wirePayeeFilter() {
-    var input = displayEl.querySelector("#payee-filter");
+  // Wire the payee search filter scoped to a specific card root.
+  // Multiple cards can each have their own filter without interference.
+  function wirePayeeFilter(scopeEl) {
+    var root = scopeEl || displayEl;
+    var input = root.querySelector(".js-payee-filter");
     if (!input) return;
 
     input.addEventListener("input", function () {
       var query = input.value.trim().toLowerCase();
-      var list = displayEl.querySelector("#clarify-list");
-      var noMatch = displayEl.querySelector("#no-match");
+      var list = root.querySelector(".js-clarify-list");
+      var noMatch = root.querySelector(".js-no-match");
       if (!list || !noMatch) return;
 
       var visibleCount = 0;
@@ -947,10 +1012,16 @@
           btn.hidden = true;
           // Clear selection on a now-hidden button so no invisible
           // selected candidate persists after the filter changes.
+          var wasSelected = btn.classList.contains("selected");
           btn.classList.remove("selected");
           btn.setAttribute("aria-pressed", "false");
           var check = btn.querySelector(".candidate-check");
           if (check) check.style.display = "none";
+          // If the selected candidate was hidden, disable this card's Confirm.
+          if (wasSelected) {
+            var cb = root.querySelector(".js-clarify-confirm");
+            if (cb) cb.disabled = true;
+          }
         }
       });
 
@@ -965,6 +1036,254 @@
   }
 
   // ── Technical details (collapsible) ─────────────────────────
+
+  // ── Payee clarification submission (CONTRACT.md §4) ──────────
+  //
+  // Submits the selected candidate id to POST /api/clarify with
+  //   { draft_id, field: "payee", answer: selectedCandidateId }.
+  //
+  // All state is per-card — no module-level shared variables. The
+  // card root element (a .clarify-card <div>) carries:
+  //   data-draft-id      — the server draft id to submit
+  //   data-card-uid      — unique card identifier
+  //   data-candidate-ids — comma-separated offered candidate ids
+  //   data-clarify-in-flight — per-card duplicate-submission guard
+  //   data-message-gen   — the messageGen value when this card was
+  //                         rendered (used to detect superseded displays)
+  //   data-clarify-seq   — per-card monotonic counter for this card's
+  //                         own /api/clarify requests
+  //
+  // Guards:
+  // - Only fires if the card has a data-draft-id (server draft, not fixture).
+  // - data-clarify-in-flight on the card prevents duplicate submissions
+  //   for THAT card only — other cards remain interactive.
+  // - The selected candidate id must be one of the card's offered
+  //   payee_candidates (validated by the server, but we check locally too).
+  // - messageGen (global) guards against stale /api/clarify responses
+  //   arriving after the user has sent a new /api/message — the entire
+  //   display has been replaced.
+  // - data-clarify-seq (per-card) guards against stale /api/clarify
+  //   responses for THIS card only. Confirming card A does NOT
+  //   invalidate card B's in-flight clarify response.
+
+  function wireClarifyConfirmBtn(scopeEl) {
+    var root = scopeEl || displayEl;
+    var btn = root.querySelector(".js-clarify-confirm");
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+      submitClarify(root);
+    });
+  }
+
+  function submitClarify(cardEl) {
+    if (!cardEl) return;
+    var inFlight = cardEl.getAttribute("data-clarify-in-flight") === "true";
+    if (inFlight) return;
+
+    var draftId = cardEl.getAttribute("data-draft-id") || "";
+    if (!draftId) {
+      showClarifyError(cardEl, "No server draft is currently displayed. " +
+                       "Fixture previews cannot be submitted to /api/clarify.");
+      return;
+    }
+
+    // Find the selected candidate within THIS card only.
+    var selectedBtn = cardEl.querySelector(".candidate-btn.selected");
+    if (!selectedBtn) {
+      showClarifyError(cardEl, "Select a payee candidate before confirming.");
+      return;
+    }
+    var answerId = selectedBtn.getAttribute("data-candidate-id") || "";
+
+    // Local sanity: answer must be one of the offered candidates.
+    var candidateIdsStr = cardEl.getAttribute("data-candidate-ids") || "";
+    var candidateIds = candidateIdsStr ? candidateIdsStr.split(",") : [];
+    var isValid = candidateIds.indexOf(answerId) !== -1;
+    if (!isValid) {
+      showClarifyError(cardEl, "The selected candidate is not among the offered payee_candidates.");
+      return;
+    }
+
+    // Per-card in-flight flag.
+    cardEl.setAttribute("data-clarify-in-flight", "true");
+
+    var confirmBtn = cardEl.querySelector(".js-clarify-confirm");
+    var candidateBtns = cardEl.querySelectorAll(".candidate-btn");
+    var filterInput = cardEl.querySelector(".js-payee-filter");
+
+    // Loading state: disable all interactive elements in THIS card.
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = "Submitting…";
+    }
+    Array.prototype.forEach.call(candidateBtns, function (b) {
+      b.disabled = true;
+    });
+    if (filterInput) filterInput.disabled = true;
+
+    showClarifyLoading(cardEl, "Submitting clarification to /api/clarify…");
+
+    // Per-card clarify sequence: independent per card. Confirming
+    // card A does NOT increment card B's counter, so card B's
+    // in-flight clarify response remains valid.
+    var myCardSeq = (parseInt(cardEl.getAttribute("data-clarify-seq") || "0", 10) + 1);
+    cardEl.setAttribute("data-clarify-seq", String(myCardSeq));
+
+    // Capture the message generation at the time of this request.
+    // If the user sends a new /api/message while this request is
+    // in-flight, messageGen will increment and we discard this
+    // response — the entire display has been replaced.
+    var myGen = parseInt(cardEl.getAttribute("data-message-gen") || "0", 10);
+
+    fetch(API_CLARIFY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        draft_id: draftId,
+        field: "payee",
+        answer: answerId,
+      }),
+    })
+      .then(function (res) {
+        return res.json()
+          .then(function (body) {
+            return { ok: res.ok, status: res.status, body: body };
+          })
+          .catch(function () {
+            return { ok: res.ok, status: res.status, body: null };
+          });
+      })
+      .then(function (result) {
+        // Stale-response guards (both must pass):
+        // 1. messageGen mismatch → a new /api/message has replaced
+        //    the entire display. This card no longer exists in the DOM.
+        // 2. clarify-seq mismatch → a newer /api/clarify request has
+        //    been issued for THIS card (duplicate submission guard).
+        if (myGen !== messageGen) return;
+        if (myCardSeq !== parseInt(cardEl.getAttribute("data-clarify-seq") || "0", 10)) return;
+
+        if (result.ok) {
+          // Clear this card's in-flight flag and replace ONLY this
+          // card's content with the server's new items-list response.
+          // The new draft has a new id and nonce — the old one is
+          // never reused. Other cards on screen are untouched.
+          cardEl.setAttribute("data-clarify-in-flight", "false");
+          renderClarifySuccessInto(result.body, cardEl);
+        } else {
+          cardEl.setAttribute("data-clarify-in-flight", "false");
+          showClarifyRejection(cardEl, result.status, result.body);
+          restoreClarifyControls(cardEl);
+        }
+      })
+      .catch(function (err) {
+        if (myGen !== messageGen) return;
+        if (myCardSeq !== parseInt(cardEl.getAttribute("data-clarify-seq") || "0", 10)) return;
+        cardEl.setAttribute("data-clarify-in-flight", "false");
+        showClarifyError(cardEl, "Could not reach /api/clarify: " + err.message);
+        restoreClarifyControls(cardEl);
+      });
+  }
+
+  // Render the server's items-list response from /api/clarify into the
+  // specific card element that was clarified. This replaces ONLY that
+  // card's content — other cards on screen are untouched. The server
+  // returns a new draft with a new id and nonce.
+  function renderClarifySuccessInto(body, cardEl) {
+    var parsed = parseMessageResponse(body);
+    if (!parsed) {
+      cardEl.innerHTML =
+        '<p class="placeholder">Clarification succeeded but the response ' +
+        'did not contain an items list.</p>';
+      return;
+    }
+
+    var items = parsed.items;
+    var html = "";
+
+    items.forEach(function (item, idx) {
+      if (!item || typeof item !== "object") return;
+
+      if (item.kind === "draft" && item.draft) {
+        var draft = item.draft;
+        var validator = item.validator || null;
+        var policy = item.policy || null;
+        // For clarify success, the draft should be resolved (no
+        // unresolved payee). Render it as a normal draft card.
+        html += '<div class="api-item-inner" data-item-idx="' + idx + '">' +
+                '<p class="placeholder">Loading draft…</p></div>';
+        // Compute hash and render into the placeholder asynchronously.
+        // We use a unique marker so the closure can find the right div.
+        var marker = 'data-item-idx="' + idx + '"';
+        canonical.draftHashAsync(draft)
+          .then(function (hash) {
+            var inner = cardEl.querySelector('[' + marker + ']');
+            if (!inner) return;
+            renderServerDraftInto(draft, hash, validator, policy, inner);
+          })
+          .catch(function (err) {
+            var inner = cardEl.querySelector('[' + marker + ']');
+            if (inner) inner.innerHTML =
+              '<p class="placeholder">Hash error: ' +
+              escapeHtml(err.message) + "</p>";
+          });
+      } else if (item.kind === "question") {
+        html += renderQuestionItem(item);
+      }
+    });
+
+    cardEl.innerHTML = html;
+    setHint("Clarification accepted. The server returned a new draft with a new id.");
+  }
+
+  // Restore candidate buttons, filter, and confirm button after a
+  // failed clarification (422 or network error) — scoped to one card.
+  function restoreClarifyControls(cardEl) {
+    var confirmBtn = cardEl.querySelector(".js-clarify-confirm");
+    var candidateBtns = cardEl.querySelectorAll(".candidate-btn");
+    var filterInput = cardEl.querySelector(".js-payee-filter");
+    if (confirmBtn) {
+      confirmBtn.textContent = "Confirm selection";
+      // Re-enable only if a candidate is still selected.
+      var hasSelected = cardEl.querySelector(".candidate-btn.selected");
+      confirmBtn.disabled = !hasSelected;
+    }
+    Array.prototype.forEach.call(candidateBtns, function (b) {
+      b.disabled = false;
+    });
+    if (filterInput) filterInput.disabled = false;
+  }
+
+  function showClarifyLoading(cardEl, msg) {
+    var el = cardEl.querySelector(".js-clarify-status");
+    if (!el) return;
+    el.hidden = false;
+    el.className = "clarify-status clarify-loading";
+    el.innerHTML = escapeHtml(msg);
+  }
+
+  function showClarifyError(cardEl, msg) {
+    var el = cardEl.querySelector(".js-clarify-status");
+    if (!el) return;
+    el.hidden = false;
+    el.className = "clarify-status clarify-error";
+    el.innerHTML = escapeHtml(msg);
+  }
+
+  function showClarifyRejection(cardEl, status, body) {
+    var el = cardEl.querySelector(".js-clarify-status");
+    if (!el) return;
+    el.hidden = false;
+    el.className = "clarify-status clarify-error";
+    var msg = "Clarification rejected (HTTP " + status + ")";
+    if (body && body.reason_code) {
+      msg += " — " + body.reason_code;
+    }
+    if (body && body.message) {
+      msg += ": " + body.message;
+    }
+    el.innerHTML = escapeHtml(msg);
+    setHint("Clarification rejected. Select a different candidate or try again.");
+  }
 
   function technicalDetailsHtml(draft, hash) {
     var html = '<details class="tech-details">';
