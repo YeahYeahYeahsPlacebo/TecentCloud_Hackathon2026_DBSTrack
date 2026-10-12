@@ -670,3 +670,240 @@ class TestCallableDisabled:
 
         assert "Call validate(" in str(exc_info.value)
         assert "ClarificationRecord" in str(exc_info.value)
+
+
+# ── Payee pick (resolve_payee's ClarificationRecord) ──────────────────
+#
+# "Send fifty dollars to John." fits three payees (001, 101, 102), so a
+# resolved draft needs a pick on record.  With one, the draft's payee is
+# checked against the PICKED id's directory record, not only against what
+# the transcript says.
+
+PICK_TRANSCRIPT = "Send fifty dollars to John."
+
+
+def _pick_draft(payee_id: str = "payee-102", transcript: str = PICK_TRANSCRIPT):
+    return _make_transfer_draft(payee_id=payee_id, transcript=transcript)
+
+
+def _pick_record(answer: str = "payee-102", kind: str = "candidate_id"):
+    return ClarificationRecord(
+        question_id="22222222-2222-2222-2222-222222222222",  # the stored draft's id
+        field="payee",
+        original_transcript=PICK_TRANSCRIPT,
+        answer=answer,
+        answer_kind=kind,
+    )
+
+
+def _validate(draft, *, mention="John", record=None, transcript=PICK_TRANSCRIPT):
+    client = FakeChatClient([_extraction_reply(payee_mention=mention)])
+    verdict = LlmValidator(client=client, directory=DIRECTORY).validate(
+        draft, transcript, clarification=record,
+    )
+    return verdict, client
+
+
+class TestPayeePickPasses:
+    @pytest.mark.parametrize("picked", ["payee-101", "payee-102"])
+    def test_pick_with_record_passes_for_the_picked_payee(self, picked):
+        draft = _pick_draft(picked)
+        verdict, client = _validate(draft, record=_pick_record(picked))
+        assert verdict.verdict == "pass", verdict.reason
+        assert verdict.discrepancies == []
+        assert verdict.draft_hash == _expected_hash(draft)
+        assert len(client.received_messages) == 1
+
+    def test_the_pick_is_shown_in_its_own_answer_block_labelled_payee(self):
+        _, client = _validate(_pick_draft(), record=_pick_record("payee-102"))
+        prompt = client.received_messages[0]
+        assert (
+            "Clarification answer for field <<<FIELD>>>payee<<<FIELD>>>:\n"
+            "<<<ANSWER>>>\npayee-102\n<<<END>>>"
+        ) in prompt
+        # Separate from the transcript block, never merged into it.
+        assert prompt.count("payee-102") == 1
+        assert PICK_TRANSCRIPT in prompt
+
+    def test_the_prompt_tells_the_model_the_id_is_not_a_name(self):
+        _, client = _validate(_pick_draft(), record=_pick_record())
+        prompt = client.received_messages[0]
+        assert "never copy it into payee_mention" in prompt
+
+
+class TestPayeePickMismatchFreezes:
+    def test_same_draft_but_the_answer_is_the_other_johns_id_freezes(self):
+        """Draft names John Lee (payee-102); the record says payee-101 was
+        picked.  Both fit the transcript, so only the record can tell."""
+        draft = _pick_draft("payee-102")
+        verdict, _ = _validate(draft, record=_pick_record("payee-101"))
+        assert verdict.verdict == "freeze"
+        assert verdict.discrepancies == ["payee"]
+        assert "not the payee that was picked" in verdict.reason
+        assert "John Doe" in verdict.reason and "John Lee" in verdict.reason
+
+    def test_and_the_other_way_round(self):
+        verdict, _ = _validate(_pick_draft("payee-101"), record=_pick_record("payee-102"))
+        assert verdict.verdict == "freeze"
+        assert verdict.discrepancies == ["payee"]
+
+    def test_a_draft_payee_that_differs_from_the_directory_record_freezes(self):
+        """Right id, wrong display name: the draft is not the directory's
+        payee, whatever its id says."""
+        data = _pick_draft("payee-102").model_dump(mode="json", exclude_none=True)
+        data["payee"]["display_name"] = "John Smith"
+        verdict, _ = _validate(
+            TransactionDraft.model_validate(data), record=_pick_record("payee-102"),
+        )
+        assert verdict.verdict == "freeze"
+        assert verdict.discrepancies == ["payee"]
+
+    def test_a_masked_account_that_differs_from_the_directory_freezes(self):
+        data = _pick_draft("payee-102").model_dump(mode="json", exclude_none=True)
+        data["payee"]["masked_account"] = "****0000"
+        verdict, _ = _validate(
+            TransactionDraft.model_validate(data), record=_pick_record("payee-102"),
+        )
+        assert verdict.verdict == "freeze"
+
+    def test_the_transcript_must_fit_the_pick_too(self):
+        """The model heard "Jane"; the picked payee is a John."""
+        verdict, _ = _validate(
+            _pick_draft("payee-102"), mention="Jane", record=_pick_record("payee-102"),
+        )
+        assert verdict.verdict == "freeze"
+        assert "does not match who was said" in verdict.reason
+
+
+class TestPayeePickAnswerNotInDirectory:
+    def test_answer_not_in_directory_freezes(self):
+        verdict, client = _validate(_pick_draft(), record=_pick_record("payee-999"))
+        assert verdict.verdict == "freeze"
+        assert verdict.discrepancies == ["payee"]
+        assert "not in the directory" in verdict.reason
+        assert "payee-999" in verdict.reason
+
+    @pytest.mark.parametrize("answer", [
+        "payee-1​02",      # an invisible character is not the id
+        "PAYEE-102",
+        " payee-102",
+        "John Lee",             # a name is not an id
+        "",
+    ])
+    def test_only_an_exact_directory_id_counts(self, answer):
+        verdict, _ = _validate(_pick_draft("payee-102"), record=_pick_record(answer))
+        assert verdict.verdict == "freeze"
+        assert verdict.discrepancies == ["payee"]
+
+
+class TestPayeePickWithoutRecord:
+    """A resolved draft whose transcript fits several payees, with no pick
+    on record, is refused by the validator's own check."""
+
+    def test_ambiguous_transcript_with_no_record_freezes_not_passes(self):
+        draft = _pick_draft("payee-102")
+        verdict, client = _validate(draft, record=None)
+        assert verdict.verdict == "freeze"
+        assert verdict.discrepancies == ["payee"]
+        assert "no payee pick was recorded" in verdict.reason
+        assert "fits 3" in verdict.reason
+        # The validator's own error, not its fail-closed "model unavailable".
+        assert not verdict.reason.startswith("validator_unavailable")
+        assert len(client.received_messages) == 1
+
+    def test_same_draft_passes_once_the_pick_is_supplied(self):
+        draft = _pick_draft("payee-102")
+        assert _validate(draft, record=None)[0].verdict == "freeze"
+        assert _validate(draft, record=_pick_record("payee-102"))[0].verdict == "pass"
+
+    def test_a_text_record_is_not_a_pick(self):
+        """A free-text reply to a payee question is not a candidate pick,
+        so it does not rescue an ambiguous transcript."""
+        verdict, _ = _validate(
+            _pick_draft("payee-102"), record=_pick_record("Jane", kind="text"),
+        )
+        assert verdict.verdict == "freeze"
+        assert "no payee pick was recorded" in verdict.reason
+
+    @pytest.mark.parametrize("payee_id,transcript,mention", [
+        ("payee-001", "Send fifty dollars to John Smith.", "John Smith"),
+        ("payee-002", "Send fifty dollars to Jane.", "Jane"),
+        ("payee-102", "Send fifty dollars to John ending 8892.", "John"),
+    ])
+    def test_an_unambiguous_transcript_needs_no_pick(self, payee_id, transcript, mention):
+        """Regression: one match (by name, or narrowed by an account clue)
+        passes exactly as before, with no record."""
+        draft = _make_transfer_draft(payee_id=payee_id, transcript=transcript)
+        verdict, _ = _validate(draft, mention=mention, transcript=transcript)
+        assert verdict.verdict == "pass", verdict.reason
+
+    def test_an_unresolved_draft_is_not_asked_for_a_pick(self):
+        """The ambiguous draft itself (payee unresolved) is validated at
+        /api/message time, before any pick exists."""
+        draft = _make_transfer_draft(unresolved=["payee"], transcript=PICK_TRANSCRIPT)
+        verdict, _ = _validate(draft, record=None)
+        assert verdict.verdict == "pass", verdict.reason
+
+
+class TestPayeePickModelConfusion:
+    """The model sees an opaque id in the ANSWER block.  If it copies the
+    id into payee_mention, or returns no mention, the check falls back to
+    the transcript itself -- it neither passes blindly nor freezes a
+    correct pick."""
+
+    @pytest.mark.parametrize("mention", [None, "payee-102"])
+    def test_no_usable_mention_falls_back_to_the_transcript(self, mention):
+        verdict, _ = _validate(
+            _pick_draft("payee-102"), mention=mention, record=_pick_record("payee-102"),
+        )
+        assert verdict.verdict == "pass", verdict.reason
+
+    @pytest.mark.parametrize("mention", [None, "payee-102"])
+    def test_and_still_freezes_if_the_transcript_does_not_name_the_pick(self, mention):
+        transcript = "Send fifty dollars to Jane."
+        draft = _make_transfer_draft(payee_id="payee-102", transcript=transcript)
+        verdict, _ = _validate(
+            draft, mention=mention, record=_pick_record("payee-102"),
+            transcript=transcript,
+        )
+        assert verdict.verdict == "freeze"
+        assert verdict.discrepancies == ["payee"]
+        assert "does not name the payee that was picked" in verdict.reason
+
+
+class TestOtherRecordsAreUntouched:
+    def test_a_free_text_payee_answer_is_not_checked_against_the_directory(self):
+        """resolve_question can record field="payee" with a sentence as the
+        answer.  That must not freeze for "not being an id"."""
+        draft = _make_transfer_draft(payee_id="payee-002", transcript="Send fifty dollars.")
+        record = ClarificationRecord(
+            question_id="q-payee-abc12345", field="payee",
+            original_transcript="Send fifty dollars.", answer="Jane",
+        )
+        assert record.answer_kind == "text"
+        client = FakeChatClient([_extraction_reply(payee_mention="Jane")])
+        verdict = LlmValidator(client=client, directory=DIRECTORY).validate(
+            draft, "Send fifty dollars.", clarification=record,
+        )
+        assert verdict.verdict == "pass", verdict.reason
+
+    def test_an_amount_record_is_not_a_pick(self):
+        record = ClarificationRecord(
+            question_id="q-amount-1", field="amount",
+            original_transcript="Send some money to John Smith.", answer="fifty dollars",
+        )
+        draft = _make_transfer_draft(transcript="Send some money to John Smith.")
+        client = FakeChatClient([_extraction_reply()])
+        verdict = LlmValidator(client=client, directory=DIRECTORY).validate(
+            draft, "Send some money to John Smith.", clarification=record,
+        )
+        assert verdict.verdict == "pass", verdict.reason
+
+    def test_answer_kind_defaults_to_text_and_rejects_unknown_kinds(self):
+        from pydantic import ValidationError
+
+        base = dict(question_id="q", field="payee", original_transcript="t", answer="a")
+        assert ClarificationRecord(**base).answer_kind == "text"
+        assert ClarificationRecord(**base, answer_kind="candidate_id").answer_kind == "candidate_id"
+        with pytest.raises(ValidationError):
+            ClarificationRecord(**base, answer_kind="free")

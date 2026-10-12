@@ -465,7 +465,7 @@ class MessageService:
             )
 
         try:
-            resolved = resolve_payee(stored, request["answer"], self.directory)
+            resolved, record = resolve_payee(stored, request["answer"], self.directory)
         except InvalidClarificationAnswer as exc:
             return rejection_response(R.INVALID_CLARIFICATION_ANSWER, str(exc))
 
@@ -482,4 +482,4 @@ class MessageService:
                 "answer": request["answer"],
             },
         )
-        return {"intents_detected": 1, "items": [self._attach(resolved)]}
+        return {"intents_detected": 1, "items": [self._attach(resolved, clarification=record)]}

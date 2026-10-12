@@ -8,6 +8,9 @@ the Pydantic model.
 Covers:
   - payee pick success (new id, new nonce, payee from directory,
     candidates gone, schema-valid)
+  - payee pick returns a ClarificationRecord (candidate_id, stored
+    draft's id and transcript, the picked id as the answer)
+  - the stub parser's payee candidates come from the directory
   - input draft unchanged after payee pick
   - answer not in candidates → rejected
   - answer in candidates but not in directory → rejected
@@ -152,7 +155,7 @@ class TestResolvePayeeSuccess:
     def test_payee_pick_returns_new_draft_with_new_id_and_nonce(self):
         stored = _load_ambiguous()
         directory = FixtureDirectory()
-        resolved = resolve_payee(stored, "payee-102", directory)
+        resolved, _record = resolve_payee(stored, "payee-102", directory)
 
         assert isinstance(resolved, TransactionDraft)
         assert resolved.id != stored.id
@@ -161,7 +164,7 @@ class TestResolvePayeeSuccess:
     def test_payee_pick_fills_payee_from_directory(self):
         stored = _load_ambiguous()
         directory = FixtureDirectory()
-        resolved = resolve_payee(stored, "payee-102", directory)
+        resolved, _record = resolve_payee(stored, "payee-102", directory)
 
         assert resolved.payee is not None
         assert resolved.payee.id == "payee-102"
@@ -172,14 +175,14 @@ class TestResolvePayeeSuccess:
     def test_payee_pick_removes_payee_from_unresolved(self):
         stored = _load_ambiguous()
         directory = FixtureDirectory()
-        resolved = resolve_payee(stored, "payee-102", directory)
+        resolved, _record = resolve_payee(stored, "payee-102", directory)
 
         assert resolved.unresolved == []
 
     def test_payee_pick_omits_payee_candidates(self):
         stored = _load_ambiguous()
         directory = FixtureDirectory()
-        resolved = resolve_payee(stored, "payee-102", directory)
+        resolved, _record = resolve_payee(stored, "payee-102", directory)
 
         # payee_candidates should be None (omitted) since payee is resolved.
         assert resolved.payee_candidates is None
@@ -187,13 +190,13 @@ class TestResolvePayeeSuccess:
     def test_payee_pick_validates_against_schema(self):
         stored = _load_ambiguous()
         directory = FixtureDirectory()
-        resolved = resolve_payee(stored, "payee-102", directory)
+        resolved, _record = resolve_payee(stored, "payee-102", directory)
         _validate_schema(resolved)
 
     def test_payee_pick_keeps_same_transcript_amount_and_intent(self):
         stored = _load_ambiguous()
         directory = FixtureDirectory()
-        resolved = resolve_payee(stored, "payee-102", directory)
+        resolved, _record = resolve_payee(stored, "payee-102", directory)
 
         assert resolved.transcript == stored.transcript
         assert resolved.amount.value == stored.amount.value
@@ -201,6 +204,120 @@ class TestResolvePayeeSuccess:
         assert resolved.intent_type == stored.intent_type
         assert resolved.source_account == stored.source_account
 
+
+
+# ── Payee pick returns a ClarificationRecord ─────────────────────────
+
+
+class TestResolvePayeeRecord:
+    """resolve_payee returns (draft, record); the record is required when
+    the draft is validated."""
+
+    def test_returns_a_draft_and_a_record(self):
+        result = resolve_payee(_load_ambiguous(), "payee-102", FixtureDirectory())
+        assert isinstance(result, tuple) and len(result) == 2
+        draft, record = result
+        assert isinstance(draft, TransactionDraft)
+        assert isinstance(record, ClarificationRecord)
+
+    def test_record_fields(self):
+        stored = _load_ambiguous()
+        _, record = resolve_payee(stored, "payee-102", FixtureDirectory())
+        assert record.model_dump() == {
+            # No separate question was issued: the stored draft's id.
+            "question_id": stored.id,
+            "field": "payee",
+            "original_transcript": stored.transcript,
+            "answer": "payee-102",
+            "answer_kind": "candidate_id",
+        }
+
+    def test_question_id_is_the_stored_drafts_id_not_the_new_one(self):
+        stored = _load_ambiguous()
+        draft, record = resolve_payee(stored, "payee-102", FixtureDirectory())
+        assert record.question_id == stored.id
+        assert record.question_id != draft.id
+
+    def test_answer_is_not_merged_into_the_transcript(self):
+        stored = _load_ambiguous()
+        draft, record = resolve_payee(stored, "payee-101", FixtureDirectory())
+        assert record.answer == "payee-101"
+        assert record.original_transcript == stored.transcript == draft.transcript
+        assert "payee-101" not in record.original_transcript
+
+    def test_the_record_is_for_the_picked_candidate(self):
+        for picked in ("payee-101", "payee-102"):
+            draft, record = resolve_payee(_load_ambiguous(), picked, FixtureDirectory())
+            assert record.answer == picked == draft.payee.id
+
+    def test_every_existing_check_still_raises_and_returns_no_record(self):
+        directory = FixtureDirectory()
+        with pytest.raises(InvalidClarificationAnswer):
+            resolve_payee(_load_ambiguous(), "payee-999", directory)
+        resolved = _load_ambiguous()
+        resolved.unresolved = []
+        with pytest.raises(InvalidClarificationAnswer):
+            resolve_payee(resolved, "payee-102", directory)
+
+    def test_a_free_text_answer_record_is_marked_text(self):
+        """Only resolve_payee marks a record a candidate pick; a free-text
+        reply (resolve_question) keeps the default."""
+        client = FakeChatClient([json.dumps({
+            "resolved": True, "amount_text": "fifty dollars", "amount_value": "50.00",
+        })])
+        _, record = resolve_question(_make_pending(), "fifty dollars", client, FixtureDirectory())
+        assert record.answer_kind == "text"
+        assert record.answer == "fifty dollars"
+
+
+# ── The stub's payee candidates come from the directory ──────────────
+
+
+class TestStubCandidatesComeFromTheDirectory:
+    """A candidate labelled differently from the payee it resolves to
+    would show the user one name and execute another."""
+
+    def _stub_draft(self):
+        item = parse("Send fifty dollars to John.").items[0]
+        assert isinstance(item, TransactionDraft)
+        return item
+
+    def test_every_candidate_equals_its_directory_record(self):
+        by_id = {p.id: p for p in FixtureDirectory().payees()}
+        candidates = self._stub_draft().payee_candidates
+        assert [c.id for c in candidates] == ["payee-101", "payee-102"]
+        for c in candidates:
+            record = by_id[c.id]
+            assert (c.display_name, c.masked_account) == (
+                record.display_name, record.masked_account,
+            )
+
+    def test_payee_102_is_shown_as_john_lee(self):
+        names = {c.id: c.display_name for c in self._stub_draft().payee_candidates}
+        assert names["payee-102"] == "John Lee"
+        assert names["payee-101"] == "John Doe"
+        assert "John Smith" not in names.values()
+
+    def test_what_the_user_picks_is_what_the_draft_names(self):
+        stub = self._stub_draft()
+        for c in stub.payee_candidates:
+            fresh = stub.model_copy()  # same ids; resolve_payee builds a new draft
+            resolved, _ = resolve_payee(fresh, c.id, FixtureDirectory())
+            assert (resolved.payee.display_name, resolved.payee.masked_account) == (
+                c.display_name, c.masked_account,
+            )
+
+    def test_the_stub_does_not_fall_back_to_a_hardcoded_name(self, monkeypatch):
+        """If the directory lacks an id the stub offers, it fails loudly
+        rather than inventing a label."""
+        import backend.parser.stub as stub_module
+
+        class _NoLee(FixtureDirectory):
+            _PAYEES = tuple(p for p in FixtureDirectory._PAYEES if p.id != "payee-102")
+
+        monkeypatch.setattr(stub_module, "FixtureDirectory", _NoLee)
+        with pytest.raises(LookupError, match="payee-102"):
+            parse("Send fifty dollars to John.")
 
 # ── Input draft unchanged ────────────────────────────────────────────
 

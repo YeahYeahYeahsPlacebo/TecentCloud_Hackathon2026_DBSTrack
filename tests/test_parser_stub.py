@@ -126,7 +126,7 @@ def test_ambiguous_payee_returns_draft_with_unresolved():
 
     names = [c.display_name for c in item.payee_candidates]
     assert "John Doe" in names
-    assert "John Smith" in names
+    assert "John Lee" in names
 
     masked = [c.masked_account for c in item.payee_candidates]
     assert "****4521" in masked

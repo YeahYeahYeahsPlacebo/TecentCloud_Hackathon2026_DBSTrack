@@ -47,7 +47,7 @@ so the user can supply the missing value first.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Literal, Union
 
 from pydantic import BaseModel, ConfigDict
 
@@ -157,6 +157,19 @@ class ClarificationRecord(BaseModel):
       to the validator (CONTRACT.md §4 second form).
 
     The answer is never merged into ``original_transcript``.
+
+    ``answer_kind`` says what ``answer`` is:
+
+    - ``"text"`` (default): the user's free-text reply to a
+      :class:`ClarifyingQuestion` (:func:`resolve_question`).
+    - ``"candidate_id"``: the ``id`` of one of a draft's
+      ``payee_candidates``, picked in the UI (:func:`resolve_payee`).
+      Here ``question_id`` is the id of the draft the pick was made on,
+      because no separate question was issued.
+
+    The validator needs the difference: a candidate id must exist in the
+    directory and must be the payee the draft names, whereas a free-text
+    answer is a sentence to be read.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -165,6 +178,7 @@ class ClarificationRecord(BaseModel):
     field: str
     original_transcript: str
     answer: str
+    answer_kind: Literal["text", "candidate_id"] = "text"
 
 
 class ParseResult(BaseModel):

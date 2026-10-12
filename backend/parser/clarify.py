@@ -6,7 +6,8 @@ No storage, no HTTP.  Member 3's service stores state and calls these.
 Two functions:
 
 1. :func:`resolve_payee` — resolve a payee candidate pick on an existing
-   draft (CONTRACT.md §4, first form).
+   draft (CONTRACT.md §4, first form).  Returns ``(draft, record)``; the
+   :class:`ClarificationRecord` must be passed to the validator.
 
 2. :func:`resolve_question` — resolve a free-text answer to a
    :class:`~backend.parser.interface.ClarifyingQuestion` (CONTRACT.md §4,
@@ -14,7 +15,7 @@ Two functions:
    field, with the answer isolated between ``<<<ANSWER>>>`` and
    ``<<<END>>>`` markers.
 
-Both functions return a **new** draft/value — the input is never modified.
+Both functions return a **new** draft — the input is never modified.
 
 Single-use enforcement (marking a ``question_id`` as consumed, refusing
 re-use) is the **server's** job — it holds storage.  These pure functions
@@ -135,7 +136,7 @@ def resolve_payee(
     stored_draft: TransactionDraft,
     answer_id: str,
     directory: PayeeDirectory,
-) -> TransactionDraft:
+) -> Tuple[TransactionDraft, ClarificationRecord]:
     """Resolve a payee candidate pick on an existing draft.
 
     This is the first form of ``/api/clarify`` (CONTRACT.md §4):
@@ -150,14 +151,27 @@ def resolve_payee(
             payee record — never trust the candidate fields alone).
 
     Returns:
-        A **new** :class:`TransactionDraft` with:
-        - a new ``id``, ``nonce``, ``created_at``, ``expires_at``
-          (5-minute window),
-        - ``payee`` filled from the **directory** record,
-        - ``"payee"`` removed from ``unresolved``,
-        - ``payee_candidates`` omitted,
-        - the same ``transcript``, ``amount``, ``source_account``,
-          ``intent_type``, and other fields as the input.
+        A tuple ``(draft, record)``:
+
+        - ``draft`` is a **new** :class:`TransactionDraft` with
+          a new ``id``, ``nonce``, ``created_at``, ``expires_at``
+          (5-minute window), ``payee`` filled from the **directory**
+          record, ``"payee"`` removed from ``unresolved``,
+          ``payee_candidates`` omitted, and the same ``transcript``,
+          ``amount``, ``source_account``, ``intent_type`` and other
+          fields as the input.
+        - ``record`` is the :class:`ClarificationRecord` for the pick:
+          ``question_id`` is the stored draft's id (no separate question
+          was issued), ``field`` is ``"payee"``, ``original_transcript``
+          is the stored draft's transcript, ``answer`` is ``answer_id``
+          and ``answer_kind`` is ``"candidate_id"``.
+
+          **The record is required when the draft is validated.** Pass
+          it to ``validator.validate(draft, transcript,
+          clarification=record)``: the validator checks the draft's
+          payee against the picked id's directory record, and refuses a
+          draft whose transcript names more than one payee when no pick
+          is supplied.
 
     Raises:
         InvalidClarificationAnswer: If:
@@ -215,7 +229,14 @@ def resolve_payee(
         "masked_account": record.masked_account,
     }
 
-    return TransactionDraft.model_validate(data)
+    clarification = ClarificationRecord(
+        question_id=stored_draft.id,
+        field="payee",
+        original_transcript=stored_draft.transcript,
+        answer=answer_id,
+        answer_kind="candidate_id",
+    )
+    return TransactionDraft.model_validate(data), clarification
 
 
 # ── 2. Answering a question (CONTRACT.md §4, second form) ───────────────
