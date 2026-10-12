@@ -652,6 +652,8 @@ developer log, not necessarily for the user.
 | `step_up_required` | Additional authentication (e.g. biometric or 2FA) is required for this transaction. |
 | `schema_invalid` | The draft does not validate against `contract/draft.schema.json`. |
 | `invalid_clarification_answer` | `/api/clarify` was called with an `answer` that is not the `id` of one of the stored draft's `payee_candidates`, with a `field` that is not in its `unresolved` list, or (in the proposed question form) with a `question_id` that is unknown or already used. |
+| `multi_intent_unsupported` | The transcript describes more than one transaction. Before phase 5 the request is declined and **nothing is drafted** — see §8 open question 4. |
+| `parser_cannot_handle` | The parser could not produce a draft for the transcript at all (it raises `ParserCannotHandle`). Kept separate from `multi_intent_unsupported` so an evaluation table can tell "several intents" apart from "not understood". |
 
 ---
 
@@ -773,9 +775,11 @@ team, not a silent assumption:
    message asking the user to send one request at a time, and nothing
    is drafted. Reason: executing dependent steps independently, with
    nothing enforcing order, is the risk raised in the multi-intent
-   proposal. The exact response for a declined request is an open
-   decision (suggest 422 with `reason_code` `"multi_intent_unsupported"`);
-   it is not yet added to the reason code table. Until then,
+   proposal. **The declined-request response is now decided and
+   implemented:** 422 with `reason_code` `"multi_intent_unsupported"`,
+   added to the §5 table above. A transcript the parser cannot handle
+   at all (as opposed to one describing several transactions) gets
+   `"parser_cannot_handle"`, also in §5. Until phase 5,
    `multi_step.json` represents a single transfer whose transcript
    matches the draft exactly.
 
@@ -794,6 +798,10 @@ team, not a silent assumption:
 8. **Policy `decision` values.** The examples use `"allow"` and
    `"hold"`. Is `"block"` different from `"hold"`? What are all the
    possible policy decisions, and which map to which reason codes?
+   *Current behaviour in code, not yet a decision:* `allow` passes,
+   `block` becomes `policy_blocked`, and anything else — today only
+   `hold` — becomes `step_up_required` at step 12. Pinned by
+   `tests/test_policy_step_up.py`.
 
 ---
 
