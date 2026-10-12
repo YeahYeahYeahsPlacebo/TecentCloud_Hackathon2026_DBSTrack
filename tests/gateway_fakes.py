@@ -64,3 +64,79 @@ def passing_validator() -> FakeValidator:
 def freezing_validator(reason: str = "amount disagrees") -> FakeValidator:
     """A validator that refuses the draft."""
     return FakeValidator("freeze", reason=reason, discrepancies=["amount"])
+
+
+# ── A real signature, so a test can reach /api/execute ─────────────────
+# Every step after 8 needs a signed assertion. Copying this plumbing into a
+# second test file would let the copies drift apart, and drift here means a
+# test that quietly stops exercising step 9. One copy, here.
+
+ORIGIN = "http://localhost:8000"
+RP_ID = "localhost"
+
+
+def new_key():
+    """A fresh P-256 key, which is what WebAuthn ES256 means."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return ec.generate_private_key(ec.SECP256R1())
+
+
+def sign_assertion(private_key, credential_id: str, challenge: str) -> dict:
+    """An assertion over ``authenticator_data || SHA256(client_data_json)``."""
+    import hashlib
+    import json
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from backend.gateway.execute import (
+        FLAG_USER_PRESENT,
+        FLAG_USER_VERIFIED,
+        b64url_encode,
+    )
+    from backend.gateway.webauthn import der_to_raw_signature
+
+    client_data = json.dumps(
+        {"type": "webauthn.get", "challenge": challenge, "origin": ORIGIN}
+    ).encode()
+    authenticator_data = (
+        hashlib.sha256(RP_ID.encode()).digest()
+        + bytes([FLAG_USER_PRESENT | FLAG_USER_VERIFIED])
+        + (1).to_bytes(4, "big")
+    )
+    signed = authenticator_data + hashlib.sha256(client_data).digest()
+    return {
+        "credential_id": credential_id,
+        "authenticator_data": b64url_encode(authenticator_data),
+        "client_data_json": b64url_encode(client_data),
+        "signature": b64url_encode(
+            der_to_raw_signature(private_key.sign(signed, ec.ECDSA(hashes.SHA256())))
+        ),
+    }
+
+
+def signed_full_run(api, private_key, idempotency_key: str = "key-1") -> dict:
+    """message -> register -> challenge -> signed execute.
+
+    Returns the ``/api/execute`` response, so a caller can assert on the
+    reason code rather than on the happy path only.
+    """
+    from backend.gateway.webauthn import public_key_to_pem
+
+    message = api.message({"transcript": "Send fifty dollars to John Smith."})
+    draft_id = message["items"][0]["draft"]["id"]
+    credential_id = api.register(
+        {"user_id": "user-001", "public_key": public_key_to_pem(private_key.public_key())}
+    )["credential_id"]
+    challenge = api.challenge({"draft_id": draft_id, "credential_id": credential_id})[
+        "challenge"
+    ]
+    return api.execute(
+        {
+            "draft_id": draft_id,
+            "credential_id": credential_id,
+            "idempotency_key": idempotency_key,
+            "assertion": sign_assertion(private_key, credential_id, challenge),
+        }
+    )

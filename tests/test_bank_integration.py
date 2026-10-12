@@ -28,13 +28,16 @@ from backend.gateway.execute import (  # noqa: E402
 from backend.gateway.webauthn import der_to_raw_signature, public_key_to_pem  # noqa: E402
 from backend.models.draft import Money, Payee, TransactionDraft  # noqa: E402
 from backend.parser.interface import ParseResult  # noqa: E402
-from gateway_fakes import FakeValidator, passing_validator  # noqa: E402
+from gateway_fakes import (  # noqa: E402
+    FakeValidator,
+    passing_validator,
+    sign_assertion,
+    signed_full_run,
+)
 from cryptography.hazmat.primitives import hashes  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "drafts"
-ORIGIN = "http://localhost:8000"
-RP_ID = "localhost"
 
 
 def load(name: str) -> TransactionDraft:
@@ -60,47 +63,6 @@ def make_api(*items, bank=_UNSET, now=None, validator=None):
     )
 
 
-def sign_assertion(private_key, credential_id, challenge):
-    client_data = json.dumps(
-        {"type": "webauthn.get", "challenge": challenge, "origin": ORIGIN}
-    ).encode()
-    authenticator_data = (
-        hashlib.sha256(RP_ID.encode()).digest()
-        + bytes([FLAG_USER_PRESENT | FLAG_USER_VERIFIED])
-        + (1).to_bytes(4, "big")
-    )
-    signed = authenticator_data + hashlib.sha256(client_data).digest()
-    return {
-        "credential_id": credential_id,
-        "authenticator_data": b64url_encode(authenticator_data),
-        "client_data_json": b64url_encode(client_data),
-        "signature": b64url_encode(
-            der_to_raw_signature(private_key.sign(signed, ec.ECDSA(hashes.SHA256())))
-        ),
-    }
-
-
-def full_run(api, private_key):
-    """message -> challenge -> signed execute. Returns the execute response."""
-    clean = load("clean_transfer.json")
-    message = api.message({"transcript": "Send fifty dollars to John Smith."})
-    draft_id = message["items"][0]["draft"]["id"]
-    credential_id = api.register(
-        {"user_id": "user-001", "public_key": public_key_to_pem(private_key.public_key())}
-    )["credential_id"]
-    challenge = api.challenge({"draft_id": draft_id, "credential_id": credential_id})[
-        "challenge"
-    ]
-    return api.execute(
-        {
-            "draft_id": draft_id,
-            "credential_id": credential_id,
-            "idempotency_key": "key-1",
-            "assertion": sign_assertion(private_key, credential_id, challenge),
-        }
-    )
-
-
 # ── Money actually moves ───────────────────────────────────────────────
 
 
@@ -112,7 +74,7 @@ def test_executing_a_signed_draft_moves_the_money():
     before = api.bank.balance("acct-001-2345")
     assert api.bank.balance("payee-001") == Decimal("0.00")
 
-    result = full_run(api, private_key)
+    result = signed_full_run(api, private_key)
     assert result["result"] == "executed", result
 
     # Fifty dollars left the account and arrived at John Smith.
@@ -125,7 +87,7 @@ def test_the_ledger_and_the_bank_agree():
     books and the balances drift apart."""
     private_key = ec.generate_private_key(ec.SECP256R1())
     api = make_api()
-    assert full_run(api, private_key)["result"] == "executed"
+    assert signed_full_run(api, private_key)["result"] == "executed"
 
     assert len(api.ledger.entries) == 1
     posted = api.ledger.entries[0]["draft"]
@@ -224,7 +186,7 @@ def test_a_bank_with_no_money_still_runs_every_check():
     """``bank=None`` means no balances change; it must not break execution."""
     private_key = ec.generate_private_key(ec.SECP256R1())
     api = make_api(bank=None)
-    assert full_run(api, private_key)["result"] == "executed"
+    assert signed_full_run(api, private_key)["result"] == "executed"
     assert api.bank is None
 
 
