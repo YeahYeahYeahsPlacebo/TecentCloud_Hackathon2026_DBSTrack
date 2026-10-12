@@ -45,6 +45,7 @@ from backend.models.draft import (
     PayeeCandidate,
     TransactionDraft,
 )
+from backend.parser.directory import FixtureDirectory
 from backend.parser.interface import (
     ClarifyingQuestion,
     ParserCannotHandle,
@@ -232,8 +233,39 @@ def _clean_transfer(transcript: str) -> TransactionDraft:
     )
 
 
+# The payee ids the stub offers for an ambiguous "John".
+_AMBIGUOUS_JOHN_IDS = ("payee-101", "payee-102")
+
+
+def _candidates_from_directory(ids: tuple[str, ...]) -> list[PayeeCandidate]:
+    """Build ``payee_candidates`` for *ids* from the payee directory.
+
+    Names and masked accounts are never written out here: the directory is
+    the source of truth (CONTRACT.md §4), and ``resolve_payee`` fills the
+    resolved payee from it.  A candidate labelled differently from the
+    payee it resolves to would show the user one name and execute another.
+    """
+    by_id = {p.id: p for p in FixtureDirectory().payees()}
+    missing = [i for i in ids if i not in by_id]
+    if missing:
+        raise LookupError(f"stub offers payee id(s) the directory lacks: {missing}")
+    return [
+        PayeeCandidate(
+            id=by_id[i].id,
+            display_name=by_id[i].display_name,
+            masked_account=by_id[i].masked_account,
+        )
+        for i in ids
+    ]
+
+
 def _ambiguous_payee(transcript: str) -> TransactionDraft:
-    """Match fixtures/drafts/ambiguous_payee.json (field values, not id/timestamps)."""
+    """The ambiguous-payee draft (shape of fixtures/drafts/ambiguous_payee.json).
+
+    Only the shape matches the fixture.  The candidate names come from the
+    directory, so payee-102 is "John Lee" here, whereas the shared fixture
+    still labels it "John Smith".
+    """
     created, expires = _fresh_timestamps()
     return TransactionDraft(
         id=_fresh_id(),
@@ -246,18 +278,7 @@ def _ambiguous_payee(transcript: str) -> TransactionDraft:
         confidence=0.4,
         unresolved=["payee"],
         transcript=transcript,
-        payee_candidates=[
-            PayeeCandidate(
-                id="payee-101",
-                display_name="John Doe",
-                masked_account="****4521",
-            ),
-            PayeeCandidate(
-                id="payee-102",
-                display_name="John Smith",
-                masked_account="****8892",
-            ),
-        ],
+        payee_candidates=_candidates_from_directory(_AMBIGUOUS_JOHN_IDS),
     )
 
 

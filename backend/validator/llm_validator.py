@@ -25,7 +25,11 @@ The validator:
      - currency (product rule in backend.parser.amount_rules, never
        the model's currency field) unclear or different -> "amount"
      - payee: match_payees (name AND any account digits said) must
-       include the draft's payee id, else "payee"
+       include the draft's payee id, else "payee".  A transcript that
+       fits several payees needs a payee pick on record (the
+       ClarificationRecord from resolve_payee); without one -> "payee".
+       With a pick, the draft's payee must be the directory record for
+       the picked id, which must exist in the directory -> else "payee"
      - source account: must match the draft's if mentioned
      - ticker and order_type for equity drafts
   4. Any discrepancy -> freeze, listing the fields.
@@ -167,6 +171,86 @@ def _parse_reply(text: str) -> _ExtractionResult:
     return _ExtractionResult.model_validate(data)
 
 
+# ── Payee pick (CONTRACT.md §4, first form of /api/clarify) ──────────
+
+
+def _payee_pick(
+    clarification: Optional[ClarificationRecord],
+) -> Optional[ClarificationRecord]:
+    """Return *clarification* if it records a payee candidate pick."""
+    if (
+        clarification is not None
+        and clarification.field == "payee"
+        and clarification.answer_kind == "candidate_id"
+    ):
+        return clarification
+    return None
+
+
+def _transcript_names(record: Any, transcript: str) -> bool:
+    """True if a word of the transcript is the first or last name of *record*.
+
+    Deterministic and model-free: the fallback when the model gave no
+    usable payee mention for a payee pick.
+    """
+    words = record.display_name.lower().split()
+    if not words:
+        return False
+    tokens = set(re.findall(r"[^\W\d_]+", transcript.lower()))
+    return bool(tokens & {words[0], words[-1]})
+
+
+def _check_payee_pick(
+    draft: TransactionDraft,
+    pick: ClarificationRecord,
+    mention: Optional[str],
+    matches: list[Any],
+    directory: PayeeDirectory,
+    transcript: str,
+) -> list[str]:
+    """Reasons the draft's payee disagrees with a payee pick (empty = fine).
+
+    1. The picked id must exist in the directory; otherwise freeze.
+    2. The draft's payee must be exactly the directory record for that
+       id (id, display name and masked account).
+    3. The transcript must be consistent with the picked payee: the
+       model's payee mention must match it, or -- if the model gave no
+       usable mention (none, or it copied the opaque id) -- a name
+       component of the picked payee must appear in the transcript.
+    """
+    picked = next((p for p in directory.payees() if p.id == pick.answer), None)
+    if picked is None:
+        return [
+            f"The payee that was picked ({pick.answer!r}) is not in the "
+            f"directory."
+        ]
+
+    reasons: list[str] = []
+    drafted = draft.payee
+    if drafted is None or (
+        drafted.id, drafted.display_name, drafted.masked_account
+    ) != (picked.id, picked.display_name, picked.masked_account):
+        named = drafted.display_name if drafted is not None else "no payee"
+        reasons.append(
+            f"The payee in the draft ({named}) is not the payee that was "
+            f"picked ({picked.display_name})."
+        )
+
+    usable = mention is not None and mention.strip().lower() != pick.answer.strip().lower()
+    if usable:
+        if picked.id not in {m.id for m in matches}:
+            reasons.append(
+                f"The payee that was picked ({picked.display_name}) does "
+                f"not match who was said ({mention})."
+            )
+    elif not _transcript_names(picked, transcript):
+        reasons.append(
+            f"The transcript does not name the payee that was picked "
+            f"({picked.display_name})."
+        )
+    return reasons
+
+
 # ── Comparison logic ─────────────────────────────────────────────────
 
 
@@ -175,11 +259,15 @@ def _compare(
     extraction: _ExtractionResult,
     directory: PayeeDirectory,
     user_texts: tuple[str, ...] = (),
+    clarification: Optional[ClarificationRecord] = None,
 ) -> tuple[list[str], str, bool]:
     """Compare the model's extraction with the draft.
 
-    *user_texts* are the sanitised transcript and (if any) the
+    *user_texts* are the sanitised transcript (first) and, if any, the
     clarification answer; the currency rule is applied to them.
+    *clarification* is the record for a clarified draft; for a payee
+    pick it is what the draft's payee is checked against (see
+    :func:`_check_payee_pick`).
 
     Returns ``(discrepancies, reason, should_freeze)``.
 
@@ -253,13 +341,29 @@ def _compare(
 
     # ── payee (skip if payee is unresolved) ─────────────────────
     if "payee" not in draft.unresolved:
-        if intent.payee_mention is not None:
+        pick = _payee_pick(clarification)
+        said = "\n".join(user_texts)
+        matches = (
             # Same rule as the parser: name AND account digits.  The
             # clue may sit after the mention in the user's own text.
-            matches = match_payees(
-                intent.payee_mention, directory, context="\n".join(user_texts),
+            match_payees(intent.payee_mention, directory, context=said)
+            if intent.payee_mention is not None
+            else []
+        )
+        match_ids = {m.id for m in matches}
+
+        if pick is not None:
+            # The user picked a candidate in the UI: check the draft
+            # against THAT payee's directory record as well as the
+            # transcript.
+            problems = _check_payee_pick(
+                draft, pick, intent.payee_mention, matches, directory,
+                user_texts[0] if user_texts else "",
             )
-            match_ids = {m.id for m in matches}
+            if problems:
+                discrepancies.append("payee")
+                reasons.extend(problems)
+        elif intent.payee_mention is not None:
             if draft.payee is not None and draft.payee.id not in match_ids:
                 discrepancies.append("payee")
                 payee_name = (
@@ -268,6 +372,18 @@ def _compare(
                 reasons.append(
                     f"The payee in the draft ({payee_name}) does not "
                     f"match who was said ({intent.payee_mention})."
+                )
+            elif draft.payee is not None and len(match_ids) > 1:
+                # The transcript fits several payees, so only a pick can
+                # say which one the user meant.  A resolved draft with no
+                # pick on record has no evidence of that choice: refuse
+                # it rather than pass because the name happens to fit.
+                discrepancies.append("payee")
+                reasons.append(
+                    f"The transcript names more than one payee "
+                    f"({intent.payee_mention!r} fits {len(match_ids)}) and "
+                    f"no payee pick was recorded for the draft's payee "
+                    f"({draft.payee.display_name})."
                 )
         elif draft.payee is not None:
             # The draft has a payee but the model found none.
@@ -423,7 +539,7 @@ class LlmValidator:
             (clean_answer,) if clean_answer is not None else ()
         )
         discrepancies, reason, should_freeze = _compare(
-            draft, extraction, self._directory, user_texts
+            draft, extraction, self._directory, user_texts, clarification
         )
 
         if should_freeze:
