@@ -7,6 +7,10 @@ Every rejection is HTTP 422 with the same three fields::
 
 ``reason_code`` is machine-readable and is the only field the client should
 branch on. ``message`` is for the developer log, not for the end user.
+
+A 500 uses the same three fields with ``result: "error"`` — see
+:func:`error_response`. §5 fixes the shape of *every* error response, so ours
+carry a reason code too (``internal_error``) instead of a bare ``detail``.
 """
 
 from __future__ import annotations
@@ -48,3 +52,24 @@ def rejection_response(reason_code: str, message: str = "") -> dict:
     rejection — so the HTTP layer only has to pick the status code.
     """
     return rejected(reason_code, message).to_response()
+
+
+def error_response(message: str, *, bug: str) -> dict:
+    """The wire shape for a 500 (CONTRACT.md §5).
+
+    Same three fields as a rejection — ``result``, ``reason_code``,
+    ``message`` — because §5 fixes the shape of every error response and
+    does not exempt the 500s. ``result`` is ``"error"`` rather than
+    ``"rejected"``: a 500 means *we* could not answer, not that the request
+    was judged and refused, and a client that branched on "rejected" would
+    otherwise show the user an error that is not theirs.
+
+    ``bug`` is ours, not part of the contract: which of our own failures it
+    was, for whoever reads the log.
+    """
+    return {
+        "result": "error",
+        "reason_code": reason_codes.INTERNAL_ERROR,
+        "message": message,
+        "bug": bug,
+    }

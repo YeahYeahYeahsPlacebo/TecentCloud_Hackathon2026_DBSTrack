@@ -7,11 +7,12 @@ know, and it is thin on purpose — it translates, it does not decide:
 
 - a dict with ``{"result": "rejected", ...}`` becomes **422** with that body
 - anything else becomes **200** with that body
-- :class:`ParserContractViolation`, :class:`ServerNotConfigured` and
-  :class:`ValidatorUnusable` become **500** — they mean *we* are broken or
-  misconfigured, not that the user's request was refused. There is no reason
-  code for "our server is not wired up", and inventing one would put our bug
-  in the user's face as their error.
+- anything that raises becomes **500**, carrying the same three fields as a
+  rejection (CONTRACT.md §5): ``result``, ``reason_code``, ``message`` — with
+  ``result`` ``"error"`` rather than ``"rejected"``, because a 500 means *we*
+  could not answer, not that the request was judged. There is no reason code
+  naming "our server is not wired up"; ``internal_error`` says it is ours and
+  ``message`` says which one.
 
 Run it::
 
@@ -39,6 +40,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.audit import AuditLog
 from backend.bank import seed_bank
 from backend.gateway.api import GatewayAPI
+from backend.gateway.errors import error_response
 from backend.gateway.message import (
     ParserContractViolation,
     ServerNotConfigured,
@@ -61,6 +63,46 @@ def _flag(name: str, default: bool = False) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _chat_client() -> Optional[Any]:
+    """The chat client the question form of ``/api/clarify`` needs.
+
+    ``resolve_question`` calls a model to pull one field out of a free-text
+    answer, so the free-text form cannot work without a client. Passing none
+    is what made it a 500; this is what the 500 was asking for.
+
+    Keyed off the parser's ADP application: the answer-extraction prompt is
+    parser-side work, not validator work. With no ADP keys configured there is
+    no client to pass, and the endpoint stays a loud 500 rather than
+    inventing an answer — ``DCTA_FAKE_CLIENT=1`` opts into the scripted fake
+    for local wiring checks, and says so in ``/api/health``.
+    """
+    if _flag("DCTA_NO_CLIENT"):
+        return None
+
+    if _flag("DCTA_FAKE_CLIENT"):
+        # Explicit opt-in, before any key is looked at: "I have no model, give
+        # me the scripted one so I can exercise the wiring".
+        from backend.llm.fake_client import FakeChatClient
+
+        return FakeChatClient()
+
+    try:
+        from backend.llm.adp_client import AdpChatClient
+        from backend.llm.config import load_llm_settings
+
+        settings = load_llm_settings(env_path=str(_project_root() / ".env"))
+    except RuntimeError:
+        # Missing ADP_* / PARSER_* / VALIDATOR_* variable. No keys, no model,
+        # no answer: fail closed instead of guessing.
+        return None
+
+    return AdpChatClient(
+        app_key=settings.parser_app_key,
+        endpoint=settings.adp_endpoint,
+        timeout_seconds=settings.adp_timeout_seconds,
+    )
+
+
 def build_api() -> GatewayAPI:
     """Wire the real pieces together. The only place that does so.
 
@@ -74,6 +116,8 @@ def build_api() -> GatewayAPI:
         DCTA_AUDIT_PATH           append-only audit file (default: memory)
         DCTA_LEDGER_PATH          ledger file (default: memory)
         DCTA_NO_BANK=1            run with no money moving at all
+        DCTA_NO_CLIENT=1          no chat client (free-text clarify 500s)
+        DCTA_FAKE_CLIENT=1        scripted client, for local wiring only
     """
     audit_path = os.environ.get("DCTA_AUDIT_PATH", "").strip()
     ledger_path = os.environ.get("DCTA_LEDGER_PATH", "").strip()
@@ -83,6 +127,7 @@ def build_api() -> GatewayAPI:
     return GatewayAPI(
         parser=get_parser(),
         directory=FixtureDirectory(),
+        client=_chat_client(),
         audit=AuditLog(path=audit_path or None),
         ledger=FileLedger(ledger_path) if ledger_path else InMemoryLedger(),
         bank=bank,
@@ -137,6 +182,7 @@ def create_app(api: Optional[GatewayAPI] = None, *, serve_frontend: bool = True)
             if getattr(gateway.messages, "parser", None) is not None
             else None,
             "validator": type(gateway.validator).__name__,
+            "client": type(gateway.client).__name__ if gateway.client is not None else None,
             "bank": "none" if gateway.bank is None else f"{len(gateway.bank.accounts())} accounts",
             "drafts": len(gateway.store),
             "credentials": len(gateway.credentials),
@@ -146,15 +192,27 @@ def create_app(api: Optional[GatewayAPI] = None, *, serve_frontend: bool = True)
 
     @app.exception_handler(ParserContractViolation)
     async def _contract_violation(request: Request, exc: ParserContractViolation) -> JSONResponse:
-        return JSONResponse(status_code=500, content={"detail": str(exc), "bug": "parser"})
+        return JSONResponse(status_code=500, content=error_response(str(exc), bug="parser"))
 
     @app.exception_handler(ServerNotConfigured)
     async def _not_configured(request: Request, exc: ServerNotConfigured) -> JSONResponse:
-        return JSONResponse(status_code=500, content={"detail": str(exc), "bug": "wiring"})
+        return JSONResponse(status_code=500, content=error_response(str(exc), bug="wiring"))
 
     @app.exception_handler(ValidatorUnusable)
     async def _validator_unusable(request: Request, exc: ValidatorUnusable) -> JSONResponse:
-        return JSONResponse(status_code=500, content={"detail": str(exc), "bug": "validator"})
+        return JSONResponse(status_code=500, content=error_response(str(exc), bug="validator"))
+
+    @app.exception_handler(Exception)
+    async def _unexpected(request: Request, exc: Exception) -> JSONResponse:
+        """Anything we did not anticipate is still our error, so it still
+        carries the contract's three fields rather than a bare traceback.
+
+        The type is in ``message`` — hiding it would make the one case nobody
+        predicted the hardest one to debug."""
+        return JSONResponse(
+            status_code=500,
+            content=error_response(f"{type(exc).__name__}: {exc}", bug="unhandled"),
+        )
 
     # ── Frontend, same origin, last so it cannot shadow the API ───────
 
