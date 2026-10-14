@@ -441,22 +441,153 @@
 
   // Build the draft card HTML as a string, then set it into a
   // target element (either displayEl or a per-item placeholder).
+
+  // ── Draft state classification ──────────────────────────────
+  //
+  // A single helper computes both the badge and the blocking flags
+  // so they can never disagree.  The neutral "Draft received" badge
+  // is shown ONLY when all three conditions are met:
+  //
+  //   1. unresolved is empty
+  //   2. validator.verdict === "pass"   (exactly — not just "not freeze")
+  //   3. policy.decision === "allow"   (exactly — not just "not hold")
+  //
+  // "freeze", a missing validator, or any unknown verdict is treated
+  // as blocked.  A missing or unknown policy decision is treated as
+  // not-allow.  This means policy "allow" alone never produces the
+  // neutral badge — the validator must also be exactly "pass".
+
+  function classifyDraft(validator, policy, hasUnresolved) {
+    var vVerdict  = (validator && validator.verdict) ? validator.verdict : null;
+    var vReason  = (validator && validator.reason)  ? validator.reason  : null;
+    var pDecision = (policy && policy.decision) ? policy.decision : null;
+    var pReason   = (policy && policy.reason)   ? policy.reason   : null;
+
+    var validatorPassed  = vVerdict === "pass";
+    var validatorFrozen  = vVerdict === "freeze";
+    var validatorMissing = !vVerdict;
+    var validatorUnknown = vVerdict && !validatorPassed && !validatorFrozen;
+
+    var policyAllow   = pDecision === "allow";
+    var policyMissing = !pDecision;
+
+    var blocked = hasUnresolved ||
+                  validatorFrozen ||
+                  validatorMissing ||
+                  validatorUnknown ||
+                  !policyAllow; // covers policyHeld, policyMissing, unknown
+
+    return {
+      vVerdict: vVerdict,
+      vReason: vReason,
+      pDecision: pDecision,
+      pReason: pReason,
+      validatorPassed: validatorPassed,
+      validatorFrozen: validatorFrozen,
+      validatorMissing: validatorMissing,
+      validatorUnknown: validatorUnknown,
+      policyAllow: policyAllow,
+      policyMissing: policyMissing,
+      blocked: blocked
+    };
+  }
+
+  // Customer-facing badge text.  We use plain language instead of
+  // raw verdict strings where possible; the exact technical reason
+  // is always shown in the details row and notice below the card.
+  function draftBadgeHtml(st) {
+    if (st.validatorFrozen) {
+      return '<span class="badge badge-danger">Validation blocked</span>';
+    }
+    if (st.validatorMissing) {
+      return '<span class="badge badge-danger">Validation unavailable</span>';
+    }
+    if (st.validatorUnknown) {
+      return '<span class="badge badge-danger">Validation unclear</span>';
+    }
+    if (st.hasUnresolved) {
+      return '<span class="badge badge-warn">Needs clarification</span>';
+    }
+    if (st.policyMissing) {
+      return '<span class="badge badge-danger">Policy unavailable</span>';
+    }
+    if (!st.policyAllow) {
+      return '<span class="badge badge-warn">Policy hold</span>';
+    }
+    // Only reached when: unresolved empty, validator "pass", policy "allow".
+    return '<span class="badge badge-preview">Draft received</span>';
+  }
+
+  // Customer-facing notice text shown below the card body, explaining
+  // why the draft is blocked.  Each blocking reason gets its own
+  // paragraph so the customer sees a clear explanation.
+  function draftBlockNoticeHtml(st) {
+    var html = "";
+
+    if (st.hasUnresolved) {
+      html += '<div class="policy-hold">' +
+              'This draft has unresolved fields. It cannot be signed or ' +
+              'executed until the server resolves them.' +
+              '</div>';
+    }
+
+    if (st.validatorFrozen) {
+      html += '<div class="policy-hold">' +
+              'Validation blocked: the validator returned a verdict of ' +
+              '"freeze". The draft is not approved for signing or execution.' +
+              (st.vReason ? ' Reason: ' + escapeHtml(st.vReason) + '.' : '') +
+              '</div>';
+    }
+
+    if (st.validatorMissing) {
+      html += '<div class="policy-hold">' +
+              'Validation unavailable: no validator verdict was returned ' +
+              'with this draft. The draft is not approved for signing or ' +
+              'execution.' +
+              '</div>';
+    }
+
+    if (st.validatorUnknown) {
+      html += '<div class="policy-hold">' +
+              'Validation unclear: the validator returned an unrecognized ' +
+              'verdict ("' + escapeHtml(st.vVerdict) + '"). The draft is ' +
+              'not approved for signing or execution.' +
+              '</div>';
+    }
+
+    if (st.policyMissing && !st.validatorFrozen && !st.validatorMissing &&
+        !st.validatorUnknown) {
+      html += '<div class="policy-hold">' +
+              'Policy unavailable: no policy decision was returned with ' +
+              'this draft. The draft is not approved for signing or ' +
+              'execution.' +
+              '</div>';
+    }
+
+    if (!st.policyAllow && !st.policyMissing &&
+        !st.validatorFrozen && !st.validatorMissing &&
+        !st.validatorUnknown) {
+      html += '<div class="policy-hold">' +
+              'Policy decision is "' + escapeHtml(st.pDecision) +
+              '". This draft is not approved and cannot be signed or ' +
+              'executed until the policy engine returns "allow".' +
+              '</div>';
+    }
+
+    return html;
+  }
+
   function renderServerDraftInto(draft, hash, validator, policy, el) {
     var hasUnresolved = draft.unresolved && draft.unresolved.length > 0;
-    var policyHeld = policy && policy.decision !== "allow";
-    var validatorFrozen = validator && validator.verdict === "frozen";
-    var blocked = hasUnresolved || policyHeld || validatorFrozen;
+    var st = classifyDraft(validator, policy, hasUnresolved);
+    st.hasUnresolved = hasUnresolved;
 
     var html = '<div class="card">';
 
     // Header
     html += '<div class="card-header">';
     html +=   '<span class="intent">' + escapeHtml(draft.intent_type) + "</span>";
-    if (blocked) {
-      html += '<span class="badge badge-warn">Not ready</span>';
-    } else {
-      html += '<span class="badge badge-preview">Draft received</span>';
-    }
+    html += draftBadgeHtml(st);
     html += "</div>";
 
     // Validator + policy status (prominent, from server)
@@ -497,33 +628,8 @@
     // Transcript
     html += '<div class="transcript">\u201c' + escapeHtml(draft.transcript) + '\u201d</div>';
 
-    // Unresolved notice
-    if (hasUnresolved) {
-      html += '<div class="policy-hold">' +
-              'This draft has unresolved fields: ' +
-              escapeHtml(draft.unresolved.join(", ")) +
-              '. It cannot be signed or executed until the server ' +
-              'resolves them.' +
-              '</div>';
-    }
-
-    // Validator frozen notice
-    if (validatorFrozen) {
-      html += '<div class="policy-hold">' +
-              'The validator returned a verdict of "frozen" — the ' +
-              'transcript does not match the draft. This draft cannot ' +
-              'be signed or executed.' +
-              '</div>';
-    }
-
-    // Policy hold notice
-    if (policyHeld && !validatorFrozen) {
-      html += '<div class="policy-hold">' +
-              'Policy decision is "' + escapeHtml(policy.decision) +
-              '". This draft is not approved and cannot be signed or ' +
-              'executed until the policy engine returns "allow".' +
-              '</div>';
-    }
+    // Block notices (unresolved, validator, policy)
+    html += draftBlockNoticeHtml(st);
 
     // Technical details
     html += technicalDetailsHtml(draft, hash);
