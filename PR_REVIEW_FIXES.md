@@ -22,7 +22,7 @@ it fail). 856 pass, 0 fail.
 | 9 | Stale type hint at `message.py:151` | `message.py` | `Optional[Callable[[Mapping, str], Mapping]]` → `Optional[Any]`, with a note that `validate()` is the interface and `__call__` is deliberately refused. |
 | 10 | Out-of-date comment at `reason_codes.py:31-35` | `reason_codes.py` | It said the two `/api/message` codes were "NOT yet in the §5 table". They have been since §8 q4 was decided. |
 
-## Needs your sign-off (CONTRACT.md)
+## Needs your sign-off (CONTRACT.md) — both approved
 
 1. **§5, new row + a note:** 500s now carry `result`/`reason_code`/`message`
    like everything else, with one new code `internal_error`. The note explains
@@ -33,8 +33,9 @@ it fail). 856 pass, 0 fail.
    `validator` / `unhandled`) stays a non-contract extra for the log.
 2. **§4 `POST /api/webauthn/challenge`, one blockquote:** it now also refuses
    `validator_frozen` (including "no verdict recorded") and `policy_blocked`.
-   §4 only names unknown/unresolved/expired for this endpoint, so it is marked
-   as added-by-Member-3-needs-sign-off rather than slipped in silently.
+   Worded as Member 1 asked — *"refuses anything other than a recorded pass,
+   including no verdict"* — and stated as **the same condition as check 11**
+   rather than a list of cases, so the two gates cannot drift apart.
 
 ## Deliberately not done
 
@@ -42,17 +43,27 @@ it fail). 856 pass, 0 fail.
   there, so the single-use rule (item 5) and the type guard (item 7) live in
   the dispatcher: `clarify()` → `_clarify_once()` → `_clarify_payee()`. No edit
   to the function body, so your PR cannot collide with mine.
-- **The payee form's audit row does not carry `transcript`** (item 8 is about
-  the question form). Adding it means editing `_clarify_payee` — yours now.
-  The row still has `from_draft_id`/`to_draft_id`, so nothing is lost; there is
-  a test pinning that the row I did not touch is still written.
 - SQLite, `idempotency_key` scope, the validator's `warn` verdict: unchanged,
   still open from the earlier audit.
+
+## Follow-ups, after Member 1's review (second commit)
+
+- **payee-102 is "John Lee".** The directory is the source of truth, so
+  `backend/bank/bank.py` is aligned: payee-102 is now John Lee, and the comment
+  says why the ambiguity is "which John", not "one person with two accounts".
+  A new test asserts the seed names match `FixtureDirectory`, so the next time
+  either side moves, the suite says so instead of the receipt silently naming a
+  different person than the candidate the user picked.
+  `fixtures/drafts/ambiguous_payee.json` still says John Smith — shared file,
+  Member 1 is raising that one with Member 2.
+- **The payee form's audit row now carries `transcript` too** (item 8, both
+  forms). It is one added line inside `_clarify_payee`, as agreed.
+- `internal_error` approved as a single code; no change needed.
 
 ## Verification
 
 ```
-856 passed in 11.05s          # on origin/main, whole suite
+857 passed in 10.06s          # on origin/main, whole suite
 ```
 
 Each fix was then broken on purpose and the suite re-run — every one fails when
@@ -71,10 +82,16 @@ its fix is removed, so none of these tests can pass vacuously:
 7 execute type check         -> 1 failed
 8 audit transcript           -> 1 failed
 2 empty hash trusted         -> 2 failed
+
+bank name drifts back        -> 1 failed
+bank: two Johns collapse     -> 2 failed
+payee audit transcript       -> 1 failed
 ```
 
 ## Merge order
 
 No conflicts expected with `feature/frontend-shell` — this branch touches no
-frontend file. Merge before your `_clarify_payee` change or after; both work,
-because I did not touch the function.
+frontend file. It is already based on `main` including PR #17 (the
+`_clarify_payee` change), so that one is settled. If main moves again before
+this merges, rebase rather than merge — the only shared file touched here is
+`CONTRACT.md`, and both edits are in distinct paragraphs.

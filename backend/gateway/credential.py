@@ -98,19 +98,15 @@ class CredentialService:
         dumped = dump(draft)
         digest = draft_hash(dumped)
 
-        # Do not issue a challenge for a draft the server already knows it will
-        # refuse. A challenge is the server saying "I am willing to let you
-        # sign this"; issuing one for a draft that check 11 or 12 will reject
-        # only spends the user's biometric on something that cannot succeed.
+        # Refuse anything other than a recorded pass — including *no* verdict.
+        # This is deliberately the same condition as check 11, not a similar
+        # one: if check 11 would refuse at execute, this endpoint refuses at
+        # challenge, and the two must not be able to drift apart. (Agreed
+        # with Member 1; CONTRACT.md §4 words it the same way.)
         #
-        # That includes a draft with *no* recorded verdict. Nothing recorded
-        # means the server never ran the validator over this copy, and check
-        # 11 fails closed on exactly that — so the missing case has to be
-        # refused here too, or the challenge is a promise /api/execute will
-        # break. Both gates are the same argument as each other. Neither is
-        # listed in CONTRACT.md §4 for this endpoint, which only names
-        # unknown/unresolved/expired — this is added deliberately, and is the
-        # kind of thing to flag in review.
+        # A challenge is the server saying "I am willing to let you sign
+        # this". Issuing one for a draft check 11 or 12 will refuse only
+        # spends the user's biometric on something that cannot succeed.
         verdict = self.verdicts.get(digest)
         if verdict != "pass":
             message = (
