@@ -7,9 +7,10 @@ draft's ``nonce`` is what makes it unpredictable, which is why a draft must
 carry a fresh nonce and why a clarification mints a new one.
 
 The server refuses to issue a challenge for a draft it did not store, that has
-unresolved fields, or that has expired — there is nothing to sign in those
-cases, and handing out a challenge would only teach a client that the draft is
-worth attacking.
+unresolved fields, that has expired, or that the validator has not passed —
+there is nothing worth signing in those cases, and handing out a challenge
+would only spend the user's biometric on something ``/api/execute`` is going
+to refuse.
 
 **Attestation is not verified.** Registration accepts an already-extracted
 public key. Verifying the authenticator's attestation statement against a
@@ -67,10 +68,16 @@ class CredentialService:
         if not isinstance(request, Mapping) or "draft_id" not in request:
             return rejection_response(R.MALFORMED_REQUEST, "'draft_id' is required")
 
-        stored = self.store.get(request["draft_id"])
+        draft_id = request["draft_id"]
+        if not isinstance(draft_id, str):
+            # Unhashable otherwise: the lookup would raise and a malformed
+            # body would come back as a 500.
+            return rejection_response(R.MALFORMED_REQUEST, "'draft_id' must be a string")
+
+        stored = self.store.get(draft_id)
         if stored is None:
             return rejection_response(
-                R.UNKNOWN_DRAFT, f"no stored draft with id {request['draft_id']!r}"
+                R.UNKNOWN_DRAFT, f"no stored draft with id {draft_id!r}"
             )
 
         draft = (
@@ -96,16 +103,23 @@ class CredentialService:
         # sign this"; issuing one for a draft that check 11 or 12 will reject
         # only spends the user's biometric on something that cannot succeed.
         #
-        # Both gates are the same argument as each other. Neither is listed in
-        # CONTRACT.md §4 for this endpoint, which only names
+        # That includes a draft with *no* recorded verdict. Nothing recorded
+        # means the server never ran the validator over this copy, and check
+        # 11 fails closed on exactly that — so the missing case has to be
+        # refused here too, or the challenge is a promise /api/execute will
+        # break. Both gates are the same argument as each other. Neither is
+        # listed in CONTRACT.md §4 for this endpoint, which only names
         # unknown/unresolved/expired — this is added deliberately, and is the
         # kind of thing to flag in review.
         verdict = self.verdicts.get(digest)
-        if verdict is not None and verdict != "pass":
-            return rejection_response(
-                R.VALIDATOR_FROZEN,
-                f"validator verdict for this draft is {verdict!r}, not 'pass'",
+        if verdict != "pass":
+            message = (
+                "no validator verdict is recorded for this draft; the server "
+                "never checked this copy, so there is nothing to sign"
+                if verdict is None
+                else f"validator verdict for this draft is {verdict!r}, not 'pass'"
             )
+            return rejection_response(R.VALIDATOR_FROZEN, message)
 
         if self.policy is not None:
             decision = self.policy(dumped, digest)

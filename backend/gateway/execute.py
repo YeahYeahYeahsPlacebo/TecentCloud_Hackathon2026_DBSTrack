@@ -175,6 +175,12 @@ def _check_request_shape(gw: "ExecuteGateway", ctx: ExecuteContext) -> Optional[
     missing = sorted(REQUIRED_REQUEST_FIELDS - set(ctx.request))
     if missing:
         return rejected(R.MALFORMED_REQUEST, f"missing field(s): {missing}")
+    # All three are looked up as keys. A dict or list is unhashable, so
+    # without this the lookup raises and a malformed body comes back as a
+    # 500 instead of the malformed_request §4 gives it.
+    for field in sorted(REQUIRED_REQUEST_FIELDS):
+        if not isinstance(ctx.request[field], str):
+            return rejected(R.MALFORMED_REQUEST, f"{field!r} must be a string")
     return None
 
 

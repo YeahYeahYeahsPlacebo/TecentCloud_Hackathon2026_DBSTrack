@@ -148,7 +148,12 @@ class MessageService:
         *,
         parser: Callable[[str], Any],
         store: MutableMapping[str, Any],
-        validator: Optional[Callable[[Mapping[str, Any], str], Mapping[str, Any]]] = None,
+        # Not ``Callable[[...], ...]``: the validator is an object exposing
+        # ``validate()``, and its ``__call__`` is deliberately disabled, so
+        # typing it as a callable described a shape that is now refused.
+        # ``Any`` is honest — see :func:`require_validator` for the interface
+        # that is actually checked.
+        validator: Optional[Any] = None,
         policy: Optional[PolicyEngine] = None,
         audit: Optional[Any] = None,
         clock: Optional[Callable[[], datetime]] = None,
@@ -178,8 +183,14 @@ class MessageService:
         self.client = client
         # Server-only, keyed by question_id. A PendingQuestion carries the
         # original transcript and the partial draft — it is never serialised
-        # into any response. Consumed once: answering deletes it.
+        # into any response. Consumed once: answering deletes it, and letting
+        # it expire deletes it too (see _prune_pending).
         self.pending: dict[str, Any] = {}
+        # Server-only: draft id -> the id of the draft its payee was resolved
+        # into. A clarification is single-use in both directions — the
+        # ambiguous draft stays stored (and stays unresolved, so it can never
+        # be executed), but it cannot be picked a second time.
+        self.clarified: dict[str, str] = {}
 
     # ── What the policy engine is allowed to see ──────────────────────
 
@@ -281,7 +292,21 @@ class MessageService:
         rather than recording a pass we cannot attribute.
         """
         bound = payload.get("draft_hash")
-        if bound and bound != digest:
+        if not isinstance(bound, str) or not bound:
+            # An empty or missing hash binds to nothing. Accepting it here
+            # would mean recording a verdict — possibly a "pass" — that no
+            # one can attribute to a draft, which is exactly what check 11
+            # exists to prevent. A verdict that cannot name its draft has not
+            # been proven to be about this one.
+            return {
+                **dict(payload),
+                "verdict": "freeze",
+                "reason": (
+                    "verdict carries no draft_hash, so it cannot be bound to "
+                    f"the stored draft {digest}"
+                ),
+            }
+        if bound != digest:
             return {
                 **dict(payload),
                 "verdict": "freeze",
@@ -362,13 +387,92 @@ class MessageService:
         Both may raise ``InvalidClarificationAnswer``, which is a 422 with
         ``invalid_clarification_answer`` — not a 500. Neither modifies the
         stored draft: each returns a new one.
+
+        Both are single-use, and the checks that make them so live here in the
+        dispatcher rather than inside either form: the rule is about server
+        state, and keeping it in one place means it holds whichever way the
+        forms below are written.
         """
         if not isinstance(request, Mapping):
             return rejection_response(R.MALFORMED_REQUEST, "request body must be a JSON object")
 
+        # A question that has expired is gone before either form looks for it,
+        # so a late answer cannot resurrect it.
+        self._prune_pending()
+
         if "question_id" in request:
             return self._clarify_question(request)
-        return self._clarify_payee(request)
+        return self._clarify_once(request)
+
+    def _prune_pending(self) -> None:
+        """Forget pending questions whose window has closed.
+
+        A ``PendingQuestion`` expires with the draft it was derived from
+        (CONTRACT.md §4, second form). Without this the map only ever grows,
+        and a question the server would itself refuse as expired stays live
+        long enough to be replayed.
+        """
+        now = self.clock()
+        for question_id, pending_state in list(self.pending.items()):
+            expires_at = getattr(pending_state, "expires_at", None)
+            if expires_at is not None and now >= expires_at:
+                self.pending.pop(question_id, None)
+
+    @staticmethod
+    def _require_strings(request: Mapping[str, Any], *fields: str) -> Optional[dict]:
+        """Reject any of *fields* that was supplied but is not a string.
+
+        A dict or a list is unhashable, so using one as a ``draft_id`` or
+        ``question_id`` raises inside the store lookup and turns a malformed
+        body into a 500. The contract already has a code for this shape of
+        mistake: ``malformed_request``.
+        """
+        for field in fields:
+            if field in request and not isinstance(request[field], str):
+                return rejection_response(R.MALFORMED_REQUEST, f"{field!r} must be a string")
+        return None
+
+    def _clarify_once(self, request: Mapping[str, Any]) -> dict:
+        """The payee form, at most once per draft (CONTRACT.md §4).
+
+        Picking a candidate twice would produce two drafts from one
+        ambiguity, so the ambiguous draft is marked once its payee is
+        resolved. It stays stored and stays unresolved — that is what makes
+        it unexecutable — but it cannot be picked again.
+
+        A refused answer does not consume anything: the user has to be able
+        to answer again with a candidate that was actually offered.
+        """
+        if "draft_id" not in request:
+            # Not supplied at all: the form below names the missing field,
+            # which is a better message than anything this check could give.
+            return self._clarify_payee(request)
+
+        shaped = self._require_strings(request, "draft_id")
+        if shaped is not None:
+            return shaped
+        draft_id = request["draft_id"]
+
+        if draft_id in self.clarified:
+            replacement = self.clarified[draft_id]
+            return rejection_response(
+                R.INVALID_CLARIFICATION_ANSWER,
+                f"draft {draft_id!r} has already been clarified"
+                + (
+                    f" into draft {replacement!r}; clarify that one"
+                    if replacement
+                    else " and cannot be clarified twice"
+                ),
+            )
+
+        result = self._clarify_payee(request)
+        if result.get("result") != "rejected":
+            items = result.get("items") or []
+            resolved_id = ""
+            if items and isinstance(items[0], Mapping):
+                resolved_id = str((items[0].get("draft") or {}).get("id", ""))
+            self.clarified[draft_id] = resolved_id
+        return result
 
     # ── Form 1: answering a clarifying question ────────────────────────
 
@@ -376,6 +480,10 @@ class MessageService:
         missing = [f for f in ("question_id", "answer") if f not in request]
         if missing:
             return rejection_response(R.MALFORMED_REQUEST, f"missing field(s): {missing}")
+
+        shaped = self._require_strings(request, "question_id", "answer")
+        if shaped is not None:
+            return shaped
 
         question_id = request["question_id"]
         pending_state = self.pending.get(question_id)
@@ -418,6 +526,11 @@ class MessageService:
                 "question_id": record.question_id,
                 "field": record.field,
                 "answer": record.answer,
+                # CONTRACT.md §4, second form: the server stores the original
+                # transcript and the answer separately and records both in
+                # the audit log. Without this the log holds an answer with
+                # nothing it was an answer to.
+                "transcript": record.original_transcript,
             },
         )
 
