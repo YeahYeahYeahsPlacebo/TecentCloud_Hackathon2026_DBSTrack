@@ -189,6 +189,21 @@ class PayeeClue:
         return self.digits[-4:] if self.digits else None
 
 
+def account_clue_start(text: str) -> int | None:
+    """Index of the first account keyword or masked form in *text*, or None.
+
+    Everything from there on is an account clue ("account ending 8892"),
+    not an amount; the amount reader ignores it.
+    """
+    starts = [
+        m.start()
+        for rx in (_CLUE_KEYWORD_RE, _CLUE_MASK_RE)
+        for m in [rx.search(text)]
+        if m
+    ]
+    return min(starts) if starts else None
+
+
 def parse_payee_clue(text: str) -> PayeeClue:
     """Split *text* into a payee name and an account clue."""
     starts = []

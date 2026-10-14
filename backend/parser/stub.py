@@ -12,22 +12,34 @@ message asking the user to send one request at a time.  It must never
 return one item for a multi-intent sentence, because that would silently
 drop an intent (violating the ``len(items) == intents_detected`` rule).
 
+Speech-style input is handled the same way the LLM parser handles it
+(see :mod:`backend.parser.speech_norm`): fillers are removed for matching,
+spoken amounts ("a grand", "fifteen") are read by code, a missing "to" is
+tolerated, and the draft's ``transcript`` is always the exact submitted
+text.  Payees are matched through the directory, never by substring.
+
 Patterns handled:
 
-* "Send fifty dollars to John Smith."
-    → clean transfer draft (matches fixtures/drafts/clean_transfer.json)
+* "Send fifty dollars to John Smith."  (or "send fifty dollars john smith",
+  "uh send a grand to jane lah", "SEND FIFTY DOLLARS TO JANE")
+    -> clean transfer draft to the one directory payee the words resolve to
 * "Send fifty dollars to John."
-    → ambiguous payee draft (matches fixtures/drafts/ambiguous_payee.json)
+    -> ambiguous payee draft (matches fixtures/drafts/ambiguous_payee.json
+       in shape).  The stub always offers the two demo Johns, payee-101 and
+       payee-102, which tests/test_frontend_compat.py relies on.
+* A recipient that matches no payee ("mum", "my wife", "Bob")
+    -> ClarifyingQuestion for "payee" (never a guessed draft)
 * Anything mentioning shares/stock/buy
-    → equity purchase draft (matches fixtures/drafts/equity_purchase.json shape)
-* Amount the stub cannot parse with confidence
-    → ClarifyingQuestion for "amount" (never a draft with a guessed value)
+    -> equity purchase draft (matches fixtures/drafts/equity_purchase.json shape)
+* An amount that is missing, vague ("some", "a few hundred"), negative,
+  over-precise or ambiguous
+    -> ClarifyingQuestion for "amount" (never a draft with a guessed value)
 * Multi-intent sentence (more than one action verb, more than one
   amount mention, or a sequencing/addition connector such as
   " then ", " and then ", " also ", " plus ")
-    → raise ParserCannotHandle (multi-intent not supported)
+    -> raise ParserCannotHandle (multi-intent not supported)
 * Anything else
-    → raise ParserCannotHandle
+    -> raise ParserCannotHandle
 
 All drafts returned are valid against contract/draft.schema.json and
 backend/models/draft.py.
@@ -45,7 +57,20 @@ from backend.models.draft import (
     PayeeCandidate,
     TransactionDraft,
 )
-from backend.parser.directory import FixtureDirectory
+from backend.llm.text import sanitise
+from backend.parser.amount_rules import (
+    has_excess_decimals,
+    is_negative_amount,
+    resolve_currency,
+)
+from backend.parser.directory import FixtureDirectory, match_payees
+from backend.parser.speech_norm import (
+    directory_name_words,
+    normalise,
+    payee_phrase,
+    person_reference,
+    spoken_amount,
+)
 from backend.parser.interface import (
     ClarifyingQuestion,
     ParserCannotHandle,
@@ -104,16 +129,6 @@ _DOLLAR_WORD_RE = re.compile(r"\bdollars?\b", re.IGNORECASE)
 _DOLLAR_SIGN_RE = re.compile(r"\$", re.ASCII)
 # A digit amount immediately followed by "dollar(s)": one amount, not two.
 _DIGIT_AMOUNT_DOLLARS_RE = re.compile(r"\d+\.\d{2}\s*dollars?\b", re.ASCII)
-
-# ── Known amounts ──────────────────────────────────────────────────────
-# The stub recognises a small set of word-numbers and "$XX.XX" patterns.
-_AMOUNT_WORDS = {
-    "fifty": "50.00",
-    "one thousand": "1000.00",
-}
-
-_DOLLAR_RE = re.compile(r"\$(\d+\.\d{2})", re.ASCII)
-
 
 def _count_action_verbs(lower: str) -> int:
     """Count occurrences of action verbs (whole-word matches)."""
@@ -176,23 +191,6 @@ def _is_multi_intent(transcript: str) -> bool:
     return False
 
 
-def _parse_amount(transcript: str) -> str | None:
-    """Return a decimal-string amount or ``None`` if not confident."""
-    lower = transcript.lower()
-
-    # "$50.00" style
-    m = _DOLLAR_RE.search(lower)
-    if m:
-        return m.group(1)
-
-    # "fifty dollars" style
-    for word, value in _AMOUNT_WORDS.items():
-        if word in lower and "dollar" in lower:
-            return value
-
-    return None
-
-
 def _fresh_id() -> str:
     return str(uuid.uuid4())
 
@@ -211,8 +209,17 @@ def _fresh_timestamps() -> tuple[datetime, datetime]:
     return now, now + timedelta(minutes=5)
 
 
-def _clean_transfer(transcript: str) -> TransactionDraft:
-    """Match fixtures/drafts/clean_transfer.json (field values, not id/timestamps)."""
+def _transfer(
+    transcript: str,
+    payee: object,
+    amount: str,
+    currency: str,
+    source_account: str,
+) -> TransactionDraft:
+    """A transfer to one directory payee (shape of clean_transfer.json).
+
+    The payee fields come from the directory record, never from the text.
+    """
     created, expires = _fresh_timestamps()
     return TransactionDraft(
         id=_fresh_id(),
@@ -220,15 +227,15 @@ def _clean_transfer(transcript: str) -> TransactionDraft:
         expires_at=expires,
         nonce=_fresh_nonce(),
         intent_type="transfer",
-        source_account="acct-001-2345",
-        amount=Money(value="50.00", currency="SGD"),
+        source_account=source_account,
+        amount=Money(value=amount, currency=currency),
         confidence=0.95,
         unresolved=[],
         transcript=transcript,
         payee=Payee(
-            id="payee-001",
-            display_name="John Smith",
-            masked_account="****1234",
+            id=payee.id,
+            display_name=payee.display_name,
+            masked_account=payee.masked_account,
         ),
     )
 
@@ -259,7 +266,9 @@ def _candidates_from_directory(ids: tuple[str, ...]) -> list[PayeeCandidate]:
     ]
 
 
-def _ambiguous_payee(transcript: str) -> TransactionDraft:
+def _ambiguous_payee(
+    transcript: str, amount: str = "50.00", currency: str = "SGD"
+) -> TransactionDraft:
     """The ambiguous-payee draft (shape of fixtures/drafts/ambiguous_payee.json).
 
     Only the shape matches the fixture.  The candidate names come from the
@@ -274,7 +283,7 @@ def _ambiguous_payee(transcript: str) -> TransactionDraft:
         nonce=_fresh_nonce(),
         intent_type="transfer",
         source_account="acct-001-2345",
-        amount=Money(value="50.00", currency="SGD"),
+        amount=Money(value=amount, currency=currency),
         confidence=0.4,
         unresolved=["payee"],
         transcript=transcript,
@@ -282,7 +291,9 @@ def _ambiguous_payee(transcript: str) -> TransactionDraft:
     )
 
 
-def _equity_purchase(transcript: str, amount_value: str) -> TransactionDraft:
+def _equity_purchase(
+    transcript: str, amount_value: str, currency: str = "SGD"
+) -> TransactionDraft:
     """Match fixtures/drafts/equity_purchase.json shape."""
     created, expires = _fresh_timestamps()
     return TransactionDraft(
@@ -292,7 +303,7 @@ def _equity_purchase(transcript: str, amount_value: str) -> TransactionDraft:
         nonce=_fresh_nonce(),
         intent_type="equity_purchase",
         source_account="acct-001-2345",
-        amount=Money(value=amount_value, currency="SGD"),
+        amount=Money(value=amount_value, currency=currency),
         confidence=0.92,
         unresolved=[],
         transcript=transcript,
@@ -347,6 +358,29 @@ def _question_result(
     )
 
 
+_TRANSFER_VERB_RE = re.compile(r"\b(?:send|transfer|pay|give|wire)\b")
+_MONEY_WORD_RE = re.compile(r"\b(?:money|cash|dollars?|bucks?)\b")
+
+
+def _amount_question(text: str, reading) -> str:
+    """The question to ask when the amount cannot be drafted."""
+    if is_negative_amount(text):
+        return "The amount can't be negative. How much would you like to send?"
+    if has_excess_decimals(text):
+        return (
+            "Please give the amount with at most two decimal places. "
+            "How much would you like to send?"
+        )
+    if reading.status == "vague":
+        return (
+            'I need an exact amount, for example "fifty dollars". '
+            "How much would you like to send?"
+        )
+    if reading.status == "multiple":
+        return "I heard more than one number. How much would you like to send?"
+    return "How much would you like to send?"
+
+
 def parse(transcript: str) -> ParseResult:
     """
     Parse a user transcript into a :class:`ParseResult`.
@@ -355,29 +389,53 @@ def parse(transcript: str) -> ParseResult:
     raises :class:`ParserCannotHandle` rather than silently dropping
     one of the intents.
 
+    The draft's ``transcript`` is always *transcript* exactly as
+    submitted; the normalised text is used only for matching (R1).
+
     See module docstring for the patterns handled.
     """
-    if not transcript or not transcript.strip():
+    # Sanitise, then normalise (fillers out).  ``text`` is internal only.
+    clean = sanitise(transcript or "")
+    if not clean.strip():
         raise ParserCannotHandle("empty transcript")
 
     # ── Length limit ────────────────────────────────────────────────
-    if len(transcript) > _MAX_TRANSCRIPT_LEN:
+    if len(clean) > _MAX_TRANSCRIPT_LEN:
         raise ParserCannotHandle("request too long", reason="request too long")
+
+    directory = FixtureDirectory()
+    text = normalise(clean, protected_words=directory_name_words(directory)).text
+    if not text.strip():
+        raise ParserCannotHandle("empty transcript")
 
     # ── Multi-intent guard ───────────────────────────────────────────
     # The stub handles one intent only.  If the transcript describes
     # more than one, decline so no intent is silently dropped.
-    if _is_multi_intent(transcript):
+    if _is_multi_intent(text):
         raise ParserCannotHandle(
             "Multiple intents detected in the transcript. "
             "Please send one request at a time."
         )
 
-    lower = transcript.lower().strip()
+    lower = text.lower().strip()
+    source_account = directory.default_source_account()
+
+    # R3: the amount is read by code.  Only an exact, positive,
+    # two-decimal amount in a clear currency is usable; anything else is
+    # asked about, never guessed.
+    reading = spoken_amount(text)
+    currency = resolve_currency(text)
+    amount: str | None = None
+    if (
+        reading.status == "exact"
+        and currency is not None
+        and not is_negative_amount(text)
+        and not has_excess_decimals(text)
+    ):
+        amount = reading.value
 
     # ── Equity / shares / stock / buy ────────────────────────────────
     if any(kw in lower for kw in ("share", "stock", "buy")):
-        amount = _parse_amount(transcript)
         if amount is None:
             return _question_result(
                 "amount",
@@ -385,57 +443,66 @@ def parse(transcript: str) -> ParseResult:
                 transcript,
                 partial={
                     "intent_type": "equity_purchase",
-                    "source_account": "acct-001-2345",
+                    "source_account": source_account,
                     "ticker": "D05.SI",
                     "order_type": "market",
                 },
             )
         return ParseResult(
-            items=[_equity_purchase(transcript, amount)],
+            items=[_equity_purchase(transcript, amount, currency)],
             intents_detected=1,
         )
 
     # ── Transfer patterns ────────────────────────────────────────────
-    if "send" in lower and ("dollar" in lower or "money" in lower):
-        amount = _parse_amount(transcript)
-        if amount is None:
-            # Per CONTRACT.md §2, amount cannot be in unresolved.
-            # The parser must ask before producing any draft.
-            # Build the partial dict.  If the user named "John Smith",
-            # carry the payee in partial so resolve_question can build
-            # a valid transfer draft from partial + the amount answer.
-            # Unresolved fields are omitted (never None) — matching
-            # the shape contract on PendingQuestion.
-            partial: dict = {
-                "intent_type": "transfer",
-                "source_account": "acct-001-2345",
+    if _TRANSFER_VERB_RE.search(lower) and (
+        reading.status != "none" or _MONEY_WORD_RE.search(lower)
+    ):
+        # R5: the recipient, with or without a spoken "to".  R2: it must
+        # resolve through the directory; a relation ("mum") never does.
+        phrase = payee_phrase(text)
+        matches = match_payees(phrase, directory, context=text) if phrase else []
+
+        partial: dict = {"intent_type": "transfer", "source_account": source_account}
+        if len(matches) == 1:
+            partial["payee"] = {
+                "id": matches[0].id,
+                "display_name": matches[0].display_name,
+                "masked_account": matches[0].masked_account,
             }
-            if "john smith" in lower:
-                partial["payee"] = {
-                    "id": "payee-001",
-                    "display_name": "John Smith",
-                    "masked_account": "****1234",
-                }
+
+        if amount is None:
+            # Per CONTRACT.md §2, amount cannot be in unresolved.  The
+            # parser must ask before producing any draft.  Unresolved
+            # fields are omitted (never None) -- the PendingQuestion shape.
             return _question_result(
                 "amount",
-                "How much would you like to send?",
+                _amount_question(text, reading),
                 transcript,
                 partial=partial,
             )
 
-        # "John Smith" (full name) → clean transfer
-        if "john smith" in lower:
+        if len(matches) == 1:
             return ParseResult(
-                items=[_clean_transfer(transcript)],
+                items=[_transfer(transcript, matches[0], amount, currency, source_account)],
                 intents_detected=1,
             )
 
-        # "John" alone (ambiguous — two saved Johns)
-        if "john" in lower and "john smith" not in lower:
+        if len(matches) >= 2:
+            # Ambiguous ("John"): the stub always offers the two demo Johns.
             return ParseResult(
-                items=[_ambiguous_payee(transcript)],
+                items=[_ambiguous_payee(transcript, amount, currency)],
                 intents_detected=1,
             )
+
+        # No directory payee matches ("mum", "my wife", "Bob", nothing).
+        partial["amount"] = {"value": amount, "currency": currency}
+        reference = person_reference(phrase)
+        question = (
+            f'I can\'t tell who "{reference}" is. Please name one of your saved payees.'
+            if reference
+            else "Who would you like to send the money to?"
+        )
+        return _question_result("payee", question, transcript, partial=partial)
 
     # ── Unrecognized ─────────────────────────────────────────────────
     raise ParserCannotHandle(
