@@ -231,11 +231,16 @@ def test_a_verdict_for_a_different_draft_is_not_trusted():
     assert execute_draft(api, draft_id)["reason_code"] == "validator_frozen"
 
 
-def test_a_verdict_with_no_hash_is_still_accepted():
-    """draft_hash is optional in the model; absent means 'not bound', which is
-    the validator's choice, not a mismatch."""
-    validator = FakeValidator("pass")
-    api = make_api(validator)
+def test_a_verdict_with_no_hash_is_not_trusted():
+    """An empty draft_hash binds to nothing, so it must not be recorded as a
+    pass — that is the same 'unchecked pass' the binding exists to prevent,
+    just reached by omission instead of by naming another draft.
+
+    Used to assert the opposite ('absent means not bound, which is the
+    validator's choice'). It is not: check 11 cannot attribute an unbound
+    verdict, and a server that records one has produced a pass nobody can
+    account for.
+    """
 
     class NoHashValidator(FakeValidator):
         def validate(self, draft, transcript, clarification=None):
@@ -243,9 +248,24 @@ def test_a_verdict_with_no_hash_is_still_accepted():
                 verdict="pass", discrepancies=[], reason="ok", draft_hash=""
             )
 
+    api = make_api(FakeValidator("pass"))
     api.messages.validator = NoHashValidator("pass")
     response = api.message({"transcript": "Send fifty dollars to John Smith."})
-    assert response["items"][0]["validator"]["verdict"] == "pass"
+    item = response["items"][0]
+
+    assert item["validator"]["verdict"] == "freeze"
+    assert "no draft_hash" in item["validator"]["reason"]
+    assert execute_draft(api, item["draft"]["id"])["reason_code"] == "validator_frozen"
+
+
+def test_a_verdict_dict_without_any_hash_field_is_not_trusted():
+    """Same rule at the boundary: a verdict-shaped payload that never names a
+    draft cannot be bound to one."""
+    api = make_api(FakeValidator("pass"))
+    service = api.messages
+    bound = service._bind_verdict({"verdict": "pass", "reason": "ok"}, "b" * 64)
+    assert bound["verdict"] == "freeze"
+    assert "no draft_hash" in bound["reason"]
 
 
 # ── Nothing that cannot check a draft may produce a pass ───────────────

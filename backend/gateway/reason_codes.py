@@ -28,17 +28,26 @@ SCHEMA_INVALID = "schema_invalid"
 INVALID_CLARIFICATION_ANSWER = "invalid_clarification_answer"
 
 # ── /api/message ──
-# CONTRACT.md §8 open question 4 is marked Resolved: before phase 5, a
-# transcript that describes more than one transaction must be rejected with no
-# draft drafted at all. These two codes are NOT yet in the §5 table — adding
-# them is a contract change and needs all three members to agree. The gateway
-# uses them because the alternative is an unhandled 500.
+# CONTRACT.md §8 open question 4 is Resolved: before phase 5, a transcript
+# that describes more than one transaction is refused with nothing drafted at
+# all. Both codes below were added to the §5 table when that was decided, and
+# are now part of the contract.
 MULTI_INTENT_UNSUPPORTED = "multi_intent_unsupported"
 
 # The same ParserCannotHandle covers "the stub does not recognise this
 # sentence", which is a different failure from "two intents". It gets its own
 # code so an eval table can tell the two apart.
 PARSER_CANNOT_HANDLE = "parser_cannot_handle"
+
+# ── 500s: our bug, not the user's request ──
+# CONTRACT.md §5 fixes the shape of every error response — result,
+# reason_code and message — and does not exempt the 500s. A 500 is never a
+# rejection (nothing about the request was judged), so it carries
+# result:"error" with the same three fields. One code covers all of them: the
+# client cannot act on the difference, and splitting it would put our internal
+# failure modes into the shared contract table. The ``bug`` tag in the body
+# says which one it was.
+INTERNAL_ERROR = "internal_error"
 
 ALL_REASON_CODES: frozenset[str] = frozenset(
     {
@@ -58,6 +67,7 @@ ALL_REASON_CODES: frozenset[str] = frozenset(
         INVALID_CLARIFICATION_ANSWER,
         MULTI_INTENT_UNSUPPORTED,
         PARSER_CANNOT_HANDLE,
+        INTERNAL_ERROR,
     }
 )
 

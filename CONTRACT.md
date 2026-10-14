@@ -480,6 +480,15 @@ The server refuses (`unknown_draft`, `unresolved_fields`, `expired`) to
 issue a challenge for a draft it did not store, that has unresolved
 fields, or that has expired.
 
+> **Added by Member 3, needs sign-off:** it also refuses a draft the
+> validator has not passed (`validator_frozen`, including when **no**
+> verdict is recorded at all) and one the policy engine blocks
+> (`policy_blocked`). A challenge is the server saying "I am willing to
+> let you sign this"; issuing one for a draft check 11 or 12 will refuse
+> only spends the user's biometric on a signature that cannot succeed.
+> §4 does not list these for this endpoint — they are deliberate, and
+> they are the kind of thing to argue about in review.
+
 The frontend must recompute `draftHashAsync(draft)` over the draft it is
 displaying and check that it matches `draft_hash` here before calling
 `navigator.credentials.get()`. If they differ, it must not sign.
@@ -634,6 +643,24 @@ Every rejection uses the same shape and HTTP status 422:
 The `reason_code` is machine-readable. The `message` is for the
 developer log, not necessarily for the user.
 
+A **500** uses the same three fields, with `result` `"error"` instead
+of `"rejected"`:
+
+```json
+{
+  "result": "error",
+  "reason_code": "internal_error",
+  "message": "Human-readable explanation of what broke on our side."
+}
+```
+
+The difference matters to the client: `"rejected"` means the request
+was judged and refused, so the user can act on it; `"error"` means the
+server could not answer at all, and retrying or telling the user "try
+again" is the only honest response. `internal_error` is deliberately
+one code — splitting our own failure modes into the shared table would
+put them in the client's branch logic.
+
 ### Rejection reason codes
 
 | Code | Triggered when |
@@ -654,6 +681,7 @@ developer log, not necessarily for the user.
 | `invalid_clarification_answer` | `/api/clarify` was called with an `answer` that is not the `id` of one of the stored draft's `payee_candidates`, with a `field` that is not in its `unresolved` list, or (in the proposed question form) with a `question_id` that is unknown or already used. |
 | `multi_intent_unsupported` | The transcript describes more than one transaction. Before phase 5 the request is declined and **nothing is drafted** — see §8 open question 4. |
 | `parser_cannot_handle` | The parser could not produce a draft for the transcript at all (it raises `ParserCannotHandle`). Kept separate from `multi_intent_unsupported` so an evaluation table can tell "several intents" apart from "not understood". |
+| `internal_error` | The server could not answer: an intent was dropped by the parser, the server is missing a dependency it needs (a payee directory, a chat client), the validator is not usable, or anything else unhandled. HTTP **500**, not 422 — see the note above the table. Carries an extra non-contract field `bug` (`parser`, `wiring`, `validator`, `unhandled`) for whoever reads the log. |
 
 ---
 
