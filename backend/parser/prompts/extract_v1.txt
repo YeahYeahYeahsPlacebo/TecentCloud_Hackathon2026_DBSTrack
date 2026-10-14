@@ -36,6 +36,14 @@ Rules:
 7. Return ONLY the JSON object. No explanation, no markdown, no
    preamble.
 
+8. The transcript may come from speech: lower case, little or no
+   punctuation, and the word "to" may be missing (for example "send
+   fifty dollars john smith"). Still copy payee_mention and amount_text
+   word for word. A relation such as "mum" or "my wife" is a
+   payee_mention like any other; never replace it with a name. If the
+   amount is vague ("some", "a few hundred", "a lot"), set amount_value
+   to null and add "amount" to uncertain_fields.
+
 Transcript:
 
 <<<TRANSCRIPT>>>

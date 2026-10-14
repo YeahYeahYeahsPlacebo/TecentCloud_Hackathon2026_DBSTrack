@@ -62,6 +62,13 @@ from backend.parser.interface import (
     ParseResult,
     PendingQuestion,
 )
+from backend.parser.speech_norm import (
+    directory_name_words,
+    normalise,
+    payee_phrase,
+    person_reference,
+    spoken_amount,
+)
 
 # ── Prompt loading ────────────────────────────────────────────────────
 
@@ -209,8 +216,21 @@ class LlmParser:
                 reason="request too long",
             )
 
+        # ── 0b. Speech-style normalisation (speech_norm) ───────────
+        # Fillers ("uh", "lah", ...) come out; nothing else changes.  The
+        # result, ``work``, is what the model sees and what every check
+        # below runs on, so the model and the code always read the same
+        # words.  It is internal only: the draft's transcript stays the
+        # exact submitted text (R1), and the rules applied are not stored
+        # (the draft schema has no field for them, R7).
+        norm = normalise(clean, protected_words=directory_name_words(self._directory))
+        work = norm.text
+        if not work.strip():
+            # Nothing but fillers ("uh um lah").
+            raise ParserCannotHandle("empty transcript", reason="empty transcript")
+
         # ── 1. Ask the model to extract ────────────────────────────
-        extraction = self._extract(clean)
+        extraction = self._extract(work)
 
         # ── 2. Multi-intent guard (two signals) ───────────────────
         if len(extraction.intents) > 1:
@@ -221,7 +241,7 @@ class LlmParser:
             )
 
         # Independent second signal: keyword-based check from stub.
-        if _is_multi_intent(clean):
+        if _is_multi_intent(work):
             raise ParserCannotHandle(
                 "Multiple intents detected in the transcript. "
                 "Please send one request at a time.",
@@ -243,7 +263,7 @@ class LlmParser:
             )
 
         # ── 4. Code builds the draft ───────────────────────────────
-        return self._build_result(transcript, clean, intent)
+        return self._build_result(transcript, work, intent, sanitised=clean)
 
     def _extract(self, clean_transcript: str) -> _ExtractionResult:
         """Send the prompt to the model and validate the reply.
@@ -277,12 +297,14 @@ class LlmParser:
         transcript: str,
         clean: str,
         intent: _ExtractedIntent,
+        sanitised: str | None = None,
     ) -> ParseResult:
         """Build a :class:`ParseResult` from the extracted intent.
 
         Code — not the model — resolves payees, validates amounts,
-        and sets all draft fields.  Every check uses the sanitised
-        ``clean`` text; the raw ``transcript`` is only stored.
+        and sets all draft fields.  Every check uses ``clean``, the
+        sanitised and speech-normalised working text the model saw; the
+        raw ``transcript`` is only stored, unchanged (R1).
 
         Every :class:`ClarifyingQuestion` returned also populates
         :attr:`ParseResult.pending` with a :class:`PendingQuestion`
@@ -303,8 +325,16 @@ class LlmParser:
         }
         # Build a set of fields that fail the transcript check.
         transcript_failures: set[str] = set()
+        # A mention must be the user's own words.  The model saw ``clean``
+        # (fillers removed), but a mention that quotes the sanitised
+        # original instead ("Jane lah") is still the user's words; the
+        # directory match strips the particle.  Anything in neither text
+        # is invented and is refused.
         for field_name, value in mentions.items():
-            if value and not _in_transcript(value, clean):
+            if value and not (
+                _in_transcript(value, clean)
+                or (sanitised is not None and _in_transcript(value, sanitised))
+            ):
                 transcript_failures.add(field_name)
 
         # ── Amount resolution ──────────────────────────────────────
@@ -329,22 +359,44 @@ class LlmParser:
         payee_candidates: list[PayeeCandidate] | None = None
         unresolved: list[str] = []
         need_payee_question = False
+        payee_question = "Who would you like to send the money to?"
 
         if intent_type in ("transfer", "bill_payment"):
             # If payee_mention fails the transcript check, mark for asking.
             if "payee_mention" in transcript_failures:
                 need_payee_question = True
             else:
+                mention = intent.payee_mention
+                if not (mention and mention.strip()):
+                    # R5: the model found no recipient.  A spoken "to" is
+                    # often missing ("send fifty dollars john smith"), so
+                    # take the words left after the verb and the amount.
+                    # They are only a candidate: the directory must
+                    # resolve them to exactly one payee, else we ask.
+                    mention = payee_phrase(clean)
+
+                # R2: "mum", "my wife", ... are relations, not names.  They
+                # reach a draft only if the directory itself matches the
+                # words; nothing maps a relation to a payee.
+                reference = person_reference(mention)
+
                 # The account clue can sit after the mention in the
                 # transcript (the model often returns just the name), so
-                # the sanitised transcript is the context.
-                matches = match_payees(
-                    intent.payee_mention, self._directory, context=clean,
+                # the working text is the context.
+                matches = (
+                    match_payees(mention, self._directory, context=clean)
+                    if mention
+                    else []
                 )
 
                 if len(matches) == 0:
                     # Zero matches → mark for asking.
                     need_payee_question = True
+                    if reference:
+                        payee_question = (
+                            f'I can\'t tell who "{reference}" is. '
+                            f"Please name one of your saved payees."
+                        )
                 elif len(matches) >= 2:
                     # Ambiguous → draft with payee in unresolved.
                     unresolved.append("payee")
@@ -379,6 +431,9 @@ class LlmParser:
         need_amount_question = False
         amount_question = "How much would you like to send?"
         currency = resolve_currency(clean)
+        # R3: money words are read by code, deterministically.  The
+        # model's amount_value is only a cross-check against that reading.
+        reading = spoken_amount(clean)
 
         if is_negative_amount(clean) or is_negative_value(amount_value):
             # Never drop a sign: a negative amount is asked again.
@@ -395,8 +450,43 @@ class LlmParser:
                 "Please give the amount with at most two decimal places. "
                 "How much would you like to send?"
             )
+        elif reading.status == "vague":
+            # "some", "a few hundred", "about fifty", "two fifty": never a
+            # number, whatever the model returned for it.
+            need_amount_question = True
+            amount_question = (
+                "I need an exact amount, for example \"fifty dollars\". "
+                "How much would you like to send?"
+            )
+        elif reading.status == "multiple":
+            need_amount_question = True
+            amount_question = (
+                "I heard more than one number. "
+                "How much would you like to send?"
+            )
         elif "amount_text" in transcript_failures:
             need_amount_question = True
+        elif (
+            reading.status == "exact"
+            and amount_value
+            and _is_valid_money(amount_value)
+            and amount_value != reading.value
+        ):
+            # Two readings of the same words disagree: ask, do not pick.
+            need_amount_question = True
+            amount_question = (
+                "I could not be sure of the amount. "
+                "How much would you like to send?"
+            )
+        elif reading.status == "exact" and currency is None:
+            need_amount_question = True
+            amount_question = (
+                "Which currency did you mean? "
+                "How much would you like to send?"
+            )
+        elif reading.status == "exact":
+            amount_value = reading.value
+            partial["amount"] = {"value": amount_value, "currency": currency}
         elif "amount" in uncertain or not amount_value:
             need_amount_question = True
         elif not _is_valid_money(amount_value):
@@ -421,7 +511,7 @@ class LlmParser:
 
         if need_payee_question:
             return _make_question_result(
-                "payee", "Who would you like to send the money to?",
+                "payee", payee_question,
                 transcript, partial,
             )
 

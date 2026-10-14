@@ -53,6 +53,7 @@ from backend.parser.directory import (
     match_payees,
     resolve_ticker,
 )
+from backend.parser.speech_norm import normalise, spoken_amount
 from backend.parser.interface import (
     ClarificationRecord,
     ClarifyingQuestion,
@@ -461,6 +462,20 @@ def resolve_question(
             }
             return _finish(pending, answer, partial)
 
+    # R3: a spoken amount is read by code.  "a few hundred", "some",
+    # "about fifty" are never a number, whatever the model would say; an
+    # exact phrase ("a grand") fixes the value and the model only
+    # cross-checks it.  The answer is read after fillers are removed.
+    answer_reading = None
+    if field == "amount":
+        answer_reading = spoken_amount(normalise(clean_answer).text)
+        if answer_reading.status in ("vague", "multiple"):
+            return _reask(
+                pending, answer, partial,
+                'I need an exact amount, for example "fifty dollars". '
+                "How much would you like to send?",
+            )
+
     # ── 4. Build the prompt and call the model ───────────────────────
     prompt = _build_answer_prompt(field, clean_transcript, clean_answer)
     reply = client.ask(prompt)
@@ -473,7 +488,10 @@ def resolve_question(
         )
 
     # ── Handle unclear answer → new question for the same field ──────
-    if not reply_data.get("resolved"):
+    code_reads_amount = (
+        answer_reading is not None and answer_reading.status == "exact"
+    )
+    if not reply_data.get("resolved") and not code_reads_amount:
         return _reask(pending, answer, partial, f"Could you clarify the {field}?")
 
     # ── Field resolved → build the draft ─────────────────────────────
@@ -492,6 +510,20 @@ def resolve_question(
                 pending, answer, partial,
                 "The amount can't be negative. How much would you like to send?",
             )
+
+        if code_reads_amount:
+            # Two readings of the same words must agree; if not, ask.
+            if (
+                amount_value
+                and _MONEY_RE.fullmatch(amount_value)
+                and amount_value != answer_reading.value
+            ):
+                return _reask(
+                    pending, answer, partial,
+                    "I could not be sure of the amount. "
+                    "How much would you like to send?",
+                )
+            amount_value = answer_reading.value
 
         # amount_value must match the money pattern.
         if not amount_value or not _MONEY_RE.fullmatch(amount_value):
