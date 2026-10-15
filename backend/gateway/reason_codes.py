@@ -92,5 +92,9 @@ EXECUTE_REASON_CODES: tuple[str, ...] = (
     POLICY_BLOCKED,          # 12 policy decision is "allow" (or step-up met)
 )
 
-# Step 12's second possible outcome; it shares step 12 with POLICY_BLOCKED.
-STEP_12_REASON_CODES: frozenset[str] = frozenset({POLICY_BLOCKED, STEP_UP_REQUIRED})
+# Step 12's other outcomes; they share step 12 with POLICY_BLOCKED. A policy
+# "hold" means the draft is still unresolved, so it reports the same code as
+# check 5 — the user has a question to answer, not a factor to prove.
+STEP_12_REASON_CODES: frozenset[str] = frozenset(
+    {POLICY_BLOCKED, STEP_UP_REQUIRED, UNRESOLVED_FIELDS}
+)

@@ -8,8 +8,11 @@ short version is at the top; the evidence is below.
 **Yes — but only in one of two shapes, and the obvious third one silently
 does not work.**
 
-`POST /api/webauthn/register` takes `{user_id, public_key}`. As of the
-`feature/member3-register-key-check` branch, `public_key` may be:
+`POST /api/webauthn/register` takes `{user_id, credential_id, public_key}`.
+**`public_key` is required** — a registration without one is refused `422
+malformed_request` (`"'public_key' is required"`), because a credential with
+no key fails at `/api/execute` with `signature_invalid` *after* the user has
+spent a biometric. It may be:
 
 | Form | Works? | Notes |
 |---|---|---|
@@ -31,8 +34,13 @@ const credential = await navigator.credentials.create({
   },
 });
 
-// getPublicKey() returns a SubjectPublicKeyInfo DER. Stringify it and send
-// it as-is — the server now accepts base64/base64url DER directly.
+// 1. The credential id the BROWSER minted. Send this; the server stores the
+//    key under it and hands it back in allow_credentials.
+const rawId = btoa(String.fromCharCode(...new Uint8Array(credential.rawId)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+// 2. getPublicKey() returns a SubjectPublicKeyInfo DER. Stringify it and send
+//    it as-is — the server now accepts base64/base64url DER directly.
 const der = new Uint8Array(credential.response.getPublicKey());
 const b64url = btoa(String.fromCharCode(...der))
   .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -42,10 +50,41 @@ await fetch("/api/webauthn/register", {
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     user_id: "demo",
+    credential_id: rawId,        // <-- send the browser's rawId
     public_key: b64url,          // or a PEM string, both work
   }),
 });
-// -> {"status":"registered","credential_id":"..."}
+// -> {"status":"registered",
+//     "credential_id":"<the base64url you sent, unpadded>",
+//     "credential_id_source":"client"}
+```
+
+> **Check `credential_id_source`.** If it comes back `"server"`, the backend
+> did not see your `credential_id` and invented one — no authenticator will
+> ever produce it, so `navigator.credentials.get()` will fail. That value is
+> there so the failure is visible instead of silent.
+
+### The rawId mismatch, fixed
+
+`navigator.credentials.create()` mints the credential id; `/api/webauthn/register`
+used to mint a *different* one and store the key under that. So the browser's
+`rawId` and the id in `allow_credentials` never matched, and the Python tests
+never noticed because they just used whatever the server returned.
+
+Now: send `credential_id` (base64url of `rawId`, ≤1023 bytes, padding is
+accepted and stripped) and the server stores the key under **your** id.
+`allow_credentials` then names it, and `/api/execute` looks up the same
+string. Re-registering an id with a *different* key is refused
+(`malformed_request`); re-registering the same key is a no-op.
+
+`allow_credentials` is a list of base64url strings, so map it:
+
+```js
+allowCredentials: res.allow_credentials.map(id => ({
+  id: Uint8Array.from(atob(id.replace(/-/g, "+").replace(/_/g, "/")),
+                      c => c.charCodeAt(0)),
+  type: "public-key",
+}))
 ```
 
 If `getPublicKey()` is unavailable, `credential.response.attestationObject`
@@ -86,6 +125,9 @@ POST /api/webauthn/challenge      {"draft_id": "<id>"}
      ⚠️ the field you sign is `challenge`, NOT `draft_hash`.
         `challenge` is base64url of the raw 32 bytes; `draft_hash` is hex of
         the same. Using the wrong one gives hash_mismatch.
+     ⚠️ `allow_credentials` holds the ids you registered (base64url,
+        unpadded) — see the mapping above. An empty list means "any
+        credential", not an error.
 
 POST /api/execute                 {draft_id, credential_id, idempotency_key,
                                    assertion: {credential_id,
@@ -132,8 +174,10 @@ decision; I am happy to write it if they want it.
 
 ## For everyone: the test count
 
-Member 1 was right that 857 was stale. On current `main` (`ce1b778`) the
-suite is **1200 passed, 1 skipped**. With the registration branch, **1207**.
+Member 1 was right that 857 was stale. On current `main` the suite is
+**1229 passed, 1 skipped** (the 1 skip is `test_dotenv_guard`, which needs a
+`.env` that this machine does not have). Ten of those are the browser
+credential-id tests below.
 
 ```
 git checkout main && git pull
