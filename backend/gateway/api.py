@@ -136,6 +136,24 @@ class GatewayAPI:
             bank=self.bank,
         )
 
+    def bind_webauthn(
+        self,
+        rp_id: Optional[str] = None,
+        origin: Optional[str] = None,
+    ) -> None:
+        """Point the WebAuthn checks at the host this deployment answers on.
+
+        Both are set once when the gateway is built, but a deployment does
+        not know its own domain then — the HTTP layer reads it off the
+        request and calls this (``DCTA_ORIGIN=auto``). Only the argument
+        that is given is changed; ``None`` leaves what is already there.
+        """
+        if rp_id is not None:
+            self.webauthn.rp_id = rp_id
+            self.executor.rp_id = rp_id
+        if origin is not None:
+            self.executor.origin = origin
+
     def _known(self) -> set:
         """Payees already paid (from the ledger) plus any pre-declared ones."""
         known = set(self.known_payees)

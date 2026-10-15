@@ -82,13 +82,51 @@ def _env_value(name: str, default: str) -> str:
 
 
 def _rp_id() -> str:
-    """The WebAuthn relying-party id the browser must be on."""
+    """The WebAuthn relying-party id the browser must be on.
+
+    ``auto`` means "whatever host the request came in on" — see
+    :func:`_webauthn_for_request`. It is how a deployment on a domain nobody
+    knows at build time works at all.
+    """
     return _env_value("DCTA_RP_ID", DEFAULT_RP_ID)
 
 
 def _origin() -> str:
-    """The browser origin ``clientDataJSON`` must carry (scheme, host, port)."""
+    """The browser origin ``clientDataJSON`` must carry (scheme, host, port).
+
+    ``auto`` means "whatever origin the request came in on".
+    """
     return _env_value("DCTA_ORIGIN", DEFAULT_ORIGIN)
+
+
+def _is_auto(value: str) -> bool:
+    return value.strip().lower() == "auto"
+
+
+def _webauthn_for_request(request: Request) -> tuple[str, str]:
+    """The (rp_id, origin) this request was made to.
+
+    Takes the scheme from ``X-Forwarded-Proto`` and the host from
+    ``X-Forwarded-Host``, falling back to what the request itself says —
+    the standard pair a reverse proxy in front of the app sets. A
+    deployment answers on one domain, so reading it off the request and
+    configuring it by hand agree; reading it off the request is what makes
+    the first deploy work before anyone knows the domain.
+
+    This trusts the proxy's headers. That is the right trade for an app
+    behind one proxy answering on one domain, and the wrong one in front
+    of a proxy that routes many domains — set ``DCTA_ORIGIN`` explicitly
+    in that case.
+    """
+    scheme = (
+        request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+    )
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or DEFAULT_RP_ID
+    )
+    return host.split(":")[0], f"{scheme}://{host}"
 
 
 def _chat_client() -> Optional[Any]:
@@ -220,6 +258,25 @@ def create_app(api: Optional[GatewayAPI] = None, *, serve_frontend: bool = True)
     def call(method: str, body: Any) -> Any:
         return getattr(gateway, method)(body)
 
+    # ── WebAuthn bound to the host this deployment answers on ──────────
+    # A deployment does not know its domain when the app is built, so
+    # "auto" reads it off each request instead. Every request behind one
+    # proxy resolves to the same value, so this is set-once in practice;
+    # it is done per request because that is where the host is known.
+    auto_rp_id = _is_auto(_rp_id())
+    auto_origin = _is_auto(_origin())
+
+    if auto_rp_id or auto_origin:
+
+        @app.middleware("http")
+        async def bind_webauthn(request: Request, call_next: Any) -> Any:
+            rp_id, origin = _webauthn_for_request(request)
+            gateway.bind_webauthn(
+                rp_id=rp_id if auto_rp_id else None,
+                origin=origin if auto_origin else None,
+            )
+            return await call_next(request)
+
     # ── Routes ────────────────────────────────────────────────────────
 
     @app.post("/api/message")
@@ -263,6 +320,13 @@ def create_app(api: Optional[GatewayAPI] = None, *, serve_frontend: bool = True)
             if gateway.answer_resolver is not None
             else "model",
             "bank": "none" if gateway.bank is None else f"{len(gateway.bank.accounts())} accounts",
+            # What every signature is checked against. On a deployed box
+            # these are the first thing to look at when WebAuthn fails:
+            # the browser will not make a credential for an rpId it is not
+            # on, and an origin mismatch is a signature_invalid with no
+            # visible cause.
+            "rp_id": gateway.webauthn.rp_id,
+            "origin": gateway.executor.origin,
             "drafts": len(gateway.store),
             "credentials": len(gateway.credentials),
         }
@@ -336,7 +400,11 @@ if __name__ == "__main__":  # pragma: no cover
 
     uvicorn.run(
         "backend.gateway.server:app",
-        host=os.environ.get("DCTA_HOST", "127.0.0.1"),
-        port=int(os.environ.get("DCTA_PORT", "8000")),
+        # PORT/HOST are what a platform hands a deployed process; DCTA_*
+        # wins when set so a local run is unaffected.
+        host=os.environ.get("DCTA_HOST") or os.environ.get("HOST") or "127.0.0.1",
+        port=int(
+            os.environ.get("DCTA_PORT") or os.environ.get("PORT") or 8000
+        ),
         reload=_flag("DCTA_RELOAD"),
     )

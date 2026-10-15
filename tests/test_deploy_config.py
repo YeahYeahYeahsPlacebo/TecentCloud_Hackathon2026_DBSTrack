@@ -19,10 +19,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fastapi.testclient import TestClient  # noqa: E402
+
 from backend.gateway.server import (  # noqa: E402
     DEFAULT_ORIGIN,
     DEFAULT_RP_ID,
     build_api,
+    create_app,
 )
 
 
@@ -59,6 +62,74 @@ def test_an_empty_value_is_unset_not_an_empty_origin(monkeypatch):
 
     assert api.webauthn.rp_id == DEFAULT_RP_ID
     assert api.executor.origin == DEFAULT_ORIGIN
+
+
+def test_auto_binds_webauthn_to_the_host_the_request_came_in_on(monkeypatch):
+    """A deployment does not know its own domain when the app is built.
+
+    ``auto`` reads it off the request instead, which is what makes a first
+    deploy work before anyone has seen the domain. The proxy headers are
+    what a platform in front of the app actually sends.
+    """
+    monkeypatch.setenv("DCTA_RP_ID", "auto")
+    monkeypatch.setenv("DCTA_ORIGIN", "auto")
+
+    api = build_api()
+    app = create_app(api, serve_frontend=False)
+    client = TestClient(app)
+
+    health = client.get(
+        "/api/health",
+        headers={"x-forwarded-proto": "https", "x-forwarded-host": "dcta.example.com"},
+    ).json()
+
+    assert health["rp_id"] == "dcta.example.com"
+    assert health["origin"] == "https://dcta.example.com"
+
+
+def test_auto_falls_back_to_the_host_header(monkeypatch):
+    """A host header is enough when no proxy sets a forwarded one."""
+    monkeypatch.setenv("DCTA_RP_ID", "auto")
+    monkeypatch.setenv("DCTA_ORIGIN", "auto")
+
+    api = build_api()
+    client = TestClient(create_app(api, serve_frontend=False))
+
+    health = client.get("/api/health", headers={"host": "pay.internal:8000"}).json()
+
+    assert health["rp_id"] == "pay.internal"
+    assert health["origin"] == "http://pay.internal:8000"
+
+
+def test_auto_leaves_an_explicit_setting_alone(monkeypatch):
+    """Only what is set to auto is derived. Naming the rpId but letting the
+    origin follow the request — or the other way round — has to work, or
+    auto is not composable with a domain that is partly known."""
+    monkeypatch.setenv("DCTA_RP_ID", "dcta.example.com")
+    monkeypatch.setenv("DCTA_ORIGIN", "auto")
+
+    api = build_api()
+    client = TestClient(create_app(api, serve_frontend=False))
+
+    health = client.get("/api/health", headers={"host": "other.example.com"}).json()
+
+    assert health["rp_id"] == "dcta.example.com"
+    assert health["origin"] == "http://other.example.com"
+
+
+def test_without_auto_a_request_on_another_host_changes_nothing(monkeypatch):
+    """Auto is opt-in: a configured server ignores the host header, so a
+    stray Host cannot move the origin a signature is checked against."""
+    monkeypatch.delenv("DCTA_RP_ID", raising=False)
+    monkeypatch.delenv("DCTA_ORIGIN", raising=False)
+
+    api = build_api()
+    client = TestClient(create_app(api, serve_frontend=False))
+
+    health = client.get("/api/health", headers={"host": "evil.example.com"}).json()
+
+    assert health["rp_id"] == DEFAULT_RP_ID
+    assert health["origin"] == DEFAULT_ORIGIN
 
 
 def test_the_challenge_reports_the_configured_rp_id(monkeypatch):

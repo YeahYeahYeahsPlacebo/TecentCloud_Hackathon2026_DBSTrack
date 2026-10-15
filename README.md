@@ -43,9 +43,9 @@ validator, bank, draft count). Read it before demoing.
 | `DCTA_FAKE_CLIENT=1` | Scripted client, for local wiring only. |
 | `DCTA_ANSWER_BACKEND` | `model` \| `rules` — how a free-text answer is read. Default: `model` when ADP keys are configured, `rules` otherwise. `model` without a client is a 500. |
 | `DCTA_SERVE_FRONTEND=0` | API only, no static files. |
-| `DCTA_PORT`, `DCTA_HOST` | Default `8000` / `127.0.0.1`. |
-| `DCTA_RP_ID` | WebAuthn rpId. Default `localhost`. **Set this when deploying.** |
-| `DCTA_ORIGIN` | Origin `clientDataJSON` must carry, port included. Default `http://localhost:8000`. |
+| `DCTA_PORT`, `DCTA_HOST` | Default `8000` / `127.0.0.1`. A platform's `PORT` / `HOST` are honoured when the `DCTA_` ones are unset. |
+| `DCTA_RP_ID` | WebAuthn rpId. Default `localhost`. **`auto`** = the host the request came in on. |
+| `DCTA_ORIGIN` | Origin `clientDataJSON` must carry, port included. Default `http://localhost:8000`. **`auto`** = the origin the request came in on. |
 | `DCTA_ALLOW_UNVALIDATED=true` | Dev only: lets an unconfigured validator return `pass`. The verdict says so. |
 
 The stub parser and the unconfigured validator are the defaults on purpose:
@@ -190,6 +190,38 @@ attacks its own transaction — signs a *different* draft with the same key and
 replays it — and fails if the gateway accepts that. Exit 0 means the story
 worked **and** the gate held. Run it before every demo; it is the fastest way
 to find out that a refactor broke check 8.
+
+## Deploy it
+
+The gateway is one Python process on one port, serving the API and the
+frontend from the same origin (`frontend/app.js` calls `/api/message` with a
+relative path, so they have to be same-origin). Anything that can run a
+single HTTP port can host it.
+
+```bash
+# on a box whose domain you do not know yet:
+DCTA_HOST=0.0.0.0 DCTA_RP_ID=auto DCTA_ORIGIN=auto DCTA_ALLOW_UNVALIDATED=true \
+    python -m backend.gateway.server
+
+# once you know the domain, name it instead:
+DCTA_HOST=0.0.0.0 DCTA_RP_ID=dcta.example.com DCTA_ORIGIN=https://dcta.example.com \
+    python -m backend.gateway.server
+```
+
+Two things have to be true or WebAuthn silently fails, and both fail as
+`signature_invalid` with no visible cause:
+
+- **HTTPS.** `navigator.credentials.create()` only exists on a secure
+  origin. `http://` on a deployed domain has no WebAuthn at all.
+- **rpId and origin match where the browser actually is.** `auto` reads the
+  scheme from `X-Forwarded-Proto` and the host from `X-Forwarded-Host` (or
+  `Host`), which is what a platform's proxy in front of the app sets. It
+  trusts those headers — right for one app on one domain behind one proxy,
+  wrong in front of a proxy routing many domains. Name the values explicitly
+  in that case.
+
+`GET /api/health` now reports `rp_id` and `origin`. On a deployed box that
+is the first place to look when signing breaks.
 
 ## How We Work
 
