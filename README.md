@@ -6,7 +6,7 @@ A Direct Conversational Transaction Agent built for the DBS track of the Tencent
 
 | Folder | Owner |
 |---|---|
-| `backend/parser`, `backend/validator` | Member 1 (AI layer) |
+| `backend/parser`, `backend/validator`, `backend/llm` | Member 1 (AI layer) |
 | `frontend/` | Member 2 |
 | `backend/gateway`, `backend/ledger`, `backend/audit`, `backend/policy`, `backend/bank` | Member 3 |
 
