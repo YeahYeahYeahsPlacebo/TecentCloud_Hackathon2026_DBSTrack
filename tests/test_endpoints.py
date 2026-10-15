@@ -256,9 +256,10 @@ def test_clarify_produces_a_new_draft_with_a_new_id_and_nonce():
     resolved = response["items"][0]["draft"]
     assert resolved["id"] != original_id
     assert resolved["nonce"] != ambiguous.nonce
-    # The directory is authoritative, not the candidate fields on the draft:
-    # the fixture offers payee-102 as "John Smith", the directory says
-    # "John Lee", and the directory wins.
+    # The directory is authoritative, not the candidate fields on the draft.
+    # Fixture and directory now agree that payee-102 is "John Lee", so this
+    # reads the name from the directory rather than hard-coding it: if the
+    # two ever diverge again, the directory is what the draft must carry.
     record = next(p for p in FixtureDirectory().payees() if p.id == "payee-102")
     assert resolved["payee"] == {
         "id": "payee-102",
