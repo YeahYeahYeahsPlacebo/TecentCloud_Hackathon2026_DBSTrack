@@ -101,6 +101,16 @@ def get_validator(
     """
     backend = os.environ.get("VALIDATOR_BACKEND", "").strip().lower()
 
+    if backend == "stub":
+        # Deterministic validator: reads the transcript with code and
+        # runs the same comparison the LLM backend runs.  No model, no
+        # network, and it can still freeze a draft that disagrees with
+        # what the user said.  See backend/validator/stub_validator.py
+        # for what it does and does not catch.
+        from backend.validator.stub_validator import StubValidator
+
+        return StubValidator(directory=directory or FixtureDirectory())
+
     if backend != "llm":
         return UnconfiguredValidator()
 

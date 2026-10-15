@@ -28,6 +28,7 @@ from backend.parser.interface import ClarificationRecord
 from backend.validator.factory import UnconfiguredValidator, get_validator
 from backend.validator.interface import ValidatorVerdict
 from backend.validator.llm_validator import LlmValidator
+from backend.validator.stub_validator import StubValidator
 
 DIRECTORY = FixtureDirectory()
 
@@ -637,8 +638,15 @@ class TestGetValidatorFactory:
         v = get_validator(client=fake, directory=DIRECTORY)
         assert isinstance(v, LlmValidator)
 
-    def test_returns_unconfigured_when_backend_not_llm(self, monkeypatch):
+    def test_returns_stub_when_backend_is_stub(self, monkeypatch):
+        """stub is a real backend now: it reads the transcript with code."""
         monkeypatch.setenv("VALIDATOR_BACKEND", "stub")
+        v = get_validator()
+        assert isinstance(v, StubValidator)
+
+    def test_returns_unconfigured_for_any_other_backend(self, monkeypatch):
+        """A backend we do not have still refuses to pass silently."""
+        monkeypatch.setenv("VALIDATOR_BACKEND", "bogus")
         v = get_validator()
         assert isinstance(v, UnconfiguredValidator)
 

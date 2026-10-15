@@ -438,6 +438,52 @@ def _compare(
 # ── LlmValidator ─────────────────────────────────────────────────────
 
 
+def _entry_freeze(
+    clean_transcript: str,
+    amount_text: str,
+    h: str,
+) -> Optional[ValidatorVerdict]:
+    """The checks that run before anything is extracted, for every backend.
+
+    Shared by :class:`LlmValidator` and
+    :class:`~backend.validator.stub_validator.StubValidator` so a check
+    cannot hold for one backend and not the other: a transcript longer
+    than the limit, an amount that is negative, and an amount with more
+    than two decimal places are all refused here, before either the
+    model or the code reading ever sees the text.
+
+    Returns the freeze verdict, or None when the entry checks pass.
+    """
+    if len(clean_transcript) > _MAX_TRANSCRIPT_LEN:
+        return ValidatorVerdict(
+            verdict="freeze",
+            discrepancies=[],
+            reason="transcript too long",
+            draft_hash=h,
+        )
+
+    if is_negative_amount(amount_text):
+        return ValidatorVerdict(
+            verdict="freeze",
+            discrepancies=["amount"],
+            reason="The amount that was said is negative.",
+            draft_hash=h,
+        )
+
+    if has_excess_decimals(amount_text):
+        return ValidatorVerdict(
+            verdict="freeze",
+            discrepancies=["amount"],
+            reason=(
+                "The amount that was said has more than two decimal "
+                "places and cannot be rounded."
+            ),
+            draft_hash=h,
+        )
+
+    return None
+
+
 class LlmValidator:
     """LLM-backed validator implementing the Validator protocol.
 
@@ -481,17 +527,7 @@ class LlmValidator:
             sanitise(clarification.answer) if clarification is not None else None
         )
 
-        # A transcript longer than _MAX_TRANSCRIPT_LEN characters
-        # causes an immediate freeze — it is never sent to the model.
-        if len(clean_transcript) > _MAX_TRANSCRIPT_LEN:
-            return ValidatorVerdict(
-                verdict="freeze",
-                discrepancies=[],
-                reason="transcript too long",
-                draft_hash=h,
-            )
-
-        # ── Negative amount -> freeze, no model call ─────────────
+        # ── Entry checks, shared with the stub backend ───────────
         # The amount comes from the answer when the amount was the
         # clarified field, otherwise from the transcript.
         amount_text = (
@@ -499,26 +535,9 @@ class LlmValidator:
             if clarification is not None and clarification.field == "amount"
             else clean_transcript
         )
-        if is_negative_amount(amount_text):
-            return ValidatorVerdict(
-                verdict="freeze",
-                discrepancies=["amount"],
-                reason="The amount that was said is negative.",
-                draft_hash=h,
-            )
-
-        # ── More than two decimals -> freeze, no model call ──────
-        # A draft can only carry a rounded amount; the user said more.
-        if has_excess_decimals(amount_text):
-            return ValidatorVerdict(
-                verdict="freeze",
-                discrepancies=["amount"],
-                reason=(
-                    "The amount that was said has more than two decimal "
-                    "places and cannot be rounded."
-                ),
-                draft_hash=h,
-            )
+        early = _entry_freeze(clean_transcript, amount_text, h)
+        if early is not None:
+            return early
 
         # ── Ask the model to extract ─────────────────────────────
         prompt = _build_prompt(clean_transcript, clarification, clean_answer)

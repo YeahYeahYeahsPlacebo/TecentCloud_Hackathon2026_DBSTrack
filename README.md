@@ -34,7 +34,8 @@ validator, bank, draft count). Read it before demoing.
 | Environment variable | Effect |
 |---|---|
 | `PARSER_BACKEND=llm` | Real LLM parser. Unset: the stub. |
-| `VALIDATOR_BACKEND=llm` | Real validator. Unset: **freezes every draft** with `validator_not_configured`. |
+| `VALIDATOR_BACKEND=llm` | Real validator. Unset, or anything else: **freezes every draft** with `validator_not_configured`. |
+| `VALIDATOR_BACKEND=stub` | Deterministic validator: reads the transcript with code, no model. Passes a draft that matches, freezes one that does not. |
 | `DCTA_AUDIT_PATH=…` | Append-only audit file. Unset: in memory, lost on restart. |
 | `DCTA_LEDGER_PATH=…` | Ledger file. Unset: in memory. |
 | `DCTA_NO_BANK=1` | Run with no money moving at all. |
@@ -101,9 +102,28 @@ python scripts/demo.py --transcript "Pay John two hundred dollars."
 python scripts/demo.py --transcript "Send fifty dollars to mum."   # free-text: "John Lee"
 ```
 
-`DCTA_ALLOW_UNVALIDATED=true` makes the validator return a pass whose reason
-is literally `unvalidated (dev only)` — fine for a rehearsal, weak on stage.
-For a real `pass` without keys you need `VALIDATOR_BACKEND=stub` (Member 1).
+### The validator, with no keys
+
+Three ways to run the validator, and only one of them is a bypass:
+
+```bash
+VALIDATOR_BACKEND=stub python -m backend.gateway.server          # checks, offline
+PARSER_BACKEND=llm VALIDATOR_BACKEND=llm python -m backend.gateway.server   # the real thing
+DCTA_ALLOW_UNVALIDATED=true python -m backend.gateway.server     # bypass: passes anything
+```
+
+`VALIDATOR_BACKEND=stub` reads the transcript with the same code the parser
+trusts and runs the *same comparison* the LLM validator runs, so it gives a
+real verdict — `pass` with reason `The draft matches the transcript.`, or a
+`freeze` naming the field that drifted. It is not a second opinion in the way
+the model is (a mistake it shares with the parser is invisible to it), but it
+does catch a draft that no longer matches what the user said, which is the
+case a demo shows. `/api/health` reports `validator: StubValidator`, so it
+cannot be mistaken for the model.
+
+`DCTA_ALLOW_UNVALIDATED=true` passes *anything*, tampered draft included, and
+says so — reason `unvalidated (dev only)`. Use it only when you want the
+gate out of the way.
 
 ## `.env`
 
