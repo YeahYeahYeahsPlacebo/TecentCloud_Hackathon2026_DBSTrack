@@ -38,8 +38,9 @@ validator, bank, draft count). Read it before demoing.
 | `DCTA_AUDIT_PATH=…` | Append-only audit file. Unset: in memory, lost on restart. |
 | `DCTA_LEDGER_PATH=…` | Ledger file. Unset: in memory. |
 | `DCTA_NO_BANK=1` | Run with no money moving at all. |
-| `DCTA_NO_CLIENT=1` | No chat client. Free-text `/api/clarify` returns 500. |
+| `DCTA_NO_CLIENT=1` | No chat client. Free-text `/api/clarify` then reads answers by rule. |
 | `DCTA_FAKE_CLIENT=1` | Scripted client, for local wiring only. |
+| `DCTA_ANSWER_BACKEND` | `model` \| `rules` — how a free-text answer is read. Default: `model` when ADP keys are configured, `rules` otherwise. `model` without a client is a 500. |
 | `DCTA_SERVE_FRONTEND=0` | API only, no static files. |
 | `DCTA_PORT`, `DCTA_HOST` | Default `8000` / `127.0.0.1`. |
 | `DCTA_RP_ID` | WebAuthn rpId. Default `localhost`. **Set this when deploying.** |
@@ -65,6 +66,44 @@ set. Confirm what is actually loaded before you start:
 ```bash
 curl -s localhost:8000/api/health
 ```
+
+### With no keys
+
+A fresh clone runs, drafts, clarifies, and executes:
+
+```bash
+DCTA_ALLOW_UNVALIDATED=true python -m backend.gateway.server
+```
+
+| | works? | why |
+|---|---|---|
+| One-shot draft → sign → execute | ✅ | stub parser, dev validator pass |
+| Ambiguous payee → pick a candidate → execute | ✅ | candidate picks need the directory, not a model |
+| Free-text clarification ("who is mum?", "how much?") | ✅ | read by rule — see below |
+
+The free-text form has two ways to read an answer, and `GET /api/health`
+says which one this server is using:
+
+- `answer_backend: model` — `resolve_question` asks the model to pull one
+  field out of the answer. Needs `PARSER_APPKEY`.
+- `answer_backend: rules` — `resolve_answer_rules` reads it with the same
+  code the stub parser already trusts (`spoken_amount`, `match_payees`),
+  and **asks again** rather than guessing when the answer does not name a
+  value. No model, no keys.
+
+A server with no ADP keys picks `rules` by default, because the
+alternative was a 500 on the one clarification form a demo needs. Set
+`DCTA_ANSWER_BACKEND=model` to require the model and fail loud without
+it.
+
+```bash
+python scripts/demo.py --transcript "Pay John two hundred dollars."
+python scripts/demo.py --transcript "Send fifty dollars to mum."   # free-text: "John Lee"
+```
+
+`DCTA_ALLOW_UNVALIDATED=true` makes the validator return a pass whose reason
+is literally `unvalidated (dev only)` — fine for a rehearsal, weak on stage.
+For a real `pass` without keys you need `VALIDATOR_BACKEND=stub` (Member 1).
 
 ## `.env`
 
@@ -117,6 +156,20 @@ python scripts/redteam_ai_layer.py --delay 3 --out docs/redteam/ai_layer_report.
 three axes (result, correctness, safety) and writes
 [`docs/redteam/ai_layer_report.md`](docs/redteam/ai_layer_report.md). None of
 them ever print an AppKey or a request body.
+
+## Rehearsal
+
+```bash
+python scripts/demo.py                      # against a running server
+python scripts/demo.py --transcript "Send fifty dollars to John Doe."
+```
+
+`scripts/demo.py` walks the whole story over HTTP and prints each step:
+register → speak → clarify → challenge → sign → execute → audit. Then it
+attacks its own transaction — signs a *different* draft with the same key and
+replays it — and fails if the gateway accepts that. Exit 0 means the story
+worked **and** the gate held. Run it before every demo; it is the fastest way
+to find out that a refactor broke check 8.
 
 ## How We Work
 
