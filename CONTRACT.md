@@ -484,14 +484,16 @@ The server refuses (`unknown_draft`, `unresolved_fields`, `expired`) to
 issue a challenge for a draft it did not store, that has unresolved
 fields, or that has expired.
 
-> **Added by Member 3, needs sign-off:** it also refuses a draft the
-> validator has not passed (`validator_frozen`, including when **no**
-> verdict is recorded at all) and one the policy engine blocks
-> (`policy_blocked`). A challenge is the server saying "I am willing to
-> let you sign this"; issuing one for a draft check 11 or 12 will refuse
-> only spends the user's biometric on a signature that cannot succeed.
-> §4 does not list these for this endpoint — they are deliberate, and
-> they are the kind of thing to argue about in review.
+> **It also refuses anything other than a recorded pass, including when
+> no verdict is recorded at all** (`validator_frozen`), and a draft the
+> policy engine blocks (`policy_blocked`).
+>
+> This is worded as the *same condition* as check 11 rather than as a
+> list of cases, on purpose: the two must not be able to drift apart. If
+> check 11 would refuse at execute, this endpoint refuses at challenge.
+> A challenge is the server saying "I am willing to let you sign this";
+> issuing one for a draft that is going to be refused only spends the
+> user's biometric on a signature that cannot succeed.
 
 The frontend must recompute `draftHashAsync(draft)` over the draft it is
 displaying and check that it matches `draft_hash` here before calling

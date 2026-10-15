@@ -8,10 +8,15 @@ this is the thing that moves it.
 
 Two Johns, deliberately
 -----------------------
-The seed data contains **two different payees both named "John Smith"**
-(``payee-001`` / ``****1234`` and ``payee-102`` / ``****8892``), which is why
-"send to John" is ambiguous and why ``ambiguous_payee.json`` exists. The
-ambiguity is in the *data*, not in the code — nothing here special-cases it.
+The seed data contains **two different people who both answer to "John"**
+(``payee-101`` / ``****4521`` "John Doe" and ``payee-102`` / ``****8892``
+"John Lee"), which is why "send to John" is ambiguous and why
+``ambiguous_payee.json`` exists. They are not the same person and not the
+same account — the ambiguity is "which John", not "which account".
+
+Their names follow ``backend/parser/directory.py``, which is the source of
+truth for payee records; this seed is aligned to it. The ambiguity is in the
+*data*, not in the code — nothing here special-cases it.
 
 Money
 -----
@@ -99,14 +104,18 @@ def _money(value: "str | Decimal | int") -> Decimal:
         raise ValueError(f"not a valid monetary amount: {value!r}") from exc
 
 
-# Seed accounts, matching fixtures/drafts and backend/parser/stub.py.
-# payee-001 and payee-102 are BOTH "John Smith" at different accounts — that
-# is the whole reason "send to John" is ambiguous.
+# Seed accounts. Display names follow backend/parser/directory.py, which is
+# the source of truth for payee records — if the two ever disagree, the
+# directory wins and this line is the one that is wrong.
+#
+# payee-101 "John Doe" and payee-102 "John Lee" are two different people who
+# both answer to "John". That is the whole reason "send to John" is
+# ambiguous, and it is deliberately not "two accounts for one person".
 SEED_ACCOUNTS: Tuple[Account, ...] = (
     Account("acct-001-2345", "My Account", "****2345", Decimal("10000.00"), "SGD"),
     Account("payee-001", "John Smith", "****1234", Decimal("0.00"), "SGD"),
     Account("payee-101", "John Doe", "****4521", Decimal("0.00"), "SGD"),
-    Account("payee-102", "John Smith", "****8892", Decimal("0.00"), "SGD"),
+    Account("payee-102", "John Lee", "****8892", Decimal("0.00"), "SGD"),
 )
 
 

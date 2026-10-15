@@ -28,6 +28,7 @@ from backend.canonical import draft_hash
 from backend.gateway import reason_codes as R
 from backend.gateway.errors import rejection_response
 from backend.gateway.execute import b64url_encode
+from backend.gateway.webauthn import coerce_es256_public_key
 from backend.models.draft import TransactionDraft
 
 USER_VERIFICATION = "required"
@@ -98,19 +99,15 @@ class CredentialService:
         dumped = dump(draft)
         digest = draft_hash(dumped)
 
-        # Do not issue a challenge for a draft the server already knows it will
-        # refuse. A challenge is the server saying "I am willing to let you
-        # sign this"; issuing one for a draft that check 11 or 12 will reject
-        # only spends the user's biometric on something that cannot succeed.
+        # Refuse anything other than a recorded pass — including *no* verdict.
+        # This is deliberately the same condition as check 11, not a similar
+        # one: if check 11 would refuse at execute, this endpoint refuses at
+        # challenge, and the two must not be able to drift apart. (Agreed
+        # with Member 1; CONTRACT.md §4 words it the same way.)
         #
-        # That includes a draft with *no* recorded verdict. Nothing recorded
-        # means the server never ran the validator over this copy, and check
-        # 11 fails closed on exactly that — so the missing case has to be
-        # refused here too, or the challenge is a promise /api/execute will
-        # break. Both gates are the same argument as each other. Neither is
-        # listed in CONTRACT.md §4 for this endpoint, which only names
-        # unknown/unresolved/expired — this is added deliberately, and is the
-        # kind of thing to flag in review.
+        # A challenge is the server saying "I am willing to let you sign
+        # this". Issuing one for a draft check 11 or 12 will refuse only
+        # spends the user's biometric on something that cannot succeed.
         verdict = self.verdicts.get(digest)
         if verdict != "pass":
             message = (
@@ -149,8 +146,24 @@ class CredentialService:
         if not isinstance(request, Mapping) or "user_id" not in request:
             return rejection_response(R.MALFORMED_REQUEST, "'user_id' is required")
 
-        credential_id = b64url_encode(secrets.token_bytes(16))
         public_key = request.get("public_key")
+        if public_key is not None:
+            # Refuse a key we will never be able to verify a signature against.
+            # Storing one anyway reports "registered" and then fails much later
+            # with signature_invalid, which reads like a signing bug on the
+            # client rather than a registration bug.
+            try:
+                coerce_es256_public_key(public_key)
+            except (ValueError, TypeError) as exc:
+                return rejection_response(
+                    R.MALFORMED_REQUEST,
+                    f"unusable public_key: {exc}. Send either a PEM "
+                    "SubjectPublicKeyInfo string or base64/base64url of the DER. "
+                    "A COSE_Key map written as JSON will not work: COSE keys are "
+                    "integers (-1, -2, -3) and JSON keys can only be strings.",
+                )
+
+        credential_id = b64url_encode(secrets.token_bytes(16))
         self.credentials[credential_id] = (
             public_key if public_key is not None else "unregistered-placeholder"
         )

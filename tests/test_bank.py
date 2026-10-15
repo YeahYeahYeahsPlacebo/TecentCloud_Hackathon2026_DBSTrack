@@ -38,13 +38,39 @@ def dump(draft: TransactionDraft) -> dict:
 
 # ── The two Johns ──────────────────────────────────────────────────────
 
+# The pair backend/parser/stub.py offers when a transcript says "John".
+_AMBIGUOUS_JOHNS = ("payee-101", "payee-102")
 
-def test_seed_holds_two_different_payees_both_named_john_smith():
-    """This is the whole reason "send to John" is ambiguous."""
-    johns = [a for a in SEED_ACCOUNTS if a.display_name == "John Smith"]
+
+def test_seed_names_match_the_directory():
+    """The directory is the source of truth for payee names.
+
+    Agreed with Member 1. If a seed name drifts from the directory, the
+    receipt shows a different person than the candidate the user picked —
+    the user picks "John Lee", the bank pays "John Smith".
+    """
+    from backend.parser.directory import FixtureDirectory
+
+    directory = {p.id: p.display_name for p in FixtureDirectory().payees()}
+    seeded = {a.account_id: a.display_name for a in SEED_ACCOUNTS if a.account_id in directory}
+    assert seeded, "no seed account matches the directory at all"
+    mismatched = {k: (v, directory[k]) for k, v in seeded.items() if v != directory[k]}
+    assert mismatched == {}, f"bank names drifted from the directory: {mismatched}"
+
+
+def test_seed_holds_two_different_people_who_both_answer_to_john():
+    """"send to John" is ambiguous because two different people answer to it.
+
+    Deliberately NOT "one person with two accounts" — that was the earlier
+    shape. The ambiguity is now "which John", and the names follow
+    backend/parser/directory.py, which is the source of truth.
+    """
+    johns = {a.account_id: a for a in SEED_ACCOUNTS if a.account_id in _AMBIGUOUS_JOHNS}
     assert len(johns) == 2
-    assert {a.account_id for a in johns} == {"payee-001", "payee-102"}
-    assert {a.masked_account for a in johns} == {"****1234", "****8892"}
+    assert all(a.display_name.startswith("John") for a in johns.values())
+    # Different people, not the same person twice.
+    assert johns["payee-101"].display_name != johns["payee-102"].display_name
+    assert {a.masked_account for a in johns.values()} == {"****4521", "****8892"}
 
 
 def test_seed_source_account_matches_the_fixtures():

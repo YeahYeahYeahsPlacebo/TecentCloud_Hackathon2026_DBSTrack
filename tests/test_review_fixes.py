@@ -414,11 +414,10 @@ def test_the_question_form_audit_row_carries_the_original_transcript():
     assert "fifty" not in row.payload["transcript"]
 
 
-def test_the_payee_form_audit_row_still_names_the_draft_it_came_from():
-    """Left alone on purpose: adding `transcript` to this row means editing
-    `_clarify_payee`, which Member 1 is changing in their PR. The row still
-    carries from_draft_id/to_draft_id, so nothing is lost — this just pins
-    that the row I did not touch is the one that is still written."""
+def test_the_payee_form_audit_row_carries_the_transcript_too():
+    """Same reasoning as the question form: "payee-102" in an audit row names
+    nobody on its own. §4 asks for the transcript and the answer to be stored
+    separately, on both forms of /api/clarify."""
     ambiguous = live(load("ambiguous_payee.json"))
     api = make_api(ambiguous)
     draft_id = api.message({"transcript": "Send fifty dollars to John."})["items"][0][
@@ -427,5 +426,9 @@ def test_the_payee_form_audit_row_still_names_the_draft_it_came_from():
     api.clarify({"draft_id": draft_id, "field": "payee", "answer": "payee-102"})
 
     row = api.audit.rows[-1]
-    assert row.payload["from_draft_id"] == draft_id
+    assert row.event == "clarify"
+    assert row.payload["transcript"] == ambiguous.transcript
     assert row.payload["answer"] == "payee-102"
+    assert row.payload["from_draft_id"] == draft_id
+    # The answer is never merged into the transcript.
+    assert "payee-102" not in row.payload["transcript"]
