@@ -268,8 +268,8 @@
             if (responseGen !== messageGen) return;
             renderApiDraftInto(draft, hash, validator, policy, placeholderId);
             var card = document.getElementById(placeholderId).querySelector(".card");
-            if (!card.querySelector(".js-hear-question")) DctaVoice.attachDraftReadback(card, draft, false, idx);
-            speechCards.push({ card: card, draft: draft, index: idx,
+            if (!card.querySelector(".js-hear-question")) DctaVoice.attachDraftReadback(card, draft, false, idx, validator, policy);
+            speechCards.push({ card: card, draft: draft, validator: validator, policy: policy, index: idx,
               anchor: card.querySelector(".js-hear-question, .js-draft-readback") });
           })
           .catch(function (err) {
@@ -1329,7 +1329,6 @@
   // card's content — other cards on screen are untouched. The server
   // returns a new draft with a new id and nonce.
   function renderClarifySuccessInto(body, cardEl) {
-    DctaVoice.reset();
     var parsed = parseMessageResponse(body);
     if (!parsed) {
       cardEl.innerHTML =
@@ -1358,9 +1357,9 @@
         canonical.draftHashAsync(draft)
           .then(function (hash) {
             var inner = cardEl.querySelector('[' + marker + ']');
-            if (!inner) return;
+            if (!cardEl.isConnected || !inner) return;
             renderServerDraftInto(draft, hash, validator, policy, inner);
-            DctaVoice.attachDraftReadback(inner.querySelector(".card"), draft, true);
+            DctaVoice.resolvedCard(cardEl, inner.querySelector(".card"), draft, validator, policy);
           })
           .catch(function (err) {
             var inner = cardEl.querySelector('[' + marker + ']');

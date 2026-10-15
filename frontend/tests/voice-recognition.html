@@ -4,7 +4,7 @@
 <!-- Standalone browser test: open /tests/voice-recognition.html on the demo server.
      No app.js, network API calls, microphone or speech service is used. -->
 <textarea id="text-input"></textarea>
-<button id="send-btn">Send</button><button id="mic-btn">Hold to talk</button>
+<button id="send-btn">Send</button><button id="mic-btn">Tap to talk</button>
 <p id="voice-status"></p><p id="voice-preview" hidden></p>
 <div id="draft-display"></div><pre id="test-results">Running…</pre>
 <script>
@@ -40,7 +40,7 @@ function emit(recognizer, words) {
     catch (error) { results.push({ name: name, passed: false, error: error.message }); }
   }
   function assert(value, message) { if (!value) throw Error(message); }
-  function key(type) { mic.dispatchEvent(new KeyboardEvent(type, { key: ' ', bubbles: true, cancelable: true })); }
+  function key(type) { mic.click(); }
   DctaVoice.init();
   key('keydown');
   var first = recognizers[0];
@@ -51,11 +51,11 @@ function emit(recognizer, words) {
     emit(first, [['Send fifty dollars', true], ['to John', true]]);
     assert(input.value === 'Send fifty dollars to John', 'Finals lost or duplicated');
   });
-  test('Release uses stop once, never abort', function () {
-    key('keyup'); key('keyup');
-    assert(first.stops === 1 && first.aborts === 0, 'Normal release did not finish gracefully');
+  test('Stop uses stop once, never abort', function () {
+    key('keyup');
+    assert(first.stops === 1 && first.aborts === 0, 'Normal stop did not finish gracefully');
   });
-  test('Late final survives release, focus loss and five seconds of latency', function () {
+  test('Late final survives stop, focus loss and five seconds of latency', function () {
     mic.dispatchEvent(new Event('blur'));
     advance(5000);
     emit(first, [['Send fifty dollars', true], ['to John Lee', true]]);
@@ -81,12 +81,12 @@ function emit(recognizer, words) {
     emit(current, [['stale words', true]]);
     assert(current.aborts === 1 && input.value === 'Send fifty dollars to John', 'Stale final overwrote message');
   });
-  test('Held recording restarts and preserves a long two-transfer sentence exactly once', function () {
+  test('Tap recording restarts and preserves a long two-transfer sentence exactly once', function () {
     key('keydown'); var current = recognizers.at(-1);
     assert(current.continuous === true, 'Continuous recognition not requested');
     emit(current, [['Send fifty dollars to John', true]]);
     current.onend();
-    assert(send.disabled && mic.getAttribute('aria-pressed') === 'true', 'Browser end finished a held session');
+    assert(send.disabled && mic.getAttribute('aria-pressed') === 'true', 'Browser end finished a active session');
     emit(current, [['stale duplicated first clause', true]]);
     advance(200); var restarted = recognizers.at(-1);
     assert(restarted !== current, 'Recognizer not restarted');
@@ -97,21 +97,21 @@ function emit(recognizer, words) {
     emit(restarted, [['and send thirty dollars', true], ['to Jane Tan.', true]]);
     restarted.onend(); advance(200);
     assert(input.value === 'Send fifty dollars to John and send thirty dollars to Jane Tan.', 'Late final after restart lost');
-    assert(!send.disabled && recognizers.at(-1) === restarted && restarted.stops === 1, 'Release restarted or did not stop');
+    assert(!send.disabled && recognizers.at(-1) === restarted && restarted.stops === 1, 'Stop restarted or did not stop');
   });
-  test('Release during restart gap prevents another recognizer', function () {
+  test('Stop during restart gap prevents another recognizer', function () {
     key('keydown'); var current = recognizers.at(-1), count = recognizers.length;
     emit(current, [['fifty dollars', true]]); current.onend(); key('keyup'); advance(200);
-    assert(recognizers.length === count && !send.disabled, 'Restart survived release');
+    assert(recognizers.length === count && !send.disabled, 'Restart survived stop');
   });
-  test('Permission denial never restarts while held', function () {
+  test('Permission denial never restarts while active', function () {
     key('keydown'); var current = recognizers.at(-1), count = recognizers.length;
     current.onerror({error:'not-allowed'}); current.onend(); advance(200);
     assert(recognizers.length === count && current.aborts === 1 && !send.disabled, 'Permission denial restarted');
     assert(document.getElementById('voice-status').textContent.includes('denied'), 'No denial feedback');
   });
   test('Tap mode starts, survives browser end, and stops with a second tap', function () {
-    var toggle = document.getElementById('mic-toggle-btn'); toggle.click(); var current = recognizers.at(-1);
+    var toggle = document.getElementById('mic-btn'); toggle.click(); var current = recognizers.at(-1);
     emit(current, [['Send fifty dollars',true]]); current.onend(); advance(200);
     var restarted = recognizers.at(-1); emit(restarted, [['to John Smith',true]]);
     toggle.click(); restarted.onend(); advance(200);
@@ -120,10 +120,10 @@ function emit(recognizer, words) {
   test('Repeated empty endings are bounded with a visible fallback', function () {
     key('keydown'); for (var n=0;n<3;n++){recognizers.at(-1).onend();advance(200)}
     var count=recognizers.length;advance(1000);
-    assert(recognizers.length===count&&!send.disabled&&document.getElementById('voice-status').textContent.includes('tap-to-start'), 'Empty restart loop unbounded');
+    assert(recognizers.length===count&&!send.disabled&&document.getElementById('voice-status').textContent.includes('Tap to talk'), 'Empty restart loop unbounded');
   });
-  test('Pointer cancellation stops all restarts and ignores stale finals', function () {
-    key('keydown'); var current=recognizers.at(-1);mic.dispatchEvent(new Event('pointercancel'));
+  test('Cancellation stops all restarts and ignores stale finals', function () {
+    key('keydown'); var current=recognizers.at(-1);DctaVoice.reset();
     var before=input.value;current.onend();emit(current,[['stale',true]]);advance(200);
     assert(current.aborts===1&&input.value===before&&!send.disabled,'Cancellation leaked a restart/result');
   });

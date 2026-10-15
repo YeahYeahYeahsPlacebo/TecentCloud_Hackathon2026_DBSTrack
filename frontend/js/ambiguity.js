@@ -53,14 +53,6 @@
     var selected = controls.querySelector(".js-answer-selected");
     var confirm = card.querySelector(".js-clarify-confirm");
     var buttons = card.querySelectorAll(".candidate-btn");
-    function clearSelection() {
-      Array.prototype.forEach.call(buttons, function (button) {
-        button.classList.remove("selected"); button.setAttribute("aria-pressed", "false");
-        button.querySelector(".candidate-check").style.display = "none";
-      });
-      confirm.disabled = true;
-      selected.textContent = "Selected: none.";
-    }
     function showSelection() {
       var button = card.querySelector(".candidate-btn.selected");
       var candidate = button && candidates.find(function (candidate) { return candidate.id === button.getAttribute("data-candidate-id"); });
@@ -79,22 +71,23 @@
     DctaVoice.wireAnswer({
       card: card, button: controls.querySelector(".js-answer-voice"), status: status,
       preview: controls.querySelector(".js-answer-preview"),
-      onStart: function () { clearSelection(); heard.textContent = "Heard: listening…"; },
-      onHeard: function (text) { heard.textContent = "Heard: “" + text + "” (finishing recognition)."; },
+      onStart: function () { heard.textContent = "Heard: listening… Your current selection is unchanged."; },
+      isUnique: function (text) { return matchAnswer(text, candidates).length === 1; },
+      onHeard: function (text) { heard.textContent = "Heard: “" + text + "” (final words)."; },
       onFinal: function (text) {
-        if (!card.isConnected || card.getAttribute("data-clarify-in-flight") === "true") return;
+        if (!card.isConnected || !controls.isConnected || card.getAttribute("data-clarify-in-flight") === "true") return false;
         heard.textContent = "Heard: “" + text + "”.";
         var matches = matchAnswer(text, candidates);
-        clearSelection();
         if (matches.length !== 1) {
-          status.textContent = matches.length > 1 ? "That matches more than one payee. Say the full name or account ending, or tap a payee." : "No clear match to the offered payees. Try again or tap a payee.";
-          return;
+          status.textContent = matches.length > 1 ? "That matches more than one payee. Say the full name or account ending, or tap a payee." : "No clear match to the offered payees. Try again or tap a payee. Your selection is unchanged. Retry voice answer if needed.";
+          return false;
         }
         // Reuse the existing tap handler; it stores only the offered candidate ID.
         var filter = card.querySelector(".js-payee-filter");
         filter.value = ""; filter.dispatchEvent(new Event("input"));
         Array.prototype.find.call(buttons, function (button) { return button.getAttribute("data-candidate-id") === matches[0].id; }).click();
         status.textContent = "Review the selected payee, then click Confirm selection. Nothing was submitted by voice.";
+        return true;
       }
     });
   }

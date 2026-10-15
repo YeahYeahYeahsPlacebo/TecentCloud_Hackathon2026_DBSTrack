@@ -3,12 +3,12 @@
 <textarea id="text-input">Original message</textarea><button id="send-btn">Send</button><button id="mic-btn">Mic</button>
 <p id="voice-status"></p><p id="voice-preview"></p><div id="draft-display"></div><pre id="test-results">Running</pre>
 <script>
-var recognizers=[],spoken=[],cancellations=0;
+var recognizers=[],spoken=[],cancellations=0,speechActive=false;
 window.SpeechRecognition=class{
- constructor(){recognizers.push(this)}start(){this.onstart()}stop(){}abort(){this.aborted=true}
+ constructor(){recognizers.push(this)}start(){this.ttsAtStart=speechActive;this.onstart()}stop(){}abort(){this.aborted=true}
 };
 window.SpeechSynthesisUtterance=class{constructor(text){this.text=text}};
-Object.defineProperty(window,'speechSynthesis',{value:{speak(u){spoken.push(u)},cancel(){cancellations++}},configurable:true});
+Object.defineProperty(window,'speechSynthesis',{value:{speak(u){speechActive=true;spoken.push(u)},cancel(){speechActive=false;cancellations++}},configurable:true});
 </script>
 <script src="../js/voice.js"></script><script src="../js/ambiguity.js"></script>
 <script>
@@ -24,19 +24,19 @@ Object.defineProperty(window,'speechSynthesis',{value:{speak(u){spoken.push(u)},
   document.getElementById('draft-display').append(root);DctaAmbiguity.attach(root,candidates);return root;
  }
  DctaVoice.init();var a=card(),b=card();
- function answer(root,text){root.querySelector('.js-answer-voice').click();var r=recognizers.at(-1);r.onresult({results:[{0:{transcript:text},isFinal:true}]});root.querySelector('.js-answer-voice').click();r.onend();return r}
+ function answer(root,text){root.querySelector('.js-answer-voice').click();var r=recognizers.at(-1);r.onresult({results:[{0:{transcript:text},isFinal:true}]});if(root.querySelector('.js-answer-voice').getAttribute('aria-pressed')==='true')root.querySelector('.js-answer-voice').click();r.onend();return r}
  function selected(root){return root.querySelector('.candidate-btn.selected')?.dataset.candidateId}
  test('Question uses supplied names and suffixes',()=>assert(a.querySelector('.clarify-prompt').textContent==='I found Maya Tan ending in 1357, Maya Lim ending in 2468 and Maya Ng ending in 9753. Which one did you mean?','Wrong question'));
  test('Hear question speaks that card question',()=>{a.querySelector('.js-hear-question').click();assert(spoken.at(-1).text===a.querySelector('.clarify-prompt').textContent,'Wrong audio')});
- test('Unique offered name selects only after final end',()=>{a.querySelector('.js-answer-voice').click();let r=recognizers.at(-1);r.onresult({results:[{0:{transcript:'Maya Lim'},isFinal:true}]});assert(!selected(a),'Selected too early');a.querySelector('.js-answer-voice').click();r.onend();assert(selected(a)==='b','Wrong selection')});
+ test('Unique final name naturally stops and highlights without a Finish click',()=>{a.querySelector('.js-answer-voice').click();let r=recognizers.at(-1);r.onresult({results:[{0:{transcript:'Maya Lim'},isFinal:true}]});assert(!r.ttsAtStart&&selected(a)==='b'&&a.querySelector('.js-answer-voice').getAttribute('aria-pressed')==='false','Speech was active at mic start or did not stop naturally');r.onend()});
  test('Unique full suffix selects offered ID',()=>{answer(b,'ending in 1357');assert(selected(b)==='a','Wrong suffix')});
  test('Spoken digit suffix including one is supported',()=>{answer(b,'one three five seven');assert(selected(b)==='a','Spoken suffix lost digits')});
  test('Two cards keep heard words and selection separate',()=>{assert(selected(a)==='b'&&selected(b)==='a','Selections crossed');assert(a.querySelector('.js-answer-heard').textContent.includes('Maya Lim')&&!a.querySelector('.js-answer-heard').textContent.includes('one three'),'Heard text crossed')});
- test('Unclear answer clears own selection and keeps tap available',()=>{answer(a,'whatever');assert(!selected(a)&&a.querySelector('.js-clarify-confirm').disabled,'Unclear selected');a.querySelector('.candidate-btn').click();assert(selected(a)==='a','Tap unavailable')});
- test('Spoken yes never selects or confirms a payee',()=>{var calls=0;a.querySelector('.js-clarify-confirm').addEventListener('click',()=>calls++);answer(a,'yes');assert(!selected(a)&&a.querySelector('.js-clarify-confirm').disabled&&calls===0,'Yes authorized selection')});
- test('Shared name is ambiguous',()=>{answer(a,'Maya');assert(!selected(a)&&a.querySelector('.js-answer-status').textContent.includes('more than one'),'Ambiguity selected')});
+ test('Unclear answer preserves selection and offers Retry plus taps',()=>{answer(a,'whatever');assert(selected(a)==='b'&&a.querySelector('.js-answer-voice').textContent.includes('Retry'),'Unclear changed selection');a.querySelector('.candidate-btn').click();assert(selected(a)==='a','Tap unavailable')});
+ test('Spoken yes never selects or confirms a payee',()=>{var calls=0;a.querySelector('.js-clarify-confirm').addEventListener('click',()=>calls++);answer(a,'yes');assert(selected(a)==='a'&&calls===0,'Yes changed or authorized selection')});
+ test('Shared name is ambiguous',()=>{answer(a,'Maya');assert(selected(a)==='a'&&a.querySelector('.js-answer-status').textContent.includes('more than one'),'Partial name changed selection')});
  test('Partial suffix, unknown name, negation and conflicting clues fail closed',()=>{for(let word of ['135','not Maya Lim','Maya Tan ending in 2468','Maya Lim or Maya Tan','someone else'])assert(DctaAmbiguity.matchAnswer(word,candidates).length!==1,word+' selected')});
- test('New card microphone cancels old one and ignores late answer',()=>{a.querySelector('.js-answer-voice').click();let old=recognizers.at(-1);b.querySelector('.js-answer-voice').click();old.onresult({results:[{0:{transcript:'Maya Tan'},isFinal:true}]});old.onend();assert(old.aborted&&!selected(a),'Stale answer selected');DctaVoice.reset()});
+ test('New card microphone cancels old one and ignores late answer',()=>{a.querySelector('.js-answer-voice').click();let old=recognizers.at(-1);b.querySelector('.js-answer-voice').click();old.onresult({results:[{0:{transcript:'Maya Tan'},isFinal:true}]});old.onend();assert(old.aborted&&selected(a)==='a','Stale answer changed selection');DctaVoice.reset()});
  test('Amount read-back still repeats only the server amount and shares audio cancellation',()=>{
   var amountCard=document.createElement('div');document.getElementById('draft-display').append(amountCard);
   DctaVoice.attachReadback(amountCard,{amount:{value:'73.25',currency:'SGD'}});
@@ -53,6 +53,10 @@ Object.defineProperty(window,'speechSynthesis',{value:{speak(u){spoken.push(u)},
  });
  test('Voice never edits the main message',()=>assert(document.getElementById('text-input').value==='Original message','Message overwritten'));
  test('No automatic confirmation',()=>{let count=0;for(let root of [a,b])root.querySelector('.js-clarify-confirm').addEventListener('click',()=>count++);answer(a,'Maya Lim');assert(count===0&&!a.querySelector('.js-clarify-confirm').disabled,'Auto confirmation')});
+ test('Silence, permission denial and recognition errors preserve selection and offer Retry',()=>{for(let error of ['no-speech','not-allowed','network']){a.querySelector('.js-answer-voice').click();let r=recognizers.at(-1);r.onerror({error});r.onend();assert(selected(a)==='b'&&a.querySelector('.js-answer-voice').textContent.includes('Retry'),'Error changed selection: '+error)}});
+ test('Interim or partial shared name never commits to a new selection',()=>{a.querySelector('.js-answer-voice').click();let r=recognizers.at(-1);r.onresult({results:[{0:{transcript:'Maya'},isFinal:false}]});assert(selected(a)==='b'&&a.querySelector('.js-answer-voice').getAttribute('aria-pressed')==='true','Interim committed');r.onresult({results:[{0:{transcript:'Maya'},isFinal:true}]});assert(selected(a)==='b','Partial final committed');r.onend();assert(a.querySelector('.js-answer-voice').textContent.includes('Retry'),'No retry')});
+ test('A replaced card ignores late final and end callbacks',()=>{a.querySelector('.js-answer-voice').click();let r=recognizers.at(-1);a.remove();r.onresult({results:[{0:{transcript:'Maya Tan'},isFinal:true}]});r.onend();assert(selected(a)==='b','Detached card accepted answer');DctaVoice.reset()});
+ test('Stop listening remains a fallback for an unclear answer',()=>{var c=card();c.querySelector('.js-answer-voice').click();var r=recognizers.at(-1);r.onresult({results:[{0:{transcript:'Maya'},isFinal:true}]});assert(c.querySelector('.js-answer-voice').textContent==='Stop listening','No Stop fallback');c.querySelector('.js-answer-voice').click();r.onend();assert(!selected(c)&&c.querySelector('.js-answer-voice').textContent.includes('Retry'),'Stop committed an unclear answer')});
  // A fresh realm loads voice.js with recognition explicitly unavailable.
  var frame=document.createElement('iframe');document.body.append(frame);
  frame.srcdoc='<textarea id="text-input"></textarea><button id="send-btn"></button><button id="mic-btn"></button><p id="voice-status"></p><p id="voice-preview"></p><div id="draft-display"></div><script>window.SpeechRecognition=undefined;window.webkitSpeechRecognition=undefined;<\/script><script src="/js/voice.js"><\/script><script> DctaVoice.init();parent.postMessage("unsupported-ready",location.origin);<\/script>';
