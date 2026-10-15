@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Optional, NoReturn
 
 from backend.llm.text import sanitise
+from backend.models.draft import TransactionDraft
 from backend.parser.amount_rules import resolve_currency
 from backend.parser.directory import PayeeDirectory, match_payees
 from backend.parser.interface import ParserCannotHandle
@@ -68,6 +69,13 @@ def independent_transfer_clauses(transcript: str, directory: Optional[PayeeDirec
         reading = spoken_amount(money)
         if reading.status != "exact" or resolve_currency(money) != "SGD" or Decimal(reading.value) <= 0:
             _refuse()
+        # The amount reader must consume the entire numeric phrase, not
+        # ignore a stray word such as "zero" in "zero fifty dollars".
+        start, end = reading.span
+        if money[:start].strip().lower() not in ("", "sgd", "$", "sgd $") or money[end:].strip().lower() not in (
+            "", "dollar", "dollars", "sgd", "singapore dollar", "singapore dollars",
+        ):
+            _refuse()
         recipient = recipient.rstrip(".,").strip()
         offered = match_payees(recipient, directory, context=clause)
         phrase = recipient.casefold()
@@ -77,3 +85,26 @@ def independent_transfer_clauses(transcript: str, directory: Optional[PayeeDirec
         ):
             _refuse()
     return clauses[0], clauses[1]
+
+
+def independent_draft_matches(clause: str, draft: TransactionDraft, directory: PayeeDirectory) -> bool:
+    """Bind parser output to this clause before any draft is published.
+
+    The independent validator still runs. This extra deterministic boundary
+    prevents a parser from swapping amounts/payees or guessing an ambiguous
+    name, even if a later validator were to miss that mismatch.
+    """
+    money, recipient = _CLAUSE.fullmatch(clause).groups()
+    offered = match_payees(recipient.rstrip(".,").strip(), directory, context=clause)
+    expected = {p.id: {"id": p.id, "display_name": p.display_name, "masked_account": p.masked_account} for p in offered}
+    if (draft.transcript != clause or draft.intent_type != "transfer"
+            or draft.source_account != directory.default_source_account()
+            or draft.amount.value != spoken_amount(money).value or draft.amount.currency != "SGD"):
+        return False
+    if len(offered) == 1:
+        return (not draft.unresolved and draft.payee is not None and not draft.payee_candidates
+                and draft.payee.model_dump() == expected[offered[0].id])
+    actual = draft.payee_candidates or []
+    return (draft.unresolved == ["payee"] and draft.payee is None and len(actual) >= 2
+            and len({p.id for p in actual}) == len(actual)
+            and all(p.model_dump() == expected.get(p.id) for p in actual))

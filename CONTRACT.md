@@ -474,7 +474,11 @@ The split is deterministic and verbatim. Conditions, sequencing, shared referenc
 source-account overrides, bills, equities and more than two requests remain
 `422 multi_intent_unsupported`; general grouped execution stays deferred.
 
-Both clauses must parse to transfer drafts before either is stored. The response
+Both clauses must parse to transfer drafts before either is stored. Each amount,
+source account and offered payee is checked against its own clause and directory.
+Both validator/policy evaluations and the original-message audit must succeed
+before either draft or verdict is published. Processing errors return HTTP 500
+and publish neither item; explicit freeze/hold/block results remain visible per item. The response
 has `intents_detected: 2` and two ordinary draft items, each with a distinct ID,
 nonce, canonical hash, validator verdict and policy decision. Each draft's
 `transcript` is its exact trimmed clause, so the existing independent validator

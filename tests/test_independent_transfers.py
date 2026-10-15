@@ -99,18 +99,14 @@ def test_default_validator_still_freezes_each_independent_draft():
         assert gateway.challenge({'draft_id': item['draft']['id']})['reason_code'] == 'validator_frozen'
 
 
-def test_validator_checks_both_clauses_and_freezes_only_the_tampered_draft():
-    from backend.models.draft import Money
-    def tampered_parser(text):
-        result = parse(text)
-        if 'Jane' in text:
-            draft = result.items[0]
-            result.items[0] = draft.model_copy(update={'amount': Money(value='31.00', currency='SGD')})
-        return result
-    items = api(parser=tampered_parser).message({'transcript': TEXT})['items']
+def test_validator_verdicts_remain_independent():
+    directory = FixtureDirectory()
+    class FreezeSecond:
+        def validate(self, draft, transcript, clarification=None):
+            result = StubValidator(directory=directory).validate(draft, transcript, clarification=clarification)
+            return result.model_copy(update={'verdict': 'freeze'}) if 'Jane' in transcript else result
+    items = api(validator=FreezeSecond()).message({'transcript': TEXT})['items']
     assert [item['validator']['verdict'] for item in items] == ['pass', 'freeze']
-    assert items[0]['draft']['amount']['value'] == '50.00'
-    assert items[1]['draft']['amount']['value'] == '31.00'
 
 
 def test_policy_blocks_one_transfer_without_relabelling_the_other():
@@ -129,3 +125,118 @@ def test_parser_cannot_replace_a_childs_verbatim_source_transcript():
     with pytest.raises(ParserContractViolation):
         gateway.message({'transcript': TEXT})
     assert not gateway.store
+
+
+@pytest.mark.parametrize('change', ['amount', 'payee', 'guess', 'source', 'candidate', 'id', 'nonce'])
+def test_parser_cross_clause_changes_never_publish_either_draft(change):
+    from backend.models.draft import Money, Payee
+    from backend.gateway.message import ParserContractViolation
+    first = None
+    def changed(text):
+        nonlocal first
+        result = parse(text)
+        d = result.items[0]
+        if first is None:
+            first = d
+            if change == 'guess':
+                result.items[0] = d.model_copy(update={'payee': Payee(id='payee-101', display_name='John Doe', masked_account='****4521'), 'payee_candidates': None, 'unresolved': []})
+            elif change == 'candidate':
+                result.items[0] = d.model_copy(update={'payee_candidates': [c.model_copy(update={'masked_account': '****0000'}) for c in d.payee_candidates]})
+        elif change == 'amount':
+            result.items[0] = d.model_copy(update={'amount': first.amount})
+        elif change == 'payee':
+            result.items[0] = d.model_copy(update={'payee': first.payee})
+        elif change == 'source':
+            result.items[0] = d.model_copy(update={'source_account': 'other-account'})
+        elif change in ('id', 'nonce'):
+            result.items[0] = d.model_copy(update={change: getattr(first, change)})
+        return result
+    gateway = api(parser=changed)
+    text = TEXT if change not in ('guess', 'candidate') else TEXT.replace('John Smith', 'John')
+    with pytest.raises(ParserContractViolation):
+        gateway.message({'transcript': text})
+    assert not gateway.store and not gateway.verdicts
+
+
+@pytest.mark.parametrize('money', ['zero fifty dollars', 'fifty and dollars', 'fifty . dollars', 'about fifty dollars', '50 30 dollars', 'fifty or thirty dollars', '50 USD', '50 dollars maybe'])
+def test_uncertain_or_unconsumed_amount_words_fail_closed(money):
+    gateway = api()
+    result = gateway.message({'transcript': TEXT.replace('fifty dollars', money)})
+    assert result['reason_code'] == 'multi_intent_unsupported'
+    assert not gateway.store and not gateway.verdicts
+
+
+@pytest.mark.parametrize('stage', ['validator', 'policy', 'audit', 'store', 'verdict_store'])
+def test_partial_failure_leaves_no_new_draft_or_passing_verdict(stage):
+    gateway = api()
+    # An existing unrelated draft and verdict must survive rollback.
+    gateway.message({'transcript': 'Send ten dollars to John Smith.'})
+    before_store, before_verdicts = dict(gateway.store), dict(gateway.verdicts)
+    if stage == 'validator':
+        class BrokenValidator:
+            def validate(self, draft, transcript, clarification=None):
+                assert gateway.store == before_store and gateway.verdicts == before_verdicts
+                if 'Jane' in transcript: raise RuntimeError('validation failed')
+                return StubValidator(directory=FixtureDirectory()).validate(draft, transcript, clarification=clarification)
+        gateway.messages.validator = BrokenValidator()
+    elif stage == 'policy':
+        original = gateway.messages.policy
+        class BrokenPolicy:
+            def evaluate(self, draft, *args, **kwargs):
+                assert gateway.store == before_store and gateway.verdicts == before_verdicts
+                if 'Jane' in draft['transcript']: raise RuntimeError('policy failed')
+                return original.evaluate(draft, *args, **kwargs)
+        gateway.messages.policy = BrokenPolicy()
+    elif stage == 'audit':
+        class BrokenAudit:
+            def append(self, *args): raise RuntimeError('audit failed')
+        gateway.messages.audit = BrokenAudit()
+    else:
+        class BrokenStore(dict):
+            writes = 0
+            def __setitem__(self, key, value):
+                self.writes += 1
+                if self.writes == 2: raise RuntimeError('publication failed')
+                super().__setitem__(key, value)
+        if stage == 'store': gateway.store = gateway.messages.store = BrokenStore(before_store)
+        else: gateway.verdicts = gateway.messages.verdicts = BrokenStore(before_verdicts)
+    response = TestClient(create_app(gateway, serve_frontend=False), raise_server_exceptions=False).post('/api/message', json={'transcript': TEXT})
+    assert response.status_code == 500
+    assert response.json()['reason_code'] == 'internal_error'
+    assert gateway.store == before_store and gateway.verdicts == before_verdicts
+
+
+def test_original_combined_transcript_is_audited_and_clarify_preserves_other_binding():
+    from backend.canonical import draft_hash
+    gateway = api()
+    text = TEXT.replace('John Smith', 'John')
+    body = gateway.message({'transcript': text})
+    row = gateway.audit.rows[-1]
+    assert row.payload['transcript'] == text
+    assert row.payload['drafts'] == [x['draft']['id'] for x in body['items']]
+    first, second = body['items']
+    other_id = second['draft']['id']
+    other_hash = draft_hash(second['draft'])
+    other_draft = gateway.store[other_id]
+    other_verdict = gateway.verdicts[other_hash]
+    result = gateway.clarify({'draft_id': first['draft']['id'], 'field': 'payee', 'answer': first['draft']['payee_candidates'][0]['id']})
+    new = result['items'][0]
+    assert new['draft']['id'] != first['draft']['id']
+    assert new['validator']['draft_hash'] == draft_hash(new['draft'])
+    assert gateway.store[other_id] is other_draft and gateway.verdicts[other_hash] == other_verdict
+    assert gateway.policy.evaluate(second['draft'], other_hash, posted=[], known_payees=set()).to_response() == second['policy']
+
+
+def test_wrong_hash_verdict_freezes_only_its_own_binding():
+    from backend.canonical import draft_hash
+    directory = FixtureDirectory()
+    class WrongSecondHash:
+        def validate(self, draft, transcript, clarification=None):
+            result = StubValidator(directory=directory).validate(draft, transcript, clarification=clarification)
+            return result.model_copy(update={'draft_hash': '0' * 64}) if 'Jane' in transcript else result
+    gateway = api(validator=WrongSecondHash())
+    items = gateway.message({'transcript': TEXT})['items']
+    hashes = [draft_hash(x['draft']) for x in items]
+    assert gateway.verdicts == {hashes[0]: 'pass', hashes[1]: 'freeze'}
+    assert [x['validator']['verdict'] for x in items] == ['pass', 'freeze']
+    assert '0' * 64 not in gateway.verdicts
