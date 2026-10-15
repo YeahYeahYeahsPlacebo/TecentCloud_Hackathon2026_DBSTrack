@@ -37,7 +37,8 @@ from backend.gateway import reason_codes as R
 from backend.gateway.errors import rejection_response
 from backend.models.draft import TransactionDraft
 from backend.parser.clarify import resolve_payee, resolve_question
-from backend.parser.interface import InvalidClarificationAnswer, ParserCannotHandle
+from backend.parser.interface import InvalidClarificationAnswer, ParserCannotHandle, ParseResult
+from backend.parser.independent import independent_transfer_clauses, independent_draft_matches
 from backend.policy import PolicyEngine
 
 # CONTRACT.md §8 open question 3: the fixtures use 5 minutes, but the intended
@@ -226,15 +227,20 @@ class MessageService:
         answer against the draft — the answer is never merged into the
         transcript.
         """
+        item = self._prepare(draft, clarification)
+        self._publish(draft, item)
+        return item
+
+    def _publish(self, draft: TransactionDraft, item: dict) -> None:
         self.store[draft.id] = draft
+        if self.verdicts is not None:
+            self.verdicts[draft_hash(item["draft"])] = str(item["validator"].get("verdict", ""))
+
+    def _prepare(self, draft: TransactionDraft, clarification: Optional[Any] = None) -> dict:
+        """Validate and evaluate policy without publishing draft/verdict state."""
         dumped = dump(draft)
         digest = draft_hash(dumped)
         verdict = self._run_validator(draft, dumped, digest, clarification=clarification)
-        if self.verdicts is not None:
-            # Recorded by hash so /api/execute check 11 can find it. Without
-            # this the gateway's fail-closed default would reject everything
-            # the server itself just offered to the user.
-            self.verdicts[digest] = str(verdict.get("verdict", ""))
         decision = self.policy.evaluate(
             dumped,
             digest,
@@ -347,10 +353,27 @@ class MessageService:
             return rejection_response(R.MALFORMED_REQUEST, "'transcript' must be a non-empty string")
 
         try:
-            result = self.parser(transcript)
+            clauses = independent_transfer_clauses(transcript, self.directory)
+            if clauses is None:
+                result = self.parser(transcript)
+            else:
+                # Parse both before storing either. Do not silently drop an
+                # intent, accept a model-created split, or turn this into a group.
+                results = [self.parser(clause) for clause in clauses]
+                for clause, child in zip(clauses, results):
+                    if child.intents_detected != 1 or len(child.items) != 1:
+                        raise ParserContractViolation("each independent clause must produce exactly one item")
+                    if not isinstance(child.items[0], TransactionDraft) or child.items[0].intent_type != "transfer":
+                        raise ParserCannotHandle(
+                            "Please send these requests separately; each independent clause must produce a transfer draft.",
+                            reason="multi-intent unsupported",
+                        )
+                    if child.pending or not independent_draft_matches(clause, child.items[0], self.directory):
+                        raise ParserContractViolation("independent draft must match its verbatim source clause and offered payees")
+                result = ParseResult(items=[child.items[0] for child in results], intents_detected=2)
         except ParserCannotHandle as exc:
-            # CONTRACT.md §8 open question 4 (Resolved): before phase 5, a
-            # transcript describing more than one transaction is refused with
+            # Outside the narrow independent-transfer exception, before phase 5
+            # a transcript describing more than one transaction is refused with
             # nothing drafted. The parser raises rather than dropping one of
             # two intents; the gateway is what turns that into a rejection,
             # because "reject with a reason code" is a gateway job.
@@ -366,6 +389,9 @@ class MessageService:
         # PendingQuestion; the client sees only the ClarifyingQuestion.
         for question_id, pending_state in (result.pending or {}).items():
             self.pending[question_id] = pending_state
+
+        if clauses is not None:
+            return self._independent_response(result.items, transcript)
 
         items = []
         for item in result.items:
@@ -383,6 +409,33 @@ class MessageService:
             },
         )
         return {"intents_detected": result.intents_detected, "items": items}
+
+    def _independent_response(self, drafts: list, transcript: str) -> dict:
+        # No draft or passing verdict becomes visible until BOTH validators,
+        # BOTH policy evaluations and the original-transcript audit succeed.
+        ids = [d.id for d in drafts]
+        nonces = [d.nonce for d in drafts]
+        digests = [draft_hash(dump(d)) for d in drafts]
+        if (len(set(ids)) != 2 or len(set(nonces)) != 2 or len(set(digests)) != 2
+                or any(key in self.store for key in ids)
+                or (self.verdicts is not None and any(key in self.verdicts for key in digests))):
+            raise ParserContractViolation("independent drafts must have fresh distinct identities")
+        items = [self._prepare(draft) for draft in drafts]
+        self._record("message", {"transcript": transcript, "intents_detected": 2, "drafts": ids})
+        try:
+            for draft, item in zip(drafts, items):
+                self._publish(draft, item)
+        except Exception:
+            # Also fail closed for a store implementation that raises during
+            # publication. Only this request's fresh keys may be removed.
+            for key in ids:
+                self.store.pop(key, None)
+            if self.verdicts is not None:
+                for key in digests:
+                    self.verdicts.pop(key, None)
+            raise
+        return {"intents_detected": 2, "items": items,
+                "request_mode": "independent_transfers", "source_transcript": transcript}
 
     # ── POST /api/clarify ─────────────────────────────────────────────
 
