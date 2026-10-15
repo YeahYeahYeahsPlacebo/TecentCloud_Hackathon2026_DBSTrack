@@ -17,7 +17,9 @@ function advance(ms) {
     if (entry[1].at <= clock && timers.delete(entry[0])) entry[1].fn();
   });
 }
-var recognizers = [];
+var recognizers = [], audioActive = false, audioCancels = 0;
+window.SpeechSynthesisUtterance = class { constructor(text) { this.text = text; } };
+Object.defineProperty(window, 'speechSynthesis', {configurable:true,value:{speak(u){audioActive=true;u.onstart()},cancel(){audioActive=false;audioCancels++}}});
 window.SpeechRecognition = class {
   constructor() { this.stops = 0; this.aborts = 0; recognizers.push(this); }
   start() { this.onstart(); }
@@ -131,6 +133,16 @@ function emit(recognizer, words) {
     var submissions=0;send.addEventListener('click',()=>submissions++);
     key('keydown');var current=recognizers.at(-1);emit(current,[['yes send it',true]]);key('keyup');current.onend();
     assert(submissions===0&&input.value==='yes send it','Speech submitted instead of filling editable text');
+  });
+  test('Starting the message microphone cancels active and pending old narration', function () {
+    var card=document.createElement('div');document.getElementById('draft-display').append(card);
+    var draft={amount:{value:'30.00',currency:'SGD'},payee:{display_name:'Jane Tan',masked_account:'****5678'},source_account:'source'};
+    DctaVoice.attachDraftReadback(card,draft,false,0,{verdict:'pass'},{decision:'allow'});
+    send.click();DctaVoice.queueCards([{card,draft,index:0,validator:{verdict:'pass'},policy:{decision:'allow'}}]);
+    assert(audioActive,'No test narration');var before=audioCancels;mic.click();
+    assert(!audioActive&&audioCancels>before&&mic.getAttribute('aria-pressed')==='true','Microphone did not cancel speech');
+    var r=recognizers.at(-1);emit(r,[['New editable message',true]]);mic.click();r.onend();
+    assert(!audioActive&&input.value==='New editable message','Old audio revived after mic stop');
   });
   window.voiceTestResults = results;
   document.getElementById('test-results').textContent = JSON.stringify(results, null, 2);

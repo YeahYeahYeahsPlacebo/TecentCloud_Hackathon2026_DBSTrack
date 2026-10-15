@@ -75,7 +75,11 @@
       if (session.target === target) return;
       cancelRecognition("Microphone stopped. You can still tap a payee or type your message.");
     }
-    cancelPlayback(); clearPreview();
+    // A new message microphone invalidates the old narration. Contextual
+    // payee answers only pause it so manual clarification can resume review.
+    if (!target) { reset(); autoReviewAllowed = false; }
+    else cancelPlayback();
+    clearPreview();
     var record = { recognition: null, finalText: "", completed: [], stopping: false,
       stopIssued: false, timer: null, restartTimer: null, emptyEnds: 0, target: target };
     session = record;
@@ -197,7 +201,6 @@
     // Abort pending microphone/playback on a new message, fixture or clarification.
     document.addEventListener("click", function (event) {
       if (event.target.closest(".js-clarify-confirm")) pause();
-      else if (event.target.closest("#cancel-spoken-review")) { reset(); autoReviewAllowed = false; }
       else if (event.target.closest(".btn-scenario, #send-btn")) { reset(); autoReviewAllowed = true; }
     }, true);
     // A detached/replaced card must never keep talking about an old draft.

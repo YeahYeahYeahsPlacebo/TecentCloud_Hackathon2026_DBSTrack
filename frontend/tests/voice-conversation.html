@@ -1,6 +1,6 @@
 <!doctype html><meta charset="utf-8"><title>Conversation speech sequence regression tests</title>
 <!-- Deterministic speech events; no microphone, speech service or transaction API calls. -->
-<textarea id="text-input"></textarea><button id="send-btn">Send</button><button id="mic-btn">Tap to talk</button><button id="cancel-spoken-review">Cancel spoken review</button>
+<textarea id="text-input"></textarea><button id="send-btn">Send</button><button id="mic-btn">Tap to talk</button>
 <p id="voice-status"></p><p id="voice-preview"></p><div id="draft-display"></div><pre id="test-results">Running</pre>
 <script>
 var spoken=[],active=0,overlaps=0,cancels=0,timers=new Map(),next=0;
@@ -33,7 +33,6 @@ function ended(){active=0;spoken.at(-1).onend()}
  test('Playback error retains manual replay/continue and never silently reads next item',()=>{fresh();a=known(0);b=known(1);DctaVoice.queueCards([a,b]);var n=spoken.length;spoken.at(-1).onerror();assert(spoken.length===n&&a.card.querySelector('.js-draft-readback').nextElementSibling.textContent.includes('blocked'),'Error advanced');a.card.querySelector('.js-draft-readback').click();ended();assert(spoken.at(-1).text.startsWith('Transaction 2.'),'Successful replay did not resume');ended()});
  test('Silent playback timeout offers Continue without crossing a question barrier',()=>{fresh();a=ambiguous(0);b=known(1);var original=speechSynthesis.speak;speechSynthesis.speak=u=>{active++;spoken.push(u)};DctaVoice.queueCards([a,b]);var n=spoken.length;Array.from(timers.values()).forEach(fn=>fn());speechSynthesis.speak=original;assert(active===0&&spoken.length===n&&a.card.querySelector('.js-question-status').textContent.includes('blocked'),'Silent block did not recover')});
  test('New message cancels active speech and invalidates old completions',()=>{var old=spoken.at(-1),n=spoken.length;document.getElementById('send-btn').click();old.onend();assert(spoken.length===n&&active===0,'Old continuation survived new message')});
- test('User cancel suppresses delayed narration and clarified-draft autoplay',()=>{fresh();a=ambiguous(0);b=known(1);DctaVoice.queueCards([a,b]);document.getElementById('cancel-spoken-review').click();var n=spoken.length;DctaVoice.queueCards([a,b]);resolve(a);assert(spoken.length===n&&active===0,'Cancel revived on delayed result')});
  fresh();a=ambiguous(0);b=known(1);DctaVoice.queueCards([a,b]);var old=spoken.at(-1),n=spoken.length;a.card.remove();await new Promise(resolve=>queueMicrotask(resolve));
  test('Removing a card cancels active and pending review',()=>{old.onend();assert(active===0&&spoken.length===n,'Removed card kept talking')});
  test('Unsupported recognition leaves typing, tap choices and skip available',()=>{fresh();a=ambiguous(0);DctaVoice.queueCards([a]);assert(document.getElementById('mic-btn').disabled&&!document.getElementById('text-input').disabled&&a.card.querySelector('.js-answer-voice').disabled&&!a.card.querySelector('.js-review-continue').disabled,'No fallback')});
