@@ -83,7 +83,11 @@ that's simultaneously flagged as uncertain.
   absent or empty.
 
 See [`fixtures/drafts/ambiguous_payee.json`](fixtures/drafts/ambiguous_payee.json)
-for a working example.
+for a working example. The ambiguity there is **two different people,
+both named John** — John Doe (`payee-101`, `****4521`) and John Lee
+(`payee-102`, `****8892`) — not one person holding two accounts. That
+is why the user has to choose: picking the wrong candidate pays a
+different person, so the server can never guess on their behalf.
 
 ### `nonce`
 
@@ -246,7 +250,7 @@ Rules:
           },
           {
             "id": "payee-102",
-            "display_name": "John Smith",
+            "display_name": "John Lee",
             "masked_account": "****8892"
           }
         ]
@@ -333,7 +337,7 @@ Rules:
         "transcript": "Send fifty dollars to John.",
         "payee": {
           "id": "payee-102",
-          "display_name": "John Smith",
+          "display_name": "John Lee",
           "masked_account": "****8892"
         }
       },
@@ -675,7 +679,7 @@ put them in the client's branch logic.
 | `replayed` | The `idempotency_key` has already been used for a different draft. |
 | `unresolved_fields` | The stored draft's `unresolved` array is non-empty. The gateway rejects this regardless of any frontend check. |
 | `policy_blocked` | The policy engine determined the draft violates a rule (e.g. over per-transaction limit). |
-| `validator_frozen` | The validator returned a verdict of `frozen` — the transcript does not match the draft. |
+| `validator_frozen` | The validator returned a verdict of `freeze` — the transcript does not match the draft. The reason code keeps its own name; the verdict value is `freeze`. |
 | `step_up_required` | Additional authentication (e.g. biometric or 2FA) is required for this transaction. |
 | `schema_invalid` | The draft does not validate against `contract/draft.schema.json`. |
 | `invalid_clarification_answer` | `/api/clarify` was called with an `answer` that is not the `id` of one of the stored draft's `payee_candidates`, with a `field` that is not in its `unresolved` list, or (in the proposed question form) with a `question_id` that is unknown or already used. |
@@ -819,9 +823,16 @@ team, not a silent assumption:
    otherwise. See §2.
 
 7. **Validator verdict values.** The examples use `"pass"` and the
-   reason-code table mentions `"frozen"`. What are all the possible
+   reason-code table mentions `"freeze"`. What are all the possible
    verdict values? Is there a `"warn"` state that still allows
    execution?
+
+   *Current behaviour in code, not yet a decision:*
+   `backend/validator` only ever returns `"pass"` or `"freeze"`, and
+   `/api/execute` check 11 treats everything that is not exactly
+   `"pass"` as a refusal. The table previously said the verdict was
+   `"frozen"`, which no code has ever produced; that was a typo and is
+   now corrected. Whether a `"warn"` state should exist is still open.
 
 8. **Policy `decision` values.** The examples use `"allow"` and
    `"hold"`. Is `"block"` different from `"hold"`? What are all the
