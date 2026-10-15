@@ -493,3 +493,6 @@ body {
 
 /* Keep primary, microphone, scenario and payee controls easy to tap on mobile. */
 .btn, .candidate-btn { min-height: 44px; }
+
+.ambiguity-voice { display: flex; flex-direction: column; gap: 6px; }
+.ambiguity-voice .clarify-actions { flex-wrap: wrap; }
