@@ -18,7 +18,16 @@ The answers this file pins down:
    later with ``signature_invalid`` — a failure that reads like a signing
    bug in the frontend rather than a registration bug.
 
-3. **The validator is orthogonal to all of this.** Whether a challenge is
+3. **The credential id is the browser's, not the server's.**
+   ``navigator.credentials.create()`` mints the id (``rawId``), and it is that
+   id which comes back inside the assertion and which ``allowCredentials`` has
+   to name. The server used to invent its own, which left the frontend holding
+   an id no authenticator would ever produce. ``/api/webauthn/register`` now
+   takes ``credential_id`` — base64url of ``rawId`` — and stores the key under
+   it. Every happy-path test here sends one, because a test that lets the
+   server pick the id does not cover the browser at all.
+
+4. **The validator is orthogonal to all of this.** Whether a challenge is
    issued at all depends on the verdict; see
    ``tests/test_validator_integration.py`` for that side.
 """
@@ -93,6 +102,16 @@ def der_of(public_key: ec.EllipticCurvePublicKey) -> bytes:
     )
 
 
+# Stand-in for the ArrayBuffer a real navigator.credentials.create() returns.
+BROWSER_RAW_ID = bytes(range(32))
+
+
+def raw_id(value: bytes = BROWSER_RAW_ID, *, padded: bool = False) -> str:
+    """base64url of a rawId, padded or not — both reach the server in practice."""
+    encoded = base64.urlsafe_b64encode(value).decode("ascii")
+    return encoded if padded else encoded.rstrip("=")
+
+
 def register_then_execute(
     api: GatewayAPI, private_key: ec.EllipticCurvePrivateKey, encode
 ) -> dict:
@@ -102,11 +121,18 @@ def register_then_execute(
     which is the whole property under test: a key stored wrong cannot produce
     a signature that verifies.
 
+    The credential id is sent by the client, the way a browser does — that is
+    the property the second half of this file is about.
+
     Returns the ``/api/execute`` response, so a caller can assert either
     "it posted" or "it was refused, and here is why".
     """
     registration = api.register(
-        {"user_id": "user-001", "public_key": encode(private_key.public_key())}
+        {
+            "user_id": "user-001",
+            "credential_id": raw_id(),
+            "public_key": encode(private_key.public_key()),
+        }
     )
     if registration.get("status") != "registered":
         return registration
@@ -136,7 +162,11 @@ def test_a_pem_public_key_registers_and_can_sign():
     api = make_api()
     private_key = new_key()
     registration = api.register(
-        {"user_id": "u", "public_key": public_key_to_pem(private_key.public_key())}
+        {
+            "user_id": "u",
+            "credential_id": raw_id(),
+            "public_key": public_key_to_pem(private_key.public_key()),
+        }
     )
     assert registration["status"] == "registered"
 
@@ -229,3 +259,160 @@ def test_registering_with_no_public_key_still_reports_registered():
     """
     api = make_api()
     assert api.register({"user_id": "u"})["status"] == "registered"
+
+
+# ── The credential id belongs to the browser ──────────────────────────
+
+
+def test_the_browser_credential_id_is_the_one_stored_and_returned():
+    """The mismatch this section exists for.
+
+    `navigator.credentials.create()` makes the id. If the server answered
+    with an id of its own, the frontend would hold one no authenticator
+    would ever put in an assertion.
+    """
+    api = make_api()
+    sent = raw_id()
+    registration = api.register(
+        {
+            "user_id": "u",
+            "credential_id": sent,
+            "public_key": public_key_to_pem(new_key().public_key()),
+        }
+    )
+    assert registration["credential_id"] == sent
+    assert registration["credential_id_source"] == "client"
+    assert sent in api.credentials
+
+
+def test_the_challenge_offers_the_browser_credential_id():
+    """`allow_credentials` must name the id the browser can actually use."""
+    api = make_api()
+    sent = raw_id()
+    api.register(
+        {
+            "user_id": "u",
+            "credential_id": sent,
+            "public_key": public_key_to_pem(new_key().public_key()),
+        }
+    )
+    draft_id = api.message({"transcript": TRANSCRIPT})["items"][0]["draft"]["id"]
+    assert api.challenge({"draft_id": draft_id})["allow_credentials"] == [sent]
+
+
+def test_a_browser_registration_signs_end_to_end():
+    """rawId + base64url DER public key: register, challenge, sign, execute."""
+    private_key = new_key()
+
+    def encode(public_key):
+        return base64.urlsafe_b64encode(der_of(public_key)).decode("ascii").rstrip("=")
+
+    result = register_then_execute(make_api(), private_key, encode)
+    assert result["result"] == "executed", result
+
+
+def test_a_padded_credential_id_is_accepted_and_canonicalised():
+    """`btoa`-style encoders pad. The server stores the unpadded spelling so
+    registration, allow_credentials and /api/execute all agree on one string
+    — otherwise execute says "not registered" for a credential that is."""
+    api = make_api()
+    registration = api.register(
+        {
+            "user_id": "u",
+            "credential_id": raw_id(padded=True),
+            "public_key": public_key_to_pem(new_key().public_key()),
+        }
+    )
+    assert registration["credential_id"] == raw_id()
+    assert registration["credential_id"] in api.credentials
+
+
+def test_re_registering_a_credential_id_with_a_different_key_is_refused():
+    """Silently swapping the key under an enrolled id would let one
+    registration overwrite another's credential."""
+    api = make_api()
+    sent = raw_id()
+    api.register(
+        {
+            "user_id": "u",
+            "credential_id": sent,
+            "public_key": public_key_to_pem(new_key().public_key()),
+        }
+    )
+    response = api.register(
+        {
+            "user_id": "u",
+            "credential_id": sent,
+            "public_key": public_key_to_pem(new_key().public_key()),
+        }
+    )
+    assert response["reason_code"] == R.MALFORMED_REQUEST
+    assert "different public key" in response["message"]
+
+
+def test_re_registering_the_same_key_is_allowed():
+    """Idempotent: enrolling the same credential twice is not a conflict."""
+    api = make_api()
+    sent = raw_id()
+    body = {
+        "user_id": "u",
+        "credential_id": sent,
+        "public_key": public_key_to_pem(new_key().public_key()),
+    }
+    assert api.register(body)["status"] == "registered"
+    assert api.register(body)["status"] == "registered"
+
+
+def test_a_credential_id_that_is_not_base64url_is_refused():
+    """Standard base64 is not base64url: '+' and '/' do not survive."""
+    api = make_api()
+    response = api.register(
+        {
+            "user_id": "u",
+            "credential_id": "not base64url!",
+            "public_key": public_key_to_pem(new_key().public_key()),
+        }
+    )
+    assert response["reason_code"] == R.MALFORMED_REQUEST
+    assert "rawId" in response["message"]
+
+
+def test_an_empty_credential_id_is_refused():
+    api = make_api()
+    response = api.register(
+        {"user_id": "u", "credential_id": "", "public_key": public_key_to_pem(new_key().public_key())}
+    )
+    assert response["reason_code"] == R.MALFORMED_REQUEST
+
+
+def test_an_oversized_credential_id_is_refused():
+    """WebAuthn caps a credential id at 1023 bytes."""
+    api = make_api()
+    response = api.register(
+        {
+            "user_id": "u",
+            "credential_id": raw_id(bytes(1024)),
+            "public_key": public_key_to_pem(new_key().public_key()),
+        }
+    )
+    assert response["reason_code"] == R.MALFORMED_REQUEST
+    assert "1023" in response["message"]
+
+
+def test_a_server_generated_id_is_flagged_and_never_offered_to_a_browser():
+    """No credential_id sent: the server still answers, but says so — and a
+    key-less registration is left out of allow_credentials, because offering
+    it makes navigator.credentials.get() fail with NotAllowedError for a
+    reason the frontend cannot see."""
+    api = make_api()
+    registration = api.register({"user_id": "u"})
+    assert registration["credential_id_source"] == "server"
+
+    api.register(
+        {
+            "user_id": "u",
+            "public_key": public_key_to_pem(new_key().public_key()),
+        }
+    )
+    draft_id = api.message({"transcript": TRANSCRIPT})["items"][0]["draft"]["id"]
+    assert api.challenge({"draft_id": draft_id})["allow_credentials"] == []

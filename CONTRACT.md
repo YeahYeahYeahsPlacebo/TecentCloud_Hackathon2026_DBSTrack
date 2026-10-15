@@ -455,23 +455,47 @@ WebAuthn registration. To be implemented by Member 2 (frontend) and
 Member 3 (gateway). The credential must be created with
 `userVerification: "required"` and algorithm ES256 (COSE `-7`).
 
-**Request (placeholder):**
+**Request:**
+
+| Field | Required | Meaning |
+|---|---|---|
+| `user_id` | yes | Who the credential belongs to. |
+| `credential_id` | no, but send it | **base64url of `attestationResponse.credential.rawId`** — the id the browser minted in `navigator.credentials.create()`. Padding is accepted and stripped; at most 1023 bytes decoded. |
+| `public_key` | no | The credential's public key: a PEM SubjectPublicKeyInfo string, or base64 / base64url of the same DER — which is what `getPublicKey()` gives you once stringified. A COSE_Key map written as JSON cannot work (COSE labels are integers; JSON keys are strings) and is refused. ES256 (P-256) only. |
+| `display_name` | no | Placeholder field, unused. |
+
+> **The credential id is the browser's, not the server's.** It is what the
+> authenticator puts in the assertion and what `allowCredentials` has to
+> name, so the server stores the public key under the id it was given. Only
+> when a client sends no `credential_id` does the server invent one — and
+> that id is flagged `"credential_id_source": "server"` and is never offered
+> back in `allow_credentials`, because no authenticator will ever sign with
+> an id it did not mint. **A browser must send its `rawId`.**
 
 ```json
 {
   "user_id": "user-001",
-  "display_name": "John Smith"
+  "credential_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
 }
 ```
 
-**Response (placeholder):**
+**Response (200):**
 
 ```json
 {
   "status": "registered",
-  "credential_id": "Y3JlZGVudGlhbC0wMDE"
+  "credential_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "credential_id_source": "client"
 }
 ```
+
+**Refusals** (`malformed_request`): a `credential_id` that is not base64url,
+that decodes to nothing, or that is longer than 1023 bytes; an unusable
+`public_key` (not a key at all, not P-256, or a COSE_Key map written as
+JSON); or a `credential_id` already registered with a *different* public key
+(re-registering the same key under the same id is allowed and changes
+nothing).
 
 ### POST /api/webauthn/challenge
 
@@ -516,9 +540,20 @@ displaying and check that it matches `draft_hash` here before calling
   "challenge": "tf6PDJ3RsWyx6ecW3tWpmK40F8fHG_GH3l9z3JXDR3c",
   "rp_id": "localhost",
   "user_verification": "required",
-  "allow_credentials": ["Y3JlZGVudGlhbC0wMDE"]
+  "allow_credentials": ["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"]
 }
 ```
+
+`allow_credentials` lists the credential ids the server can verify a
+signature against — the ids registered from a browser's `rawId`, base64url
+and unpadded. Feed them to `navigator.credentials.get()` as
+`allowCredentials: ids.map(id => ({ id: base64urlToBytes(id), type: "public-key" }))`.
+An empty list is not an error: it means "any credential", which is the
+state before anything has been registered. Entries the server generated
+itself, and registrations that carry no public key, are deliberately left
+out — offering an id no authenticator can produce makes
+`navigator.credentials.get()` fail with `NotAllowedError` for a reason the
+frontend cannot see.
 
 ### POST /api/execute
 
