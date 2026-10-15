@@ -66,6 +66,30 @@ set. Confirm what is actually loaded before you start:
 curl -s localhost:8000/api/health
 ```
 
+### With no keys
+
+A fresh clone runs, drafts, and executes — but only part of the story:
+
+```bash
+DCTA_ALLOW_UNVALIDATED=true python -m backend.gateway.server
+```
+
+| | works? | why |
+|---|---|---|
+| One-shot draft → sign → execute | ✅ | stub parser, dev validator pass |
+| Ambiguous payee → pick a candidate → execute | ✅ | candidate picks need the directory, not a model |
+| **Free-text clarification** ("how much?") | ❌ | `resolve_question` calls the model. Needs `PARSER_APPKEY` |
+
+So the offline demo script uses a transcript whose only gap is the payee:
+
+```bash
+python scripts/demo.py --transcript "Pay John two hundred dollars."
+```
+
+`DCTA_ALLOW_UNVALIDATED=true` makes the validator return a pass whose reason
+is literally `unvalidated (dev only)` — fine for a rehearsal, weak on stage.
+For a real `pass` without keys you need `VALIDATOR_BACKEND=stub` (Member 1).
+
 ## `.env`
 
 Copy the variables below into a `.env` at the repo root. They are read by
@@ -117,6 +141,20 @@ python scripts/redteam_ai_layer.py --delay 3 --out docs/redteam/ai_layer_report.
 three axes (result, correctness, safety) and writes
 [`docs/redteam/ai_layer_report.md`](docs/redteam/ai_layer_report.md). None of
 them ever print an AppKey or a request body.
+
+## Rehearsal
+
+```bash
+python scripts/demo.py                      # against a running server
+python scripts/demo.py --transcript "Send fifty dollars to John Doe."
+```
+
+`scripts/demo.py` walks the whole story over HTTP and prints each step:
+register → speak → clarify → challenge → sign → execute → audit. Then it
+attacks its own transaction — signs a *different* draft with the same key and
+replays it — and fails if the gateway accepts that. Exit 0 means the story
+worked **and** the gate held. Run it before every demo; it is the fastest way
+to find out that a refactor broke check 8.
 
 ## How We Work
 
