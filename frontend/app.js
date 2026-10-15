@@ -21,12 +21,13 @@
   var API_CLARIFY_URL = "/api/clarify";
 
   // Fixture filenames relative to frontend/index.html.
-  // Used only by the demo-fallback scenario buttons.
+  // Used only by the demo-fallback scenario buttons. These preview assets
+  // mirror fixtures/drafts/ so the gateway can serve them from frontend/.
   var FIXTURES = {
-    clean_transfer:   "../fixtures/drafts/clean_transfer.json",
-    ambiguous_payee:  "../fixtures/drafts/ambiguous_payee.json",
-    equity_purchase:  "../fixtures/drafts/equity_purchase.json",
-    over_limit:       "../fixtures/drafts/over_limit.json",
+    clean_transfer:   "fixtures/drafts/clean_transfer.json",
+    ambiguous_payee:  "fixtures/drafts/ambiguous_payee.json",
+    equity_purchase:  "fixtures/drafts/equity_purchase.json",
+    over_limit:       "fixtures/drafts/over_limit.json",
   };
 
   var displayEl = null;
@@ -65,6 +66,8 @@
       console.error("[app.js] Could not find #draft-display or .btn-scenario elements");
       return;
     }
+
+    DctaVoice.init();
 
     // ── Scenario button wiring (demo fallback) ───────────────
     Array.prototype.forEach.call(scenarioBtns, function (btn) {
@@ -107,13 +110,15 @@
   // displays what the server returns.
 
   function sendMessage() {
-    if (!textInput || !sendBtn) return;
+    if (!textInput || !sendBtn || sendBtn.disabled) return;
 
     var transcript = textInput.value.trim();
     if (!transcript) {
       setHint("Please type a message before sending.");
       return;
     }
+
+    DctaVoice.reset();
 
     // Clear any previous scenario-button highlight and stale server state.
     Array.prototype.forEach.call(scenarioBtns, function (b) {
@@ -127,7 +132,7 @@
     sendBtn.disabled = true;
     sendBtn.textContent = "Sending…";
     textInput.disabled = true;
-    setHint("Sending to /api/message…");
+    setHint("Preparing your transaction draft…");
     displayEl.innerHTML = '<p class="placeholder">Loading…</p>';
 
     // Capture the generation so we can detect stale /api/message responses.
@@ -218,6 +223,7 @@
 
     var items = parsed.items;
     var intents = parsed.intentsDetected;
+    var responseGen = messageGen;
 
     // Build a container for all rendered items.
     var containerHtml = '';
@@ -253,9 +259,11 @@
         // We use a closure to capture the placeholderId and item data.
         canonical.draftHashAsync(draft)
           .then(function (hash) {
+            if (responseGen !== messageGen) return;
             renderApiDraftInto(draft, hash, validator, policy, placeholderId);
           })
           .catch(function (err) {
+            if (responseGen !== messageGen) return;
             var el = document.getElementById(placeholderId);
             if (el) el.innerHTML =
               '<p class="placeholder">Hash error: ' +
@@ -284,7 +292,7 @@
               " clarifying question" + (questionCount > 1 ? "s" : "") +
               ". Draft signing and execution are disabled.");
     } else {
-      setHint("Draft received from /api/message. Signing and execution are disabled.");
+      setHint("Review the transaction details below. Signing and execution are disabled in this demo.");
     }
   }
 
@@ -639,6 +647,7 @@
 
     html += "</div>";
     el.innerHTML = html;
+    DctaVoice.attachReadback(el.querySelector(".card"), draft);
   }
 
   // Render an ambiguous-payee draft received from the API.
@@ -724,6 +733,7 @@
 
     html += "</div>";
     el.innerHTML = html;
+    DctaVoice.attachReadback(el.querySelector(".card"), draft);
 
     // Wire all interactions scoped to THIS card only. The card root
     // is the .clarify-card element inside el.
@@ -731,7 +741,7 @@
     wireCandidateButtons(cardEl);
     wirePayeeFilter(cardEl);
     wireClarifyConfirmBtn(cardEl);
-    setHint("Draft received from /api/message. Select a payee, then confirm to submit to /api/clarify.");
+    setHint("Select the intended payee, then choose Confirm selection to update the draft.");
   }
 
   // Render validator verdict and policy decision rows.
@@ -768,12 +778,18 @@
   // ── Fixture loader (demo fallback) ──────────────────────────
 
   function loadFixture(key) {
+    DctaVoice.reset();
+    // Restore text controls if a fixture supersedes an in-flight message.
+    sendBtn.disabled = false;
+    sendBtn.textContent = "Send";
+    textInput.disabled = false;
     var url = FIXTURES[key];
     if (!url) return;
     // Fixture loads must never carry server draft state into clarify.
     // Increment the generation so any in-flight /api/clarify is stale.
     messageGen++;
     displayEl.innerHTML = '<p class="placeholder">Loading…</p>';
+    var fixtureGen = messageGen;
 
     fetch(url)
       .then(function (res) {
@@ -781,9 +797,11 @@
         return res.json();
       })
       .then(function (draft) {
-        renderDraft(draft, key);
+        if (fixtureGen !== messageGen) return;
+        renderDraft(draft, key, fixtureGen);
       })
       .catch(function (err) {
+        if (fixtureGen !== messageGen) return;
         displayEl.innerHTML =
           '<p class="placeholder">Failed to load fixture: ' +
           escapeHtml(err.message) + "</p>";
@@ -793,12 +811,13 @@
 
   // ── Renderers ───────────────────────────────────────────────
 
-  function renderDraft(draft, key) {
+  function renderDraft(draft, key, fixtureGen) {
     // Recompute the hash using frontend/js/canonical.js (CONTRACT.md §7).
     // In this prototype the hash is shown for transparency — no signing
     // or execution is performed.
     canonical.draftHashAsync(draft)
       .then(function (hash) {
+        if (fixtureGen !== messageGen) return;
         if (key === "ambiguous_payee") {
           renderAmbiguousPayee(draft, hash);
         } else if (key === "over_limit") {
@@ -808,6 +827,7 @@
         }
       })
       .catch(function (err) {
+        if (fixtureGen !== messageGen) return;
         displayEl.innerHTML =
           '<p class="placeholder">Hash error: ' + escapeHtml(err.message) + "</p>";
       });
@@ -1295,6 +1315,7 @@
   // card's content — other cards on screen are untouched. The server
   // returns a new draft with a new id and nonce.
   function renderClarifySuccessInto(body, cardEl) {
+    DctaVoice.reset();
     var parsed = parseMessageResponse(body);
     if (!parsed) {
       cardEl.innerHTML =
@@ -1338,7 +1359,7 @@
     });
 
     cardEl.innerHTML = html;
-    setHint("Clarification accepted. The server returned a new draft with a new id.");
+    setHint("Your selection was applied. Review the updated transaction details below.");
   }
 
   // Restore candidate buttons, filter, and confirm button after a

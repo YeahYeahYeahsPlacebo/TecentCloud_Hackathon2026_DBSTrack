@@ -482,3 +482,11 @@ body {
   color: var(--danger);
   border: 1px solid var(--danger);
 }
+
+/* Voice input and explicit read-back */
+.btn-voice { background: var(--primary-dim); color: var(--primary); border: 1px solid var(--primary); }
+#mic-btn { touch-action: none; user-select: none; -webkit-user-select: none; }
+#mic-btn[aria-pressed="true"] { background: var(--primary); color: white; }
+.btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.voice-preview { font-size: 13px; padding: 8px 10px; background: #eceff1; color: #455a64; border-radius: 8px; }
+.readback-controls { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
