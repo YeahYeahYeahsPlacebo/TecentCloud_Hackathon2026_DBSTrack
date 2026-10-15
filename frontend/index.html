@@ -13,7 +13,7 @@
   <!-- Header -->
   <header class="app-header">
     <h1>Transaction Drafts</h1>
-    <p class="subtitle">Preview · signing and execution disabled</p>
+    <p class="subtitle">Review · sign · confirm execution</p>
   </header>
 
   <!-- API status banner -->
@@ -21,6 +21,12 @@
     Speak or type a message, then review the transaction draft.
     You can also explore the sample scenarios below.
   </div>
+
+  <section class="input-section" aria-label="Passkey setup">
+    <button type="button" id="register-passkey" class="btn btn-primary" disabled>Register passkey</button>
+    <p id="passkey-status" class="hint" role="status">Checking passkey support…</p>
+    <p id="validation-mode" class="preview-banner" role="status" hidden></p>
+  </section>
 
   <!-- Text input -->
   <section class="input-section">
@@ -56,9 +62,9 @@
   <!-- Footer -->
   <footer class="app-footer">
     <p class="footer-note">
-      WebAuthn signing and execution are <strong>disabled</strong> in this
-      prototype. Voice helps you enter and review your message; it never
-      authorizes a transaction. Sample scenarios are previews only.
+      This prototype is not live banking. Voice only helps enter and review
+      your message. A passkey signs an approved draft; a separate deliberate
+      click confirms execution. Sample scenarios remain previews only.
     </p>
   </footer>
 
@@ -66,6 +72,7 @@
 
 <script src="js/canonical.js"></script>
 <script src="js/voice.js"></script>
+<script src="js/webauthn.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
