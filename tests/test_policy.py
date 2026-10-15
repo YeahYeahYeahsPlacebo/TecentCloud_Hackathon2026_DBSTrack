@@ -15,9 +15,12 @@ from backend.policy import (  # noqa: E402
     ALLOW,
     BLOCK,
     HOLD,
+    RULES,
+    STEP_UP,
     Limits,
     PolicyEngine,
     evaluate,
+    rule_positive_amount,
 )
 
 FIXTURES = ROOT / "fixtures" / "drafts"
@@ -39,6 +42,41 @@ def now_z(offset_hours: float = 0) -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=offset_hours)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+
+
+# ── Zero amounts (CONTRACT.md §9) ─────────────────────────────────────
+
+
+def test_zero_amount_is_blocked_not_allowed():
+    """CONTRACT.md §9: "0.00" passes the money pattern; policy must reject it."""
+    outcome = evaluate(with_amount(load("clean_transfer.json"), "0.00"))
+    assert outcome.decision == BLOCK, outcome
+    assert "not a positive transfer" in outcome.reason
+
+
+def test_zero_blocks_even_when_every_other_rule_is_silent():
+    """The trap this rule closes: 0.00 is under every limit, so with no rule
+    of its own a "send nothing" draft is an allow."""
+    draft = with_amount(load("clean_transfer.json"), "0.00")
+    assert evaluate(draft, known_payees={"payee-001"}).decision == BLOCK
+
+
+def test_zero_outranks_a_hold():
+    """block is stricter than hold, so an unresolved zero draft is blocked."""
+    outcome = evaluate(with_amount(load("ambiguous_payee.json"), "0.00"))
+    assert outcome.decision == BLOCK, outcome
+    assert "not a positive transfer" in outcome.reason
+
+
+def test_the_smallest_nonzero_amount_is_still_ordinary():
+    draft = with_amount(load("clean_transfer.json"), "0.01")
+    assert evaluate(draft, known_payees={"payee-001"}).decision == ALLOW
+
+
+def test_the_zero_rule_is_first_in_rules():
+    """Structural, and the point of the audit item: a rule that only works
+    because nothing else fires is one reorder away from not working."""
+    assert RULES[0] is rule_positive_amount
 
 
 # ── Each rule on its own ──────────────────────────────────────────────
@@ -103,9 +141,11 @@ def test_velocity_ignores_transfers_outside_the_24h_window():
 
 
 def test_new_payee_above_the_threshold_needs_step_up():
+    """``step_up``, not ``hold``: the draft is finished, it needs a factor."""
     clean = load("clean_transfer.json")
     big = with_amount(clean, "1500.00")
-    assert evaluate(big, posted=(), known_payees=set()).decision == HOLD
+    assert evaluate(big, posted=(), known_payees=set()).decision == STEP_UP
+    assert "requires step-up" in evaluate(big, known_payees=set()).reason
     assert evaluate(big, posted=(), known_payees={"payee-001"}).decision == ALLOW
 
 
@@ -131,10 +171,25 @@ def test_the_strictest_decision_wins_regardless_of_rule_order():
     assert "per-transaction" in outcome.reason
 
 
-def test_severity_is_block_over_hold_over_allow():
+def test_severity_is_block_over_step_up_over_hold_over_allow():
     engine = PolicyEngine()
-    allow_then_hold = [load("clean_transfer.json"), load("ambiguous_payee.json")]
-    assert [engine.evaluate(d).decision for d in allow_then_hold] == [ALLOW, HOLD]
+    clean = load("clean_transfer.json")
+    ladder = [
+        clean,                                  # allow: 50 to a new payee
+        load("ambiguous_payee.json"),           # hold: unresolved
+        with_amount(clean, "1500.00"),          # step_up: new payee, large
+        with_amount(clean, "9000.00"),          # block: over the limit
+    ]
+    assert [engine.evaluate(d).decision for d in ladder] == [ALLOW, HOLD, STEP_UP, BLOCK]
+
+
+def test_step_up_outranks_hold_when_both_fire():
+    """A draft that is both unfinished and large: the engine reports the one
+    that is furthest along, so the user is sent to authenticate, not asked
+    a question they already answered."""
+    draft = with_amount(load("clean_transfer.json"), "1500.00")
+    draft["unresolved"] = ["payee"]
+    assert evaluate(draft).decision == STEP_UP
 
 
 # ── Determinism ───────────────────────────────────────────────────────

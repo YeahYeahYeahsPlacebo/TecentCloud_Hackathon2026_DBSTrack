@@ -7,10 +7,10 @@ from. A fixture that labels a candidate differently is not a cosmetic
 drift: the candidate list is what the user is shown and clicks, so the
 user picks one name and the money goes to another.
 
-That is exactly what happened to ``payee-102``, which the directory
-knows as "John Lee" while ``ambiguous_payee.json`` still called it
-"John Smith". Nothing in the suite caught it because nothing compared
-the two. These tests are that comparison.
+That is what happened to ``payee-102``: the directory knew it as "John
+Lee" while ``ambiguous_payee.json`` still called it "John Smith", and
+nothing in the suite compared the two. PR #24 aligned the fixture with
+the directory; these tests are the comparison that keeps it aligned.
 """
 
 import json

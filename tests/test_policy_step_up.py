@@ -1,9 +1,10 @@
-"""Step-up: the one policy rule that produces ``hold``.
+"""Step-up: the one policy rule that produces ``step_up``.
 
-CONTRACT.md §8 open question 8 asks what ``hold`` means operationally. The
-gateway answers it in ``backend/gateway/execute.py`` ``_check_policy_allowed``:
-``block`` is terminal, and anything else needs step-up, which does not exist
-yet, so it fails closed as ``step_up_required``.
+CONTRACT.md §8 open question 8 asked what ``hold`` means operationally. It is
+resolved: ``hold`` is unresolved-only, and a complete draft that needs a
+second factor says ``step_up``. The gateway maps that in
+``backend/gateway/execute.py`` ``_check_policy_allowed`` to
+``step_up_required``, because step-up itself does not exist yet.
 
 These tests exist because the rule behind it had **none**. Every other rule is
 exercised somewhere; ``rule_new_payee_step_up`` never was, and the reason is
@@ -69,12 +70,24 @@ def make_api(limits: Limits | None = None, known_payees=()) -> GatewayAPI:
 # ── The rule itself ────────────────────────────────────────────────────
 
 
-def test_a_first_transfer_above_the_threshold_holds():
+def test_a_first_transfer_above_the_threshold_needs_step_up():
+    """``step_up``, not ``hold`` — the draft is complete; a factor is missing."""
     engine = PolicyEngine(limits=STEP_UP_ABOVE)
     outcome = engine.evaluate(draft_dict(), "0" * 64)
 
-    assert outcome.decision == "hold"
+    assert outcome.decision == "step_up"
     assert "requires step-up" in outcome.reason
+
+
+def test_an_unfinished_draft_still_says_hold_not_step_up():
+    """The other half of the split: hold means "answer the question first"."""
+    engine = PolicyEngine(limits=STEP_UP_ABOVE)
+    draft = draft_dict("ambiguous_payee.json")
+
+    outcome = engine.evaluate(draft, "0" * 64)
+
+    assert outcome.decision == "hold"
+    assert outcome.reason == "unresolved_fields"
 
 
 def test_the_same_transfer_to_a_declared_known_payee_is_allowed():
@@ -153,10 +166,10 @@ def test_after_one_execution_the_payee_is_known_and_the_next_transfer_is_clean()
     assert signed_full_run(api2, new_key())["result"] == "executed"
 
 
-def test_a_hold_still_gets_a_challenge_unlike_a_block():
+def test_a_step_up_still_gets_a_challenge_unlike_a_block():
     """``block`` refuses at the challenge (backend/gateway/credential.py), so
-    there is nothing to sign. ``hold`` lets the user sign and refuses at step
-    12 instead. Conflating the two would make step-up unreachable."""
+    there is nothing to sign. ``step_up`` lets the user sign and refuses at
+    step 12 instead. Conflating the two would make step-up unreachable."""
     api = make_api(limits=STEP_UP_ABOVE)
     key = new_key()
 

@@ -10,6 +10,13 @@ A Direct Conversational Transaction Agent built for the DBS track of the Tencent
 | `frontend/` | Member 2 |
 | `backend/gateway`, `backend/ledger`, `backend/audit`, `backend/policy`, `backend/bank` | Member 3 |
 
+## Architecture
+
+[`docs/architecture.md`](docs/architecture.md) — component flow and trust
+boundaries as Mermaid diagrams. Start there if you are new to the repo; the
+one-sentence version is that the AI writes a draft and only a signature
+writes to the ledger.
+
 ## Run it
 
 ```bash
@@ -31,12 +38,85 @@ validator, bank, draft count). Read it before demoing.
 | `DCTA_AUDIT_PATH=…` | Append-only audit file. Unset: in memory, lost on restart. |
 | `DCTA_LEDGER_PATH=…` | Ledger file. Unset: in memory. |
 | `DCTA_NO_BANK=1` | Run with no money moving at all. |
+| `DCTA_NO_CLIENT=1` | No chat client. Free-text `/api/clarify` returns 500. |
+| `DCTA_FAKE_CLIENT=1` | Scripted client, for local wiring only. |
 | `DCTA_SERVE_FRONTEND=0` | API only, no static files. |
 | `DCTA_PORT`, `DCTA_HOST` | Default `8000` / `127.0.0.1`. |
+| `DCTA_RP_ID` | WebAuthn rpId. Default `localhost`. **Set this when deploying.** |
+| `DCTA_ORIGIN` | Origin `clientDataJSON` must carry, port included. Default `http://localhost:8000`. |
+| `DCTA_ALLOW_UNVALIDATED=true` | Dev only: lets an unconfigured validator return `pass`. The verdict says so. |
 
 The stub parser and the unconfigured validator are the defaults on purpose:
 a fresh clone runs with no API keys. It will draft, and it will refuse to
 sign — which is the safest thing a half-configured server can do.
+
+## Demo line
+
+The one that uses the real models:
+
+```bash
+PARSER_BACKEND=llm VALIDATOR_BACKEND=llm python -m backend.gateway.server
+```
+
+Both flags are required. `PARSER_BACKEND=llm` alone drafts but freezes at
+check 11 with `validator_frozen`; neither drafts from the stub transcript
+set. Confirm what is actually loaded before you start:
+
+```bash
+curl -s localhost:8000/api/health
+```
+
+## `.env`
+
+Copy the variables below into a `.env` at the repo root. They are read by
+`backend/llm/config.py` (via python-dotenv) whenever `PARSER_BACKEND=llm` or
+`VALIDATOR_BACKEND=llm` is set; a missing one raises an error naming the
+variable, never its value.
+
+| Variable | Required | Notes |
+|---|---|---|
+| `PARSER_APPKEY` | yes | AppKey of the parser ADP application |
+| `VALIDATOR_APPKEY` | yes | AppKey of the validator ADP application |
+| `PARSER_MODEL_LABEL` | yes | Human-readable label only — the model is chosen in the ADP console |
+| `VALIDATOR_MODEL_LABEL` | yes | Must differ from `PARSER_MODEL_LABEL` |
+| `ADP_ENDPOINT` | no | Defaults to `DEFAULT_ENDPOINT` in `backend/llm/adp_client.py` |
+| `ADP_TIMEOUT_SECONDS` | no | Default `30` |
+
+The two AppKeys must differ and the two model labels must differ — the
+hackathon requires the parser and validator to run on different models, and
+`load_llm_settings()` refuses to start if either pair is equal.
+
+`.env` is gitignored. Nothing in the test suite reads it: `load_llm_settings()`
+only touches the file when a caller passes `env_path` explicitly, and tests
+never do.
+
+## Tests
+
+```bash
+python -m pytest              # the whole suite
+python -m pytest -q -rs       # quiet, with skip reasons
+python -m pytest tests/test_policy.py -q
+```
+
+Everything is offline by default — no `.env`, no network, no ADP calls. The
+suite passes on a fresh clone with no keys.
+
+## Eval and red-team scripts
+
+These are **not** run by pytest. They load real settings from `.env` and make
+live ADP calls, so they need keys and they are slow.
+
+```bash
+python scripts/smoke_adp.py                 # first: does either app answer?
+python scripts/eval_parser.py --delay 3     # transcripts -> draft accuracy table
+python scripts/eval_validator.py --delay 3 --repeat 1
+python scripts/redteam_ai_layer.py --delay 3 --out docs/redteam/ai_layer_report.md
+```
+
+`--delay` spaces out the ADP calls. The red-team run scores each case on
+three axes (result, correctness, safety) and writes
+[`docs/redteam/ai_layer_report.md`](docs/redteam/ai_layer_report.md). None of
+them ever print an AppKey or a request body.
 
 ## How We Work
 
