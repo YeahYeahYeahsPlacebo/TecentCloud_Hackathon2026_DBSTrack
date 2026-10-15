@@ -1,12 +1,18 @@
 """
 Constraint #2 (CONTEXT.md): the parser and validator must not import the
 ledger. They must not import the gateway either, since the gateway can
-write to the ledger.
+write to the ledger — nor the bank, which holds the balances the gateway
+moves. All three are Member 3's, and the AI layer reaching into any of
+them is the same mistake wearing a different name: a module that only
+drafts would suddenly be able to read or move money.
+
+The payee directory the parser *does* use lives in ``backend/parser`` on
+purpose, so resolving a name never needs the bank (CONTRACT.md §6).
 
 This statically inspects the AST import nodes of every .py file under
-backend/parser and backend/validator. Nothing is imported or executed.
-The folders hold no code yet; the scaffold still runs, and the checker
-itself is tested against synthetic sources so it cannot pass vacuously.
+backend/parser, backend/validator and backend/llm. Nothing is imported
+or executed, and the checker itself is tested against synthetic sources
+so it cannot pass vacuously.
 """
 
 import ast
@@ -17,7 +23,10 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 GUARDED_PACKAGES = ["backend/parser", "backend/validator", "backend/llm"]
-FORBIDDEN_MODULES = ["backend.ledger", "backend.gateway"]
+# backend.bank is here for the same reason as the other two: it holds the
+# account balances, so an AI-layer module that could import it could read
+# or move money. CONTRACT.md §6 names this test as what enforces it.
+FORBIDDEN_MODULES = ["backend.ledger", "backend.gateway", "backend.bank"]
 
 
 def _is_forbidden(module: str) -> bool:
@@ -79,7 +88,7 @@ def test_guarded_packages_exist():
 
 
 @pytest.mark.parametrize("path", _guarded_files(), ids=lambda p: str(p.relative_to(ROOT)))
-def test_no_ledger_or_gateway_imports(path: Path):
+def test_no_ledger_gateway_or_bank_imports(path: Path):
     found = forbidden_imports(path.read_text(encoding="utf-8"), _module_name(path))
     assert not found, f"{path.relative_to(ROOT)} imports {found}"
 
@@ -101,6 +110,14 @@ def test_no_ledger_or_gateway_imports(path: Path):
         "import importlib\nimportlib.import_module('backend.ledger')",
         "__import__('backend.gateway')",
         "def f():\n    from backend.ledger import x",
+        # The bank is forbidden the same way the ledger and gateway are.
+        "import backend.bank",
+        "from backend.bank import Bank",
+        "import backend.bank.bank as b",
+        "from backend.bank.bank import seed_bank",
+        "from backend import bank",
+        "from ..bank import Bank",
+        "importlib.import_module('backend.bank')",
     ],
 )
 def test_checker_flags_forbidden_imports(source: str):
@@ -116,6 +133,8 @@ def test_checker_flags_forbidden_imports(source: str):
         "from . import prompts",
         "from .ledger_notes import x",  # backend.parser.ledger_notes, not the ledger
         "import backend.ledgerish",
+        "import backend.bankish",  # not backend.bank
+        "from .bank_notes import x",  # backend.parser.bank_notes, not the bank
     ],
 )
 def test_checker_allows_other_imports(source: str):
