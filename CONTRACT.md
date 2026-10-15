@@ -466,6 +466,27 @@ Rules (proposed):
 }
 ```
 
+### Narrow independent-transfer exception
+
+`/api/message` also accepts exactly two independent clauses in the form
+`Send <exact SGD amount> to <saved payee name> and send/transfer <exact SGD amount> to <saved payee name>`.
+The split is deterministic and verbatim. Conditions, sequencing, shared references,
+source-account overrides, bills, equities and more than two requests remain
+`422 multi_intent_unsupported`; general grouped execution stays deferred.
+
+Both clauses must parse to transfer drafts before either is stored. The response
+has `intents_detected: 2` and two ordinary draft items, each with a distinct ID,
+nonce, canonical hash, validator verdict and policy decision. Each draft's
+`transcript` is its exact trimmed clause, so the existing independent validator
+checks that clause rather than trying to validate two requests against one draft.
+The top-level `request_mode: "independent_transfers"` and `source_transcript`
+preserve the exact original combined input for display and audit. These are
+response metadata; they are not fields added to a draft or its hash.
+
+An ambiguous saved name still offers candidates and is clarified per draft.
+No signing, execution, ordering, balance reservation or atomic batch is implied.
+Each eventual execution must independently satisfy the existing gateway checks.
+
 ### POST /api/webauthn/register (placeholder)
 
 WebAuthn registration. To be implemented by Member 2 (frontend) and
@@ -744,7 +765,7 @@ put them in the client's branch logic.
 | `step_up_required` | Additional authentication (e.g. biometric or 2FA) is required for this transaction. |
 | `schema_invalid` | The draft does not validate against `contract/draft.schema.json`. |
 | `invalid_clarification_answer` | `/api/clarify` was called with an `answer` that is not the `id` of one of the stored draft's `payee_candidates`, with a `field` that is not in its `unresolved` list, or (in the proposed question form) with a `question_id` that is unknown or already used. |
-| `multi_intent_unsupported` | The transcript describes more than one transaction. Before phase 5 the request is declined and **nothing is drafted** — see §8 open question 4. |
+| `multi_intent_unsupported` | A multi-request transcript is outside the narrow independent-transfer exception. The request is declined and **nothing is drafted** — see §8 open question 4. |
 | `parser_cannot_handle` | The parser could not produce a draft for the transcript at all (it raises `ParserCannotHandle`). Kept separate from `multi_intent_unsupported` so an evaluation table can tell "several intents" apart from "not understood". |
 | `internal_error` | The server could not answer: an intent was dropped by the parser, the server is missing a dependency it needs (a payee directory, a chat client), the validator is not usable, or anything else unhandled. HTTP **500**, not 422 — see the note above the table. Carries an extra non-contract field `bug` (`parser`, `wiring`, `validator`, `unhandled`) for whoever reads the log. |
 
@@ -792,7 +813,7 @@ Each member must be able to demonstrate the following:
 - The validator runs on a different model from the parser.
 - Every parser test asserts `len(items) == intents_detected`.
 - A question item never contains a draft.
-- A multi-intent request is declined, never partially drafted.
+- A multi-intent request outside the narrow independent-transfer exception is declined, never partially drafted.
 
 ### Member 2 (frontend)
 
@@ -865,7 +886,7 @@ team, not a silent assumption:
    are returned **inline** in the `/api/message` `items` array. The
    group model — `depends_on`, failure policies, and a server-side
    balance/limit check — is **deferred to phase 5**. Until phase 5, a
-   request describing more than one transaction is **declined** with a
+   request describing more than one transaction outside the narrow independent-transfer exception is **declined** with a
    message asking the user to send one request at a time, and nothing
    is drafted. Reason: executing dependent steps independently, with
    nothing enforcing order, is the risk raised in the multi-intent
@@ -955,7 +976,7 @@ Deliberately not fixed in this pass. Each is a decision, not an oversight.
   `/api/message` `items` (see §8 open question 4). The group model —
   `depends_on` between drafts, failure policies, and a server-side
   balance/limit check — is **deferred to phase 5**. Until phase 5, a
-  request describing more than one transaction is declined with a
+  request describing more than one transaction outside the narrow independent-transfer exception is declined with a
   message asking the user to send one request at a time, and nothing
   is drafted. Reason: executing dependent steps independently, with
   nothing enforcing order, is the risk raised in the multi-intent

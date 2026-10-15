@@ -37,7 +37,8 @@ from backend.gateway import reason_codes as R
 from backend.gateway.errors import rejection_response
 from backend.models.draft import TransactionDraft
 from backend.parser.clarify import resolve_payee, resolve_question
-from backend.parser.interface import InvalidClarificationAnswer, ParserCannotHandle
+from backend.parser.interface import InvalidClarificationAnswer, ParserCannotHandle, ParseResult
+from backend.parser.independent import independent_transfer_clauses
 from backend.policy import PolicyEngine
 
 # CONTRACT.md §8 open question 3: the fixtures use 5 minutes, but the intended
@@ -347,10 +348,27 @@ class MessageService:
             return rejection_response(R.MALFORMED_REQUEST, "'transcript' must be a non-empty string")
 
         try:
-            result = self.parser(transcript)
+            clauses = independent_transfer_clauses(transcript, self.directory)
+            if clauses is None:
+                result = self.parser(transcript)
+            else:
+                # Parse both before storing either. Do not silently drop an
+                # intent, accept a model-created split, or turn this into a group.
+                results = [self.parser(clause) for clause in clauses]
+                for clause, child in zip(clauses, results):
+                    if child.intents_detected != 1 or len(child.items) != 1:
+                        raise ParserContractViolation("each independent clause must produce exactly one item")
+                    if not isinstance(child.items[0], TransactionDraft) or child.items[0].intent_type != "transfer":
+                        raise ParserCannotHandle(
+                            "Please send these requests separately; each independent clause must produce a transfer draft.",
+                            reason="multi-intent unsupported",
+                        )
+                    if child.items[0].transcript != clause:
+                        raise ParserContractViolation("independent draft transcript must equal its verbatim source clause")
+                result = ParseResult(items=[child.items[0] for child in results], intents_detected=2)
         except ParserCannotHandle as exc:
-            # CONTRACT.md §8 open question 4 (Resolved): before phase 5, a
-            # transcript describing more than one transaction is refused with
+            # Outside the narrow independent-transfer exception, before phase 5
+            # a transcript describing more than one transaction is refused with
             # nothing drafted. The parser raises rather than dropping one of
             # two intents; the gateway is what turns that into a rejection,
             # because "reject with a reason code" is a gateway job.
@@ -382,7 +400,11 @@ class MessageService:
                 "drafts": [i["draft"]["id"] for i in items if i["kind"] == "draft"],
             },
         )
-        return {"intents_detected": result.intents_detected, "items": items}
+        response = {"intents_detected": result.intents_detected, "items": items}
+        if clauses is not None:
+            response["request_mode"] = "independent_transfers"
+            response["source_transcript"] = transcript
+        return response
 
     # ── POST /api/clarify ─────────────────────────────────────────────
 
