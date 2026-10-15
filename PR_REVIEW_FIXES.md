@@ -54,8 +54,9 @@ it fail). 856 pass, 0 fail.
   A new test asserts the seed names match `FixtureDirectory`, so the next time
   either side moves, the suite says so instead of the receipt silently naming a
   different person than the candidate the user picked.
-  `fixtures/drafts/ambiguous_payee.json` still says John Smith — shared file,
-  Member 1 is raising that one with Member 2.
+  `fixtures/drafts/ambiguous_payee.json` said John Smith at the time; PR #24
+  aligned it and `tests/test_fixture_directory_parity.py` now pins it, so the
+  fixture, the directory, the stub and the bank all say John Lee.
 - **The payee form's audit row now carries `transcript` too** (item 8, both
   forms). It is one added line inside `_clarify_payee`, as agreed.
 - `internal_error` approved as a single code; no change needed.
