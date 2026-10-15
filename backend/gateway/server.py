@@ -100,9 +100,11 @@ def _chat_client() -> Optional[Any]:
 
     Keyed off the parser's ADP application: the answer-extraction prompt is
     parser-side work, not validator work. With no ADP keys configured there is
-    no client to pass, and the endpoint stays a loud 500 rather than
-    inventing an answer — ``DCTA_FAKE_CLIENT=1`` opts into the scripted fake
-    for local wiring checks, and says so in ``/api/health``.
+    no client to pass, and :func:`_answer_resolver` then switches the endpoint
+    to the code-only rules rather than inventing an answer —
+    ``DCTA_ANSWER_BACKEND=model`` opts back into requiring the model, and
+    ``DCTA_FAKE_CLIENT=1`` opts into the scripted fake for local wiring
+    checks. Both say what they are in ``/api/health``.
     """
     if _flag("DCTA_NO_CLIENT"):
         return None
@@ -131,6 +133,38 @@ def _chat_client() -> Optional[Any]:
     )
 
 
+def _answer_resolver(client: Optional[Any]) -> Optional[Any]:
+    """How the free-text form of ``/api/clarify`` should read an answer.
+
+    Returns ``None`` for "with the model" (which needs *client*, and is a
+    loud 500 without one) or
+    :func:`backend.parser.clarify.resolve_answer_rules` for "with code".
+
+    The default follows the client: a server with ADP keys answers through
+    the model, and one without answers by the same rules the stub parser
+    already uses — reading only what the user said, and asking again
+    rather than guessing. That is what closes the gap where the free-text
+    form could only return a 500.
+
+    ``DCTA_ANSWER_BACKEND`` overrides it either way:
+    ``model`` to require the model (and fail loud without one), ``rules``
+    to force the code path even when keys are configured.
+    """
+    from backend.parser.clarify import resolve_answer_rules
+
+    choice = os.environ.get("DCTA_ANSWER_BACKEND", "").strip().lower()
+
+    if choice == "model":
+        return None
+    if choice == "rules":
+        return resolve_answer_rules
+    if choice:
+        raise RuntimeError(
+            f"DCTA_ANSWER_BACKEND={choice!r} is not valid; use 'model' or 'rules'"
+        )
+    return None if client is not None else resolve_answer_rules
+
+
 def build_api() -> GatewayAPI:
     """Wire the real pieces together. The only place that does so.
 
@@ -144,8 +178,12 @@ def build_api() -> GatewayAPI:
         DCTA_AUDIT_PATH           append-only audit file (default: memory)
         DCTA_LEDGER_PATH          ledger file (default: memory)
         DCTA_NO_BANK=1            run with no money moving at all
-        DCTA_NO_CLIENT=1          no chat client (free-text clarify 500s)
+        DCTA_NO_CLIENT=1          no chat client (free-text clarify reads
+                                  answers with code, or 500s if
+                                  DCTA_ANSWER_BACKEND=model)
         DCTA_FAKE_CLIENT=1        scripted client, for local wiring only
+        DCTA_ANSWER_BACKEND       model | rules (default: model when ADP
+                                  keys are configured, else rules)
         DCTA_RP_ID                WebAuthn rpId (default: localhost)
         DCTA_ORIGIN               origin clientDataJSON must carry
                                   (default: http://localhost:8000)
@@ -154,11 +192,13 @@ def build_api() -> GatewayAPI:
     ledger_path = os.environ.get("DCTA_LEDGER_PATH", "").strip()
 
     bank = None if _flag("DCTA_NO_BANK") else seed_bank()
+    client = _chat_client()
 
     return GatewayAPI(
         parser=get_parser(),
         directory=FixtureDirectory(),
-        client=_chat_client(),
+        client=client,
+        answer_resolver=_answer_resolver(client),
         audit=AuditLog(path=audit_path or None),
         ledger=FileLedger(ledger_path) if ledger_path else InMemoryLedger(),
         bank=bank,
@@ -216,6 +256,12 @@ def create_app(api: Optional[GatewayAPI] = None, *, serve_frontend: bool = True)
             else None,
             "validator": type(gateway.validator).__name__,
             "client": type(gateway.client).__name__ if gateway.client is not None else None,
+            # "model" or "rules": which of the two reads a free-text
+            # clarification answer on this server. "rules" means no model
+            # is involved, and is what a server with no ADP keys reports.
+            "answer_backend": "rules"
+            if gateway.answer_resolver is not None
+            else "model",
             "bank": "none" if gateway.bank is None else f"{len(gateway.bank.accounts())} accounts",
             "drafts": len(gateway.store),
             "credentials": len(gateway.credentials),

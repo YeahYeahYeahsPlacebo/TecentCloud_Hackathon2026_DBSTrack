@@ -163,7 +163,16 @@ class MessageService:
         verdicts: Optional[MutableMapping[str, str]] = None,
         directory: Optional[Any] = None,
         client: Optional[Any] = None,
+        answer_resolver: Optional[Any] = None,
     ) -> None:
+        """Build the service.
+
+        ``answer_resolver`` decides how the free-text form of
+        ``/api/clarify`` reads an answer. ``None`` means "use the model",
+        which needs ``client``; pass
+        :func:`backend.parser.clarify.resolve_answer_rules` to read the
+        answer with code instead, which needs no client at all.
+        """
         self.parser = parser
         self.store = store
         self.verdicts = verdicts
@@ -181,6 +190,7 @@ class MessageService:
         # for the narrow answer-extraction prompt.
         self.directory = directory
         self.client = client
+        self.answer_resolver = answer_resolver
         # Server-only, keyed by question_id. A PendingQuestion carries the
         # original transcript and the partial draft — it is never serialised
         # into any response. Consumed once: answering deletes it, and letting
@@ -494,25 +504,37 @@ class MessageService:
                 f"issued, already answered, or expired",
             )
 
-        if self.directory is None or self.client is None:
+        if self.directory is None:
             # Not the user's fault, so not a rejection: there is no reason
             # code for "the server cannot answer this". Fail loudly instead
             # of returning a 422 that blames the answer.
-            missing = [
-                name
-                for name, value in (("directory", self.directory), ("client", self.client))
-                if value is None
-            ]
             raise ServerNotConfigured(
-                f"cannot resolve a free-text answer: {', '.join(missing)} is "
-                "not configured on this server. Pass directory= and client= "
-                "when building the gateway."
+                "cannot resolve a free-text answer: 'directory' is not "
+                "configured on this server. Pass directory= when building "
+                "the gateway."
+            )
+
+        # Two ways to read an answer: through a model (needs client=), or
+        # with code (answer_resolver=). With neither, the answer cannot be
+        # read, which is a wiring gap and stays a loud 500 — never a guess.
+        resolver = self.answer_resolver
+        if resolver is None and self.client is None:
+            raise ServerNotConfigured(
+                "cannot resolve a free-text answer: no chat client and no "
+                "answer resolver are configured on this server. Pass client= "
+                "for the model path, or answer_resolver=resolve_answer_rules "
+                "to read answers with code and no model."
             )
 
         try:
-            parsed, record = resolve_question(
-                pending_state, request["answer"], self.client, self.directory
-            )
+            if resolver is not None:
+                parsed, record = resolver(
+                    pending_state, request["answer"], self.directory
+                )
+            else:
+                parsed, record = resolve_question(
+                    pending_state, request["answer"], self.client, self.directory
+                )
         except InvalidClarificationAnswer as exc:
             return rejection_response(R.INVALID_CLARIFICATION_ANSWER, str(exc))
 

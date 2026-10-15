@@ -68,6 +68,7 @@ class GatewayAPI:
         bank: Any = _UNSET,
         directory: Optional[Any] = None,
         client: Optional[Any] = None,
+        answer_resolver: Optional[Any] = None,
     ) -> None:
         # Mock bank. Seeded by default so a fresh server has known balances.
         # Pass your own Bank to control balances, or bank=None to run with no
@@ -96,6 +97,9 @@ class GatewayAPI:
         # resolve anything, and says so loudly rather than guessing.
         self.directory = directory if directory is not None else FixtureDirectory()
         self.client = client
+        # How /api/clarify reads a free-text answer: None means "with the
+        # model" (and needs client); a callable means "with code".
+        self.answer_resolver = answer_resolver
 
         self.messages = MessageService(
             parser=parser,
@@ -109,6 +113,7 @@ class GatewayAPI:
             verdicts=self.verdicts,
             directory=self.directory,
             client=self.client,
+            answer_resolver=answer_resolver,
         )
         self.webauthn = CredentialService(
             store=self.store,

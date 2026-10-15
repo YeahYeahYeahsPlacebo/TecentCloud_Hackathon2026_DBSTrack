@@ -27,9 +27,10 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 from backend.models.draft import (
     IntentType,
@@ -271,14 +272,20 @@ def _build_answer_prompt(
 def _extract_amount_from_answer(answer: str) -> str | None:
     """Try to extract a monetary amount from a free-text answer.
 
-    Returns a decimal string like "50.00" or None.
+    Returns a decimal string like "50.00" or None.  Digits win over word
+    numbers: "50.50" is a number the user actually said, while "fifty" is
+    a word this table has to look up.
     """
     lower = answer.lower().strip()
 
-    # Direct money pattern: "$50.00" or "50.00".
-    m = re.search(r"(?:\$|\b)(\d+\.\d{2})\b", lower)
+    # Direct money pattern: "$50.00", "50", "50.5".  Thousands separators
+    # are allowed; anything with more than two decimals has already been
+    # refused upstream (has_excess_decimals).
+    m = re.search(r"(?<![\d.])(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?(?![\d.])", lower)
     if m:
-        return m.group(1)
+        whole = m.group(1).replace(",", "")
+        cents = (m.group(2) or "").ljust(2, "0")
+        return f"{int(whole)}.{cents}"
 
     # Word-number lookup.
     for phrase, value in _WORD_NUMBERS.items():
@@ -345,6 +352,141 @@ def _parse_model_reply(reply_text: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+@dataclass(frozen=True)
+class _AnswerContext:
+    """What an answer looks like once the code-side checks have passed.
+
+    Both resolvers — the model-backed :func:`resolve_question` and the
+    code-only :func:`resolve_answer_rules` — start from this, so the rules
+    a valid answer has to obey live in one place rather than being copied
+    into each backend.
+    """
+
+    field: str
+    clean_answer: str
+    clean_transcript: str
+    partial: dict
+    reading: Any = None
+
+
+def _prepare_answer(
+    pending: PendingQuestion,
+    answer: str,
+    directory: Any,
+) -> tuple[Optional[_AnswerContext], Optional[Tuple[ParseResult, ClarificationRecord]]]:
+    """Run the checks a free-text answer must pass before anything reads it.
+
+    Returns ``(context, None)`` when the answer survived the checks, or
+    ``(None, result)`` when the checks settled the question on their own —
+    a re-ask for a vague amount, or a payee named by account suffix.
+
+    These checks are shared by both resolvers on purpose: a rule the model
+    path enforces has to hold when no model is involved too, or the two
+    backends would disagree about what counts as a valid answer.
+    """
+    # ── Check: pending must not be expired ───────────────────────────
+    now = datetime.now(timezone.utc)
+    if _is_expired(pending.expires_at, now):
+        raise InvalidClarificationAnswer(
+            f"question {pending.question_id!r} has expired"
+        )
+
+    # ── 1. Length limit, on the answer exactly as received ───────────
+    # Rejects before anything else reads the answer.  Sanitising only
+    # ever shortens text, so the cleaned answer is within the limit too.
+    if len(answer) > _MAX_ANSWER_LEN:
+        raise InvalidClarificationAnswer(
+            f"answer exceeds {_MAX_ANSWER_LEN} characters"
+        )
+
+    # ── 2. Sanitise once ─────────────────────────────────────────────
+    # The cleaned texts are used for every check below and, on the model
+    # path, for the prompt.  The raw answer is kept only in the audit
+    # record.
+    clean_answer = sanitise(answer)
+    clean_transcript = sanitise(pending.original_transcript)
+
+    if not clean_answer.strip():
+        raise InvalidClarificationAnswer("answer is empty")
+
+    # ── 3. Second request / change to an already-resolved field ──────
+    if _detect_second_request(clean_answer):
+        raise InvalidClarificationAnswer(
+            "answer contains a second request; "
+            "only the asked field may be answered"
+        )
+
+    if _detect_field_change_attempt(pending.field, clean_answer, directory):
+        raise InvalidClarificationAnswer(
+            f"answer attempts to change a field other than "
+            f"{pending.field!r}, which is already resolved"
+        )
+
+    partial = dict(pending.partial)
+    field = pending.field
+
+    # A negative amount is asked again, never drafted and never sent
+    # to the model (whose reply could drop the sign).
+    if field == "amount" and is_negative_amount(clean_answer):
+        return None, _reask(
+            pending, answer, partial,
+            "The amount can't be negative. How much would you like to send?",
+        )
+
+    # More than two decimal places is asked again, never rounded and
+    # never sent to the model (which might round it).
+    if field == "amount" and has_excess_decimals(clean_answer):
+        return None, _reask(
+            pending, answer, partial,
+            "Please give the amount with at most two decimal places. "
+            "How much would you like to send?",
+        )
+
+    # An answer that is only a masked-account suffix ("account ending
+    # 8892") is resolved by code against the candidate list (the
+    # directory), without the model.  It must select exactly one payee.
+    if field == "payee":
+        by_suffix = match_account_suffix(clean_answer, directory)
+        if by_suffix is not None:
+            if len(by_suffix) != 1:
+                raise InvalidClarificationAnswer(
+                    "account suffix matches "
+                    f"{len(by_suffix)} candidate payees, expected exactly 1"
+                )
+            only = by_suffix[0]
+            partial["payee"] = {
+                "id": only.id,
+                "display_name": only.display_name,
+                "masked_account": only.masked_account,
+            }
+            return None, _finish(pending, answer, partial)
+
+    # R3: a spoken amount is read by code.  "a few hundred", "some",
+    # "about fifty" are never a number, whatever the model would say; an
+    # exact phrase ("a grand") fixes the value and the model only
+    # cross-checks it.  The answer is read after fillers are removed.
+    reading = None
+    if field == "amount":
+        reading = spoken_amount(normalise(clean_answer).text)
+        if reading.status in ("vague", "multiple"):
+            return None, _reask(
+                pending, answer, partial,
+                'I need an exact amount, for example "fifty dollars". '
+                "How much would you like to send?",
+            )
+
+    return (
+        _AnswerContext(
+            field=field,
+            clean_answer=clean_answer,
+            clean_transcript=clean_transcript,
+            partial=partial,
+            reading=reading,
+        ),
+        None,
+    )
+
+
 def resolve_question(
     pending: PendingQuestion,
     answer: str,
@@ -385,96 +527,15 @@ def resolve_question(
     Single-use enforcement (marking the question_id as consumed) is the
     **server's** job — it holds storage.
     """
-    # ── Check: pending must not be expired ───────────────────────────
-    now = datetime.now(timezone.utc)
-    if _is_expired(pending.expires_at, now):
-        raise InvalidClarificationAnswer(
-            f"question {pending.question_id!r} has expired"
-        )
+    context, settled = _prepare_answer(pending, answer, directory)
+    if settled is not None:
+        return settled
 
-    # ── 1. Length limit, on the answer exactly as received ───────────
-    # Rejects before anything else reads the answer.  Sanitising only
-    # ever shortens text, so the cleaned answer is within the limit too.
-    if len(answer) > _MAX_ANSWER_LEN:
-        raise InvalidClarificationAnswer(
-            f"answer exceeds {_MAX_ANSWER_LEN} characters"
-        )
-
-    # ── 2. Sanitise once ─────────────────────────────────────────────
-    # The cleaned texts are used for every check below and for the
-    # prompt.  The raw answer is kept only in the audit record.
-    clean_answer = sanitise(answer)
-    clean_transcript = sanitise(pending.original_transcript)
-
-    if not clean_answer.strip():
-        raise InvalidClarificationAnswer("answer is empty")
-
-    # ── 3. Second request / change to an already-resolved field ──────
-    if _detect_second_request(clean_answer):
-        raise InvalidClarificationAnswer(
-            "answer contains a second request; "
-            "only the asked field may be answered"
-        )
-
-    if _detect_field_change_attempt(pending.field, clean_answer, directory):
-        raise InvalidClarificationAnswer(
-            f"answer attempts to change a field other than "
-            f"{pending.field!r}, which is already resolved"
-        )
-
-    field = pending.field
-    transcript = pending.original_transcript
-    partial = dict(pending.partial)
-
-    # A negative amount is asked again, never drafted and never sent
-    # to the model (whose reply could drop the sign).
-    if field == "amount" and is_negative_amount(clean_answer):
-        return _reask(
-            pending, answer, partial,
-            "The amount can't be negative. How much would you like to send?",
-        )
-
-    # More than two decimal places is asked again, never rounded and
-    # never sent to the model (which might round it).
-    if field == "amount" and has_excess_decimals(clean_answer):
-        return _reask(
-            pending, answer, partial,
-            "Please give the amount with at most two decimal places. "
-            "How much would you like to send?",
-        )
-
-    # An answer that is only a masked-account suffix ("account ending
-    # 8892") is resolved by code against the candidate list (the
-    # directory), without the model.  It must select exactly one payee.
-    if field == "payee":
-        by_suffix = match_account_suffix(clean_answer, directory)
-        if by_suffix is not None:
-            if len(by_suffix) != 1:
-                raise InvalidClarificationAnswer(
-                    "account suffix matches "
-                    f"{len(by_suffix)} candidate payees, expected exactly 1"
-                )
-            only = by_suffix[0]
-            partial["payee"] = {
-                "id": only.id,
-                "display_name": only.display_name,
-                "masked_account": only.masked_account,
-            }
-            return _finish(pending, answer, partial)
-
-    # R3: a spoken amount is read by code.  "a few hundred", "some",
-    # "about fifty" are never a number, whatever the model would say; an
-    # exact phrase ("a grand") fixes the value and the model only
-    # cross-checks it.  The answer is read after fillers are removed.
-    answer_reading = None
-    if field == "amount":
-        answer_reading = spoken_amount(normalise(clean_answer).text)
-        if answer_reading.status in ("vague", "multiple"):
-            return _reask(
-                pending, answer, partial,
-                'I need an exact amount, for example "fifty dollars". '
-                "How much would you like to send?",
-            )
+    field = context.field
+    clean_answer = context.clean_answer
+    clean_transcript = context.clean_transcript
+    partial = context.partial
+    answer_reading = context.reading
 
     # ── 4. Build the prompt and call the model ───────────────────────
     prompt = _build_answer_prompt(field, clean_transcript, clean_answer)
@@ -598,6 +659,120 @@ def resolve_question(
         )
 
     # ── Build the draft from partial ─────────────────────────────────
+    return _finish(pending, answer, partial)
+
+
+def _read_amount(context: _AnswerContext) -> Optional[str]:
+    """Read the amount out of an answer with code only (no model).
+
+    A spoken number the code can read exactly wins — "fifty" is 50.00 by
+    :func:`spoken_amount`, the same rule the parser uses.  Otherwise the
+    digits the user typed are used, padded to two decimals.  None means
+    neither gave a number, which is when the caller asks again instead of
+    guessing.
+    """
+    reading = context.reading
+    if reading is not None and reading.status == "exact":
+        return reading.value
+    return _extract_amount_from_answer(context.clean_answer)
+
+
+def _read_order_type(answer: str) -> Optional[str]:
+    """Read ``"market"``/``"limit"`` out of an answer, or None."""
+    lower = answer.lower()
+    if "limit" in lower:
+        return "limit"
+    if "market" in lower:
+        return "market"
+    return None
+
+
+def resolve_answer_rules(
+    pending: PendingQuestion,
+    answer: str,
+    directory: Any,
+) -> Tuple[ParseResult, ClarificationRecord]:
+    """Resolve a free-text answer with code only — no model, no client.
+
+    The second form of ``/api/clarify`` (CONTRACT.md §4) run the way the
+    stub parser runs the first: the shared checks of
+    :func:`_prepare_answer`, then the field is read out of the answer by
+    the same code the parser already trusts — :func:`spoken_amount` for a
+    spoken number, :func:`match_payees` for a name, :func:`resolve_ticker`
+    for a ticker.
+
+    This is a **deterministic** resolver, not a stand-in for the model: it
+    reads only what the user actually said and asks again when the answer
+    does not name a value, so it cannot invent one. It is what makes the
+    free-text form work on a server with no ADP keys, where the only
+    answer it could give before was a 500.
+
+    Raises:
+        InvalidClarificationAnswer: the same cases as
+            :func:`resolve_question`, plus a payee or ticker the directory
+            does not know.
+    """
+    context, settled = _prepare_answer(pending, answer, directory)
+    if settled is not None:
+        return settled
+
+    field = context.field
+    clean_answer = context.clean_answer
+    partial = context.partial
+
+    if field == "amount":
+        value = _read_amount(context)
+        if value is None:
+            return _reask(pending, answer, partial, f"Could you clarify the {field}?")
+
+        # Currency rule (amount_rules): the user's own words across the
+        # transcript and the answer, never a guess.
+        currency = resolve_currency(context.clean_transcript, clean_answer)
+        if currency is None:
+            return _reask(
+                pending, answer, partial,
+                "Which currency did you mean? How much would you like to send?",
+            )
+        partial["amount"] = {"value": value, "currency": currency}
+
+    elif field == "payee":
+        matches = match_payees(clean_answer, directory, context=clean_answer)
+        if not matches:
+            raise InvalidClarificationAnswer(
+                f"payee {clean_answer!r} not found in directory"
+            )
+        if len(matches) > 1:
+            raise InvalidClarificationAnswer(
+                f"payee {clean_answer!r} is ambiguous: {len(matches)} matches"
+            )
+        payee = matches[0]
+        partial["payee"] = {
+            "id": payee.id,
+            "display_name": payee.display_name,
+            "masked_account": payee.masked_account,
+        }
+
+    elif field == "ticker":
+        symbol = resolve_ticker(clean_answer, directory)
+        if symbol is None:
+            raise InvalidClarificationAnswer(
+                f"ticker {clean_answer!r} not found in directory"
+            )
+        partial["ticker"] = symbol
+
+    elif field == "order_type":
+        order_type = _read_order_type(clean_answer)
+        if order_type is None:
+            raise InvalidClarificationAnswer(
+                f"order_type {clean_answer!r} is not valid"
+            )
+        partial["order_type"] = order_type
+
+    else:
+        raise InvalidClarificationAnswer(
+            f"field {field!r} is not supported for clarification"
+        )
+
     return _finish(pending, answer, partial)
 
 

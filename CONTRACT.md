@@ -398,6 +398,23 @@ Rules (proposed):
   `intents_detected` and `items` — so the client can treat it
   uniformly. A subsequent question item may appear if a different
   field is now unresolved.
+- The answer is read by one of **two backends**, and `GET
+  /api/health` reports which (`answer_backend`):
+  - `model` — `resolve_question` asks the parser model to pull the one
+    asked field out of the answer. Requires `PARSER_APPKEY`.
+  - `rules` — `resolve_answer_rules` reads it with the same code the
+    stub parser already trusts (`spoken_amount`, `match_payees`,
+    `resolve_ticker`). No model, no keys.
+
+  Both run the **same code-side checks** first (`_prepare_answer`):
+  expiry, answer length, a second request, an attempt to change a
+  field that is already resolved, a negative or over-precise amount,
+  and a payee named by account suffix. A server with no ADP keys uses
+  `rules` by default, so the form works offline;
+  `DCTA_ANSWER_BACKEND=model` requires the model and fails loud (500,
+  `bug: wiring`) without one. Neither backend may guess: when the
+  answer does not name a value, the response is a **new question for
+  the same field**, never a draft with an invented one.
 
 **Request (proposed):**
 
