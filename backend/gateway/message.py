@@ -593,6 +593,11 @@ class MessageService:
                 "to_draft_id": resolved.id,
                 "field": field,
                 "answer": request["answer"],
+                # Same reason as the question form: an answer id on its own
+                # names nobody. The audit row has to say which transcript it
+                # was an answer to, or the log holds "payee-102" with nothing
+                # to interpret it against.
+                "transcript": stored.transcript,
             },
         )
         return {"intents_detected": 1, "items": [self._attach(resolved, clarification=record)]}
