@@ -132,7 +132,7 @@
     sendBtn.disabled = true;
     sendBtn.textContent = "Sending…";
     textInput.disabled = true;
-    setHint("Sending to /api/message…");
+    setHint("Preparing your transaction draft…");
     displayEl.innerHTML = '<p class="placeholder">Loading…</p>';
 
     // Capture the generation so we can detect stale /api/message responses.
@@ -292,7 +292,7 @@
               " clarifying question" + (questionCount > 1 ? "s" : "") +
               ". Draft signing and execution are disabled.");
     } else {
-      setHint("Draft received from /api/message. Signing and execution are disabled.");
+      setHint("Review the transaction details below. Signing and execution are disabled in this demo.");
     }
   }
 
@@ -741,7 +741,7 @@
     wireCandidateButtons(cardEl);
     wirePayeeFilter(cardEl);
     wireClarifyConfirmBtn(cardEl);
-    setHint("Draft received from /api/message. Select a payee, then confirm to submit to /api/clarify.");
+    setHint("Select the intended payee, then choose Confirm selection to update the draft.");
   }
 
   // Render validator verdict and policy decision rows.
@@ -1359,7 +1359,7 @@
     });
 
     cardEl.innerHTML = html;
-    setHint("Clarification accepted. The server returned a new draft with a new id.");
+    setHint("Your selection was applied. Review the updated transaction details below.");
   }
 
   // Restore candidate buttons, filter, and confirm button after a

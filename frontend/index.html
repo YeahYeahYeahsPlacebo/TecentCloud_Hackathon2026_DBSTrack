@@ -18,9 +18,8 @@
 
   <!-- API status banner -->
   <div class="preview-banner" id="api-banner">
-    Text input calls <code>POST /api/message</code>. If the backend is not
-    running, Send will fail with a clear error. The buttons below load
-    sample fixtures as a demo fallback.
+    Speak or type a message, then review the transaction draft.
+    You can also explore the sample scenarios below.
   </div>
 
   <!-- Text input -->
@@ -33,9 +32,7 @@
     <p class="hint">Hold the microphone button (or hold Space/Enter while focused). Release to finish. Only final words enter the editable message. Review them, then press Send.</p>
     <button id="send-btn" class="btn btn-primary">Send</button>
     <p class="hint" id="input-hint">
-      Send posts <code>{"transcript": "..."}</code> to
-      <code>/api/message</code>. The server returns the draft — the
-      frontend never constructs or mutates one.
+      Review your message before sending. You'll see the transaction details before any confirmation.
     </p>
   </section>
 
@@ -60,9 +57,8 @@
   <footer class="app-footer">
     <p class="footer-note">
       WebAuthn signing and execution are <strong>disabled</strong> in this
-      prototype. The frontend never builds or mutates a draft
-      (CONTEXT.md core rule, hard constraint 1). The text input sends
-      to <code>/api/message</code>; the sample buttons load local fixtures.
+      prototype. Voice helps you enter and review your message; it never
+      authorizes a transaction. Sample scenarios are previews only.
     </p>
   </footer>
 

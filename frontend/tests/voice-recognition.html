@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Voice recognition regression tests</title>
+<!-- Standalone browser test: open /tests/voice-recognition.html on the demo server.
+     No app.js, network API calls, microphone or speech service is used. -->
+<textarea id="text-input"></textarea>
+<button id="send-btn">Send</button><button id="mic-btn">Hold to talk</button>
+<p id="voice-status"></p><p id="voice-preview" hidden></p>
+<div id="draft-display"></div><pre id="test-results">Running…</pre>
+<script>
+var clock = 0, timers = new Map(), nextTimer = 0;
+window.setTimeout = function (fn, delay) { timers.set(++nextTimer, { fn: fn, at: clock + delay }); return nextTimer; };
+window.clearTimeout = function (id) { timers.delete(id); };
+function advance(ms) {
+  clock += ms;
+  Array.from(timers).forEach(function (entry) {
+    if (entry[1].at <= clock && timers.delete(entry[0])) entry[1].fn();
+  });
+}
+var recognizers = [];
+window.SpeechRecognition = class {
+  constructor() { this.stops = 0; this.aborts = 0; recognizers.push(this); }
+  start() { this.onstart(); }
+  stop() { this.stops++; }
+  abort() { this.aborts++; }
+};
+function emit(recognizer, words) {
+  recognizer.onresult({ results: words.map(function (word) {
+    return { 0: { transcript: word[0] }, isFinal: word[1] };
+  }) });
+}
+</script>
+<script src="../js/voice.js"></script>
+<script>
+(function () {
+  var results = [], input = document.getElementById('text-input');
+  var mic = document.getElementById('mic-btn'), send = document.getElementById('send-btn');
+  function test(name, fn) {
+    try { fn(); results.push({ name: name, passed: true }); }
+    catch (error) { results.push({ name: name, passed: false, error: error.message }); }
+  }
+  function assert(value, message) { if (!value) throw Error(message); }
+  function key(type) { mic.dispatchEvent(new KeyboardEvent(type, { key: ' ', bubbles: true, cancelable: true })); }
+  DctaVoice.init();
+  key('keydown');
+  var first = recognizers[0];
+  test('Cumulative final segments are preserved without duplication', function () {
+    emit(first, [['Send fifty dollars', true], ['to', false]]);
+    assert(input.value === 'Send fifty dollars', 'Interim leaked into message');
+    emit(first, [['Send fifty dollars', true], ['to John', true]]);
+    emit(first, [['Send fifty dollars', true], ['to John', true]]);
+    assert(input.value === 'Send fifty dollars to John', 'Finals lost or duplicated');
+  });
+  test('Release uses stop once, never abort', function () {
+    key('keyup'); key('keyup');
+    assert(first.stops === 1 && first.aborts === 0, 'Normal release did not finish gracefully');
+  });
+  test('Late final survives release, focus loss and five seconds of latency', function () {
+    mic.dispatchEvent(new Event('blur'));
+    advance(5000);
+    emit(first, [['Send fifty dollars', true], ['to John Lee', true]]);
+    assert(first.aborts === 0, 'Pending final aborted');
+    assert(input.value === 'Send fifty dollars to John Lee', 'Late final lost');
+    assert(send.disabled, 'Send enabled before recognition ended');
+    first.onend();
+    assert(!send.disabled, 'Send not restored after end');
+  });
+  test('Editing cancels pending finals rather than overwriting correction', function () {
+    key('keydown'); var current = recognizers[1];
+    emit(current, [['Send fifteen dollars to John', true]]);
+    key('keyup');
+    input.value = 'Send fifty dollars to John';
+    input.dispatchEvent(new Event('input'));
+    emit(current, [['Send fifteen dollars to John', true]]);
+    assert(current.aborts === 1, 'Editing should cancel recognition');
+    assert(input.value === 'Send fifty dollars to John', 'Correction overwritten');
+  });
+  test('Switching drafts cancels and ignores stale final callbacks', function () {
+    key('keydown'); var current = recognizers[2];
+    DctaVoice.reset();
+    emit(current, [['stale words', true]]);
+    assert(current.aborts === 1 && input.value === 'Send fifty dollars to John', 'Stale final overwrote message');
+  });
+  window.voiceTestResults = results;
+  document.getElementById('test-results').textContent = JSON.stringify(results, null, 2);
+})();
+</script>

@@ -46,7 +46,7 @@
     var recognition;
     try { recognition = new Recognition(); }
     catch (_) { sayStatus("Speech recognition could not start. Please type your message."); return; }
-    var record = { recognition: recognition, finalText: "", stopping: false, timer: null };
+    var record = { recognition: recognition, finalText: "", stopping: false, stopIssued: false, timer: null };
     session = record;
     recognition.lang = "en-SG";
     recognition.interimResults = true;
@@ -62,6 +62,8 @@
     };
     recognition.onresult = function (event) {
       if (session !== record) return;
+      // results is cumulative for this session. Rebuild finals rather than
+      // appending each event, which would duplicate earlier final segments.
       var finals = [], interim = [];
       for (var i = 0; i < event.results.length; i++) {
         var result = event.results[i];
@@ -96,11 +98,16 @@
     if (!session) return;
     var record = session;
     record.stopping = true;
+    if (record.stopIssued) return;
     sayStatus("Finishing recognition… Review the final words before sending.");
     // stop() while starting may throw; onstart retries after a quick release.
-    try { record.recognition.stop(); } catch (_) { /* onstart retries */ }
-    clearTimeout(record.timer);
-    record.timer = setTimeout(function () { cancelRecognition("Microphone stopped. Review any final words or type your message."); }, 4000);
+    try {
+      record.recognition.stop();
+      record.stopIssued = true;
+    } catch (_) { /* onstart retries */ }
+    // Keep accepting final results until onend. A short release timeout can
+    // discard delayed speech-service results. The session's 45s watchdog
+    // still recovers a hung recognizer; edits, resets and navigation cancel.
   }
   function init() {
     mic = document.getElementById("mic-btn");
@@ -133,7 +140,11 @@
     mic.addEventListener("click", function (event) {
       if (event.detail === 0) { if (session) stopRecording(); else startRecording(); }
     });
-    mic.addEventListener("blur", function () { cancelRecognition(); });
+    mic.addEventListener("blur", function () {
+      // Moving focus after release is not an edit: preserve pending finals.
+      // The input handler below still cancels before a user edit is overwritten.
+      stopRecording();
+    });
     input.addEventListener("input", function () { cancelRecognition("Message edited. Review it, then press Send."); });
     global.addEventListener("pagehide", reset);
     document.addEventListener("visibilitychange", function () { if (document.hidden) reset(); });
