@@ -13,18 +13,20 @@ would only spend the user's biometric on something ``/api/execute`` is going
 to refuse.
 
 **Attestation is not verified.** Registration accepts an already-extracted
-public key. Verifying the authenticator's attestation statement against a
-metadata service is a separate piece of work and is not even sketched here;
-until it exists, registration is a placeholder (as CONTRACT.md §4 says).
+public key — it does not parse an attestation statement. Verifying one
+against a metadata service is a separate piece of work and is not even
+sketched here (CONTRACT.md §4 says as much). What registration *does*
+require is a usable ES256 public key: without one there is nothing to
+verify a signature against later.
 
 **The credential id is the browser's, not ours.** ``navigator.credentials.create()``
 mints the credential id (``rawId``); the server has no business inventing a
 different one, because the id is what the authenticator puts in the assertion
 and what ``allowCredentials`` has to name. So ``/api/webauthn/register`` takes
 ``credential_id`` — base64url of ``rawId`` — and stores the public key under
-*that* key. Only when a client sends no id at all does the server generate one
-(the placeholder path, which cannot sign anything and is therefore never
-offered back to a browser).
+*that* key. Only when a client sends no id at all does the server generate
+one; that id is unusable by a browser, so it is flagged ``"server"`` in the
+response and never offered back in ``allow_credentials``.
 """
 
 from __future__ import annotations
@@ -46,9 +48,6 @@ from backend.gateway.webauthn import coerce_es256_public_key
 from backend.models.draft import TransactionDraft
 
 USER_VERIFICATION = "required"
-
-# A registration with no public key: it holds the id down but cannot sign.
-PLACEHOLDER_CREDENTIAL = "unregistered-placeholder"
 
 # WebAuthn caps a credential id at 1023 bytes (WebAuthn L2 §5.4.3, "The
 # credential id... MUST NOT exceed 1023 bytes").
@@ -222,9 +221,12 @@ class CredentialService:
         with ``NotAllowedError`` — an error whose cause the frontend cannot
         see. Both are left out:
 
-        * a registration that carried no public key (it cannot sign at all);
         * an id this server generated itself, because no authenticator will
-          ever put an id it did not mint into an assertion.
+          ever put an id it did not mint into an assertion;
+        * a stored value that is not a usable ES256 key. ``register`` refuses
+          those now, but the credential store can also be seeded directly
+          (tests, fixtures), and the filter is what keeps such an entry from
+          reaching a browser.
         """
         usable = []
         for credential_id in sorted(self.credentials):
@@ -238,13 +240,18 @@ class CredentialService:
     # ── POST /api/webauthn/register ───────────────────────────────────
 
     def register(self, request: Mapping[str, Any]) -> dict:
-        """Placeholder registration.
+        """Register a credential: the browser's id, and a key that can sign.
 
         Accepts the browser's credential id (base64url of ``rawId``) and an
-        optional already-extracted public key, and stores the key under that
-        id. It does **not** verify an attestation statement, so a client can
+        already-extracted public key, and stores the key under that id. It
+        does **not** verify an attestation statement, so a client can
         register any key pair it likes — fine for a hackathon prototype, not
         fine for production.
+
+        Both fields are checked before anything is stored, because the two
+        failure modes they prevent are invisible from the frontend: an id the
+        server invented (no browser will sign with it) and a key that cannot
+        verify (reported much later as ``signature_invalid``).
         """
         if not isinstance(request, Mapping) or "user_id" not in request:
             return rejection_response(R.MALFORMED_REQUEST, "'user_id' is required")
@@ -271,26 +278,37 @@ class CredentialService:
             id_source = "client"
 
         public_key = request.get("public_key")
-        if public_key is not None:
-            # Refuse a key we will never be able to verify a signature against.
-            # Storing one anyway reports "registered" and then fails much later
-            # with signature_invalid, which reads like a signing bug on the
-            # client rather than a registration bug.
-            try:
-                coerce_es256_public_key(public_key)
-            except (ValueError, TypeError) as exc:
-                return rejection_response(
-                    R.MALFORMED_REQUEST,
-                    f"unusable public_key: {exc}. Send either a PEM "
-                    "SubjectPublicKeyInfo string or base64/base64url of the DER. "
-                    "A COSE_Key map written as JSON will not work: COSE keys are "
-                    "integers (-1, -2, -3) and JSON keys can only be strings.",
-                )
+        if public_key is None:
+            # 422, not a "registered" that cannot sign. A credential with no
+            # key fails at /api/execute with signature_invalid, which reads
+            # like a signing bug in the frontend rather than an incomplete
+            # registration — and it costs a biometric to find out.
+            return rejection_response(
+                R.MALFORMED_REQUEST,
+                "'public_key' is required: a credential with no key cannot sign "
+                "anything. Send a PEM SubjectPublicKeyInfo string, or "
+                "base64/base64url of the DER from getPublicKey().",
+            )
+
+        # Refuse a key we will never be able to verify a signature against.
+        # Storing one anyway reports "registered" and then fails much later
+        # with signature_invalid, which reads like a signing bug on the
+        # client rather than a registration bug.
+        try:
+            coerce_es256_public_key(public_key)
+        except (ValueError, TypeError) as exc:
+            return rejection_response(
+                R.MALFORMED_REQUEST,
+                f"unusable public_key: {exc}. Send either a PEM "
+                "SubjectPublicKeyInfo string or base64/base64url of the DER. "
+                "A COSE_Key map written as JSON will not work: COSE keys are "
+                "integers (-1, -2, -3) and JSON keys can only be strings.",
+            )
 
         # Re-registering an id the server already knows is only harmless when
         # it is the same key. A different key under an id the client believes
         # is already enrolled would silently replace it.
-        if public_key is not None and credential_id in self.credentials:
+        if credential_id in self.credentials:
             stored = _public_key_bytes(self.credentials[credential_id])
             offered = _public_key_bytes(public_key)
             if stored is not None and stored != offered:
@@ -301,11 +319,7 @@ class CredentialService:
                     "replacing this one's key",
                 )
 
-        if public_key is not None:
-            self.credentials[credential_id] = public_key
-        elif credential_id not in self.credentials:
-            # Placeholder: holds no key, so it is never offered to a browser.
-            self.credentials[credential_id] = PLACEHOLDER_CREDENTIAL
+        self.credentials[credential_id] = public_key
 
         if self.audit is not None:
             self.audit.append(

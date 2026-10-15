@@ -65,6 +65,7 @@ WEB_AUTHN_GET = "webauthn.get"
 VALIDATOR_PASS = "pass"
 POLICY_ALLOW = "allow"
 POLICY_BLOCK = "block"
+POLICY_STEP_UP = "step_up"
 
 
 # ── Pluggable pieces ──────────────────────────────────────────────────
@@ -385,9 +386,20 @@ def _check_validator_passed(gw: "ExecuteGateway", ctx: ExecuteContext) -> Option
 def _check_policy_allowed(gw: "ExecuteGateway", ctx: ExecuteContext) -> Optional[Rejection]:
     """12. The policy decision for this draft hash must be "allow".
 
-    A "block" decision is terminal. Anything else needs step-up authentication,
-    which is not yet defined (CONTRACT.md §8 open question 8) and therefore
-    currently fails closed as ``step_up_required``.
+    Each decision now says what it needs, and the mapping follows from that
+    instead of guessing (CONTRACT.md §8 open question 8, resolved):
+
+    ``block``    terminal — ``policy_blocked``.
+    ``step_up``  the draft is complete; it needs a second factor. Step-up is
+                 not implemented, so this fails closed as
+                 ``step_up_required``.
+    ``hold``     the draft still has an unresolved field, so no
+                 authentication can rescue it — ``unresolved_fields``,
+                 the same code check 5 already returns. In the real flow
+                 this is unreachable: check 5 refuses an unresolved draft
+                 long before policy runs. It is mapped rather than lumped
+                 in with step-up so an injected policy cannot turn "the
+                 user has not answered yet" into "prove who you are".
     """
     assert ctx.draft_dict is not None
     outcome = gw.policy(ctx.draft_dict, ctx.draft_hash_hex)
@@ -395,9 +407,15 @@ def _check_policy_allowed(gw: "ExecuteGateway", ctx: ExecuteContext) -> Optional
         return None
     if outcome.decision == POLICY_BLOCK:
         return rejected(R.POLICY_BLOCKED, outcome.reason or "policy blocked this draft")
+    if outcome.decision == POLICY_STEP_UP:
+        return rejected(
+            R.STEP_UP_REQUIRED,
+            outcome.reason or "policy requires step-up authentication",
+        )
     return rejected(
-        R.STEP_UP_REQUIRED,
-        outcome.reason or f"policy decision {outcome.decision!r} requires step-up",
+        R.UNRESOLVED_FIELDS,
+        outcome.reason
+        or f"policy decision {outcome.decision!r} cannot be resolved by authentication",
     )
 
 

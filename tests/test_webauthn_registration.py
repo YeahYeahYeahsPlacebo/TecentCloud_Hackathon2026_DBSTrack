@@ -250,15 +250,29 @@ def test_a_non_es256_key_is_refused():
     assert response["reason_code"] == R.MALFORMED_REQUEST
 
 
-def test_registering_with_no_public_key_still_reports_registered():
-    """Unchanged, and deliberately still allowed: the placeholder path.
+def test_registering_with_no_public_key_is_refused():
+    """A credential with no key is refused here, not at /api/execute.
 
-    It cannot sign anything — execute will refuse with `signature_invalid` —
-    but nothing in the flow requires a key until /api/execute, and refusing
-    here would break the shape CONTRACT.md §4 describes.
+    It used to answer "registered" and then fail with `signature_invalid`
+    after the user had spent a biometric — which reads like a signing bug
+    in the frontend rather than an incomplete registration.
     """
     api = make_api()
-    assert api.register({"user_id": "u"})["status"] == "registered"
+    response = api.register({"user_id": "u"})
+    assert response["reason_code"] == R.MALFORMED_REQUEST
+    # "is required", not "unusable": the two are different mistakes and the
+    # message is the only thing that tells them apart.
+    assert "'public_key' is required" in response["message"]
+    assert api.credentials == {}
+
+
+def test_a_refused_registration_is_not_offered_to_a_browser():
+    """The refusal has to be a refusal: nothing may be stored under it."""
+    api = make_api()
+    api.register({"user_id": "u"})
+
+    draft_id = api.message({"transcript": TRANSCRIPT})["items"][0]["draft"]["id"]
+    assert api.challenge({"draft_id": draft_id})["allow_credentials"] == []
 
 
 # ── The credential id belongs to the browser ──────────────────────────
@@ -400,19 +414,23 @@ def test_an_oversized_credential_id_is_refused():
 
 
 def test_a_server_generated_id_is_flagged_and_never_offered_to_a_browser():
-    """No credential_id sent: the server still answers, but says so — and a
-    key-less registration is left out of allow_credentials, because offering
-    it makes navigator.credentials.get() fail with NotAllowedError for a
-    reason the frontend cannot see."""
+    """No credential_id sent: the server still answers, but flags the id as
+    its own and leaves it out of allow_credentials — no authenticator will
+    ever put an id it did not mint into an assertion, so offering it only
+    makes navigator.credentials.get() fail with NotAllowedError for a reason
+    the frontend cannot see."""
     api = make_api()
-    registration = api.register({"user_id": "u"})
+    registration = api.register(
+        {"user_id": "u", "public_key": public_key_to_pem(new_key().public_key())}
+    )
     assert registration["credential_id_source"] == "server"
 
-    api.register(
+    browser_id = api.register(
         {
             "user_id": "u",
+            "credential_id": raw_id(),
             "public_key": public_key_to_pem(new_key().public_key()),
         }
-    )
+    )["credential_id"]
     draft_id = api.message({"transcript": TRANSCRIPT})["items"][0]["draft"]["id"]
-    assert api.challenge({"draft_id": draft_id})["allow_credentials"] == []
+    assert api.challenge({"draft_id": draft_id})["allow_credentials"] == [browser_id]

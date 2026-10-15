@@ -4,6 +4,7 @@ from backend.policy.policy import (
     ALLOW,
     BLOCK,
     HOLD,
+    STEP_UP,
     VELOCITY_WINDOW,
     Limits,
     PolicyDecision,
@@ -14,6 +15,7 @@ from backend.policy.policy import (
     rule_daily_velocity,
     rule_new_payee_step_up,
     rule_per_transaction_limit,
+    rule_positive_amount,
     rule_unresolved,
 )
 
@@ -21,6 +23,7 @@ __all__ = [
     "ALLOW",
     "BLOCK",
     "HOLD",
+    "STEP_UP",
     "VELOCITY_WINDOW",
     "Limits",
     "PolicyDecision",
@@ -31,5 +34,6 @@ __all__ = [
     "rule_daily_velocity",
     "rule_new_payee_step_up",
     "rule_per_transaction_limit",
+    "rule_positive_amount",
     "rule_unresolved",
 ]

@@ -9,7 +9,10 @@ short version is at the top; the evidence is below.
 does not work.**
 
 `POST /api/webauthn/register` takes `{user_id, credential_id, public_key}`.
-As of the `feature/member3-register-key-check` branch, `public_key` may be:
+**`public_key` is required** — a registration without one is refused `422
+malformed_request` (`"'public_key' is required"`), because a credential with
+no key fails at `/api/execute` with `signature_invalid` *after* the user has
+spent a biometric. It may be:
 
 | Form | Works? | Notes |
 |---|---|---|

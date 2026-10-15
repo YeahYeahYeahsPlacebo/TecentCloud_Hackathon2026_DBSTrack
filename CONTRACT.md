@@ -461,7 +461,7 @@ Member 3 (gateway). The credential must be created with
 |---|---|---|
 | `user_id` | yes | Who the credential belongs to. |
 | `credential_id` | no, but send it | **base64url of `attestationResponse.credential.rawId`** — the id the browser minted in `navigator.credentials.create()`. Padding is accepted and stripped; at most 1023 bytes decoded. |
-| `public_key` | no | The credential's public key: a PEM SubjectPublicKeyInfo string, or base64 / base64url of the same DER — which is what `getPublicKey()` gives you once stringified. A COSE_Key map written as JSON cannot work (COSE labels are integers; JSON keys are strings) and is refused. ES256 (P-256) only. |
+| `public_key` | **yes** | The credential's public key: a PEM SubjectPublicKeyInfo string, or base64 / base64url of the same DER — which is what `getPublicKey()` gives you once stringified. A COSE_Key map written as JSON cannot work (COSE labels are integers; JSON keys are strings) and is refused. ES256 (P-256) only. |
 | `display_name` | no | Placeholder field, unused. |
 
 > **The credential id is the browser's, not the server's.** It is what the
@@ -490,12 +490,19 @@ Member 3 (gateway). The credential must be created with
 }
 ```
 
-**Refusals** (`malformed_request`): a `credential_id` that is not base64url,
-that decodes to nothing, or that is longer than 1023 bytes; an unusable
-`public_key` (not a key at all, not P-256, or a COSE_Key map written as
-JSON); or a `credential_id` already registered with a *different* public key
-(re-registering the same key under the same id is allowed and changes
-nothing).
+> **No key, no registration.** A credential with no public key cannot sign
+> anything, so `public_key` is required and a request without one is refused
+> `422 malformed_request` instead of answering "registered". The alternative
+> — accepting it and failing later at `/api/execute` with
+> `signature_invalid` — costs the user a biometric before it tells them the
+> registration was incomplete.
+
+**Refusals** (`malformed_request`): a missing `public_key`; a `credential_id`
+that is not base64url, that decodes to nothing, or that is longer than 1023
+bytes; an unusable `public_key` (not a key at all, not P-256, or a COSE_Key
+map written as JSON); or a `credential_id` already registered with a
+*different* public key (re-registering the same key under the same id is
+allowed and changes nothing).
 
 ### POST /api/webauthn/challenge
 
@@ -609,7 +616,7 @@ first failure, so every rejection has exactly one reason code:
 | 9 | `type` is `webauthn.get`; `origin` is the expected origin; rpIdHash matches; user-verified flag set; credential is registered; ES256 signature over `authenticator_data ‖ SHA256(client_data_json)` verifies | `signature_invalid` |
 | 10 | `idempotency_key` not previously used for a different draft (same key + same draft returns the original result) | `replayed` |
 | 11 | Validator verdict for this draft hash is `pass` | `validator_frozen` |
-| 12 | Policy decision for this draft hash is `allow` (or step-up satisfied) | `policy_blocked` / `step_up_required` |
+| 12 | Policy decision for this draft hash is `allow` (or step-up satisfied) | `policy_blocked` / `step_up_required` / `unresolved_fields` |
 
 `tests/test_execute_binding.py` checks this order against a stub store,
 including that a request carrying a different draft body is rejected
@@ -871,13 +878,23 @@ team, not a silent assumption:
    `"frozen"`, which no code has ever produced; that was a typo and is
    now corrected. Whether a `"warn"` state should exist is still open.
 
-8. **Policy `decision` values.** The examples use `"allow"` and
-   `"hold"`. Is `"block"` different from `"hold"`? What are all the
-   possible policy decisions, and which map to which reason codes?
-   *Current behaviour in code, not yet a decision:* `allow` passes,
-   `block` becomes `policy_blocked`, and anything else — today only
-   `hold` — becomes `step_up_required` at step 12. Pinned by
-   `tests/test_policy_step_up.py`.
+8. ~~**Policy `decision` values.**~~ **Resolved (audit item 6).** There
+   are four, and each names what it needs:
+
+   | Decision | Means | Step 12 reason code |
+   |---|---|---|
+   | `allow` | may proceed | — |
+   | `hold` | the draft is **unfinished**: a field is still unresolved | `unresolved_fields` (same as check 5) |
+   | `step_up` | the draft is complete; a second factor is required | `step_up_required` |
+   | `block` | terminal: no rule can be satisfied | `policy_blocked` |
+
+   `hold` is **unresolved-only** now. It used to cover the new-payee
+   rule too, which made one word mean "answer a question" and "prove
+   who you are" at the same time — so step 12 had to guess. The
+   new-payee rule returns `step_up` instead. Strictness is
+   `block > step_up > hold > allow`. Step-up itself is still not
+   implemented, so `step_up` fails closed as `step_up_required`.
+   Pinned by `tests/test_policy.py` and `tests/test_policy_step_up.py`.
 
 ---
 
@@ -908,7 +925,13 @@ Deliberately not fixed in this pass. Each is a decision, not an oversight.
 - **Duplicate JSON keys.** Both parsers keep the last value; neither rejects duplicates.
 - **Stubbed crypto in tests.** `tests/test_execute_binding.py` stubs ECDSA verification. Real WebAuthn verification is untested until the gateway exists.
 - **Not yet specified.** WebAuthn `signCount` / clone detection, KYC, and binding validator and policy verdicts to the draft hash in storage.
-- **Zero amounts.** `"0.00"` passes the money pattern; policy must reject it.
+- ~~**Zero amounts.**~~ **Resolved (audit item 1):** `"0.00"` still passes
+  the money pattern, and policy now rejects it —
+  `rule_positive_amount` in `backend/policy/policy.py` returns `block`
+  for any amount that is not `> 0`, and it is **first** in `RULES`
+  because a zero is under every other limit and would otherwise be an
+  `allow`. The gateway maps that to `policy_blocked`. Pinned by
+  `tests/test_policy.py`.
 - **Multi-step group model (deferred to phase 5).** Multi-step
   transactions produce separate drafts returned inline in
   `/api/message` `items` (see §8 open question 4). The group model —

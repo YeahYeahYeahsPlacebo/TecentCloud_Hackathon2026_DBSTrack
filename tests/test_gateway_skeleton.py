@@ -284,17 +284,25 @@ def test_step_11_missing_verdict_fails_closed():
     assert gw.ledger.entries == []
 
 
-def test_step_12_block_is_policy_blocked_and_hold_is_step_up_required():
+def test_step_12_maps_each_policy_decision_to_its_own_reason_code():
     clean = load_draft("clean_transfer.json")
     blocked = build(policy=lambda d, h: PolicyDecision("block", "over per-transaction limit"))
     assert only_code(
         blocked.execute(request_for(clean.id, make_assertion(challenge_for(clean))))
     ) == R.POLICY_BLOCKED
 
-    held = build(policy=lambda d, h: PolicyDecision("hold", "new payee"))
+    needs_factor = build(policy=lambda d, h: PolicyDecision("step_up", "new payee"))
+    assert only_code(
+        needs_factor.execute(request_for(clean.id, make_assertion(challenge_for(clean))))
+    ) == R.STEP_UP_REQUIRED
+    assert needs_factor.ledger.entries == []
+
+    # "hold" is unresolved-only now, so it reports the same code as check 5
+    # rather than pretending a second factor would help.
+    held = build(policy=lambda d, h: PolicyDecision("hold", "unresolved_fields"))
     assert only_code(
         held.execute(request_for(clean.id, make_assertion(challenge_for(clean))))
-    ) == R.STEP_UP_REQUIRED
+    ) == R.UNRESOLVED_FIELDS
     assert held.ledger.entries == []
 
 

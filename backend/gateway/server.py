@@ -63,6 +63,34 @@ def _flag(name: str, default: bool = False) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+# WebAuthn is bound to a host and an origin, both of which a deployment has
+# to be able to name: the browser will not produce a credential for an rpId
+# it is not on, and /api/execute compares the origin in clientDataJSON to
+# this one literally. Localhost is the development default, not a setting.
+DEFAULT_RP_ID = "localhost"
+DEFAULT_ORIGIN = "http://localhost:8000"
+
+
+def _env_value(name: str, default: str) -> str:
+    """``name`` if it is set to something, else ``default``.
+
+    Deliberately treats "set but empty" as unset: a stray ``DCTA_ORIGIN=``
+    in a shell would otherwise make every signature fail with
+    ``signature_invalid`` for a reason nobody can see.
+    """
+    return os.environ.get(name, "").strip() or default
+
+
+def _rp_id() -> str:
+    """The WebAuthn relying-party id the browser must be on."""
+    return _env_value("DCTA_RP_ID", DEFAULT_RP_ID)
+
+
+def _origin() -> str:
+    """The browser origin ``clientDataJSON`` must carry (scheme, host, port)."""
+    return _env_value("DCTA_ORIGIN", DEFAULT_ORIGIN)
+
+
 def _chat_client() -> Optional[Any]:
     """The chat client the question form of ``/api/clarify`` needs.
 
@@ -118,6 +146,9 @@ def build_api() -> GatewayAPI:
         DCTA_NO_BANK=1            run with no money moving at all
         DCTA_NO_CLIENT=1          no chat client (free-text clarify 500s)
         DCTA_FAKE_CLIENT=1        scripted client, for local wiring only
+        DCTA_RP_ID                WebAuthn rpId (default: localhost)
+        DCTA_ORIGIN               origin clientDataJSON must carry
+                                  (default: http://localhost:8000)
     """
     audit_path = os.environ.get("DCTA_AUDIT_PATH", "").strip()
     ledger_path = os.environ.get("DCTA_LEDGER_PATH", "").strip()
@@ -131,6 +162,8 @@ def build_api() -> GatewayAPI:
         audit=AuditLog(path=audit_path or None),
         ledger=FileLedger(ledger_path) if ledger_path else InMemoryLedger(),
         bank=bank,
+        rp_id=_rp_id(),
+        origin=_origin(),
     )
 
 

@@ -8,10 +8,14 @@ is one of three decisions:
 ``allow``
     Execution may proceed.
 ``hold``
-    The draft is legitimate but needs something more from the user — an
-    unresolved field, or step-up authentication for a new payee. Maps to
-    ``step_up_required`` at `/api/execute` until step-up is defined
-    (CONTRACT.md §8 open question 8).
+    The draft still has an unresolved field, so a question must be answered
+    first. Step-up authentication cannot satisfy it — there is nothing to
+    authenticate against until the draft is complete. **Unresolved is the
+    only thing ``hold`` means** (CONTRACT.md §8 open question 8, resolved).
+``step_up``
+    The draft is complete and legitimate, but this account has never paid
+    this payee and the amount is large enough to ask for a second factor.
+    Maps to ``step_up_required`` at `/api/execute`.
 ``block``
     The draft violates a rule and no amount of extra authentication makes it
     executable. Maps to ``policy_blocked``.
@@ -33,10 +37,13 @@ from typing import Any, Iterable, Mapping, Optional
 
 ALLOW = "allow"
 HOLD = "hold"
+STEP_UP = "step_up"
 BLOCK = "block"
 
 # How strict each decision is. Higher wins when several rules fire.
-_SEVERITY = {ALLOW: 0, HOLD: 1, BLOCK: 2}
+# ``step_up`` outranks ``hold``: a complete draft that merely needs a second
+# factor is further along than one the user has not finished answering.
+_SEVERITY = {ALLOW: 0, HOLD: 1, STEP_UP: 2, BLOCK: 3}
 
 VELOCITY_WINDOW = timedelta(hours=24)
 
@@ -112,6 +119,34 @@ def _parse_z(value: Any) -> Optional[datetime]:
 # ── The rules ─────────────────────────────────────────────────────────
 
 
+def rule_positive_amount(
+    draft: Mapping[str, Any], ctx: "PolicyInput"
+) -> Optional[PolicyDecision]:
+    r"""A transfer of nothing is not a transfer.
+
+    CONTRACT.md §9 lists zero amounts under "known limitations" with the
+    note *policy must reject it* — this is that rejection. It is first in
+    :data:`RULES` because every rule below it either compares the amount
+    against a limit or ignores it: ``0.00`` is under every limit, so a
+    zero draft would otherwise walk through as ``allow`` while looking
+    like a real payment on screen.
+
+    ``block`` rather than ``hold``: there is no answer the user can give
+    that makes sending nothing meaningful.
+
+    The schema forbids negative amounts (``^(0|[1-9][0-9]*)\.[0-9]{2}$``),
+    so in practice this fires on ``"0.00"``. It checks ``<= 0`` anyway
+    because ``_money`` reads an unparseable amount as ``0``, and an amount
+    that is not a number is no more executable than one that is zero.
+    """
+    amount, currency = _draft_amount(draft)
+    if amount > 0:
+        return None
+    return PolicyDecision(
+        BLOCK, f"amount {amount} {currency} is not a positive transfer"
+    )
+
+
 def rule_unresolved(draft: Mapping[str, Any], ctx: "PolicyInput") -> Optional[PolicyDecision]:
     """A draft with unresolved fields cannot be executed at all.
 
@@ -119,6 +154,10 @@ def rule_unresolved(draft: Mapping[str, Any], ctx: "PolicyInput") -> Optional[Po
     "unresolved_fields"}`` for `ambiguous_payee.json`. The gateway also
     rejects it independently at check 5 — this is the second gate, and the
     two must not disagree.
+
+    ``hold`` is this rule's alone. It used to be shared with the step-up
+    rule, which made the word mean two different things and forced
+    `/api/execute` to guess which one it was looking at.
     """
     if draft.get("unresolved"):
         return PolicyDecision(HOLD, "unresolved_fields")
@@ -167,7 +206,12 @@ def rule_daily_velocity(draft: Mapping[str, Any], ctx: "PolicyInput") -> Optiona
 def rule_new_payee_step_up(
     draft: Mapping[str, Any], ctx: "PolicyInput"
 ) -> Optional[PolicyDecision]:
-    """A large transfer to a payee this account has never paid needs step-up."""
+    """A large transfer to a payee this account has never paid needs step-up.
+
+    Returns ``step_up``, not ``hold``: the draft is complete and the user
+    has answered everything, so what it needs is a second factor, not
+    another question. Conflating the two is what made ``hold`` ambiguous.
+    """
     payee = draft.get("payee")
     if not isinstance(payee, Mapping):
         return None  # no payee yet: the unresolved rule already covers it
@@ -178,7 +222,7 @@ def rule_new_payee_step_up(
     threshold = _money(ctx.limits.new_payee_step_up_above)
     if amount > threshold:
         return PolicyDecision(
-            HOLD,
+            STEP_UP,
             f"first transfer to payee {payee_id} of {amount} {currency} requires step-up",
         )
     return None
@@ -226,6 +270,9 @@ def rule_sufficient_funds(
 
 
 RULES = (
+    # First, and deliberately so: a zero amount is under every limit below,
+    # so anything else here would let "send nothing" through as an allow.
+    rule_positive_amount,
     rule_unresolved,
     rule_per_transaction_limit,
     rule_daily_velocity,
