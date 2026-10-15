@@ -28,6 +28,7 @@ from backend.canonical import draft_hash
 from backend.gateway import reason_codes as R
 from backend.gateway.errors import rejection_response
 from backend.gateway.execute import b64url_encode
+from backend.gateway.webauthn import coerce_es256_public_key
 from backend.models.draft import TransactionDraft
 
 USER_VERIFICATION = "required"
@@ -149,8 +150,24 @@ class CredentialService:
         if not isinstance(request, Mapping) or "user_id" not in request:
             return rejection_response(R.MALFORMED_REQUEST, "'user_id' is required")
 
-        credential_id = b64url_encode(secrets.token_bytes(16))
         public_key = request.get("public_key")
+        if public_key is not None:
+            # Refuse a key we will never be able to verify a signature against.
+            # Storing one anyway reports "registered" and then fails much later
+            # with signature_invalid, which reads like a signing bug on the
+            # client rather than a registration bug.
+            try:
+                coerce_es256_public_key(public_key)
+            except (ValueError, TypeError) as exc:
+                return rejection_response(
+                    R.MALFORMED_REQUEST,
+                    f"unusable public_key: {exc}. Send either a PEM "
+                    "SubjectPublicKeyInfo string or base64/base64url of the DER. "
+                    "A COSE_Key map written as JSON will not work: COSE keys are "
+                    "integers (-1, -2, -3) and JSON keys can only be strings.",
+                )
+
+        credential_id = b64url_encode(secrets.token_bytes(16))
         self.credentials[credential_id] = (
             public_key if public_key is not None else "unregistered-placeholder"
         )
