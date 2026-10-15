@@ -224,6 +224,7 @@
     var items = parsed.items;
     var intents = parsed.intentsDetected;
     var responseGen = messageGen;
+    var speechCards = [], renderJobs = [];
 
     // Build a container for all rendered items.
     var containerHtml = '';
@@ -262,10 +263,14 @@
 
         // Compute hash, then render into the placeholder.
         // We use a closure to capture the placeholderId and item data.
-        canonical.draftHashAsync(draft)
+        renderJobs.push(canonical.draftHashAsync(draft)
           .then(function (hash) {
             if (responseGen !== messageGen) return;
             renderApiDraftInto(draft, hash, validator, policy, placeholderId);
+            var card = document.getElementById(placeholderId).querySelector(".card");
+            if (!card.querySelector(".js-hear-question")) DctaVoice.attachDraftReadback(card, draft, false, idx);
+            speechCards.push({ card: card, draft: draft, index: idx,
+              anchor: card.querySelector(".js-hear-question, .js-draft-readback") });
           })
           .catch(function (err) {
             if (responseGen !== messageGen) return;
@@ -273,7 +278,7 @@
             if (el) el.innerHTML =
               '<p class="placeholder">Hash error: ' +
               escapeHtml(err.message) + "</p>";
-          });
+          }));
         draftCount++;
       } else if (item.kind === "question") {
         containerHtml += renderQuestionItem(item);
@@ -284,6 +289,9 @@
     // Set the container HTML. Draft placeholders will be filled
     // asynchronously as each hash completes.
     displayEl.innerHTML = containerHtml;
+    Promise.all(renderJobs).then(function () {
+      if (responseGen === messageGen) DctaVoice.queueCards(speechCards);
+    });
 
     if (draftCount === 0 && questionCount === 0) {
       // No recognizable items.

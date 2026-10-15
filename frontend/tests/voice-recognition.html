@@ -81,6 +81,57 @@ function emit(recognizer, words) {
     emit(current, [['stale words', true]]);
     assert(current.aborts === 1 && input.value === 'Send fifty dollars to John', 'Stale final overwrote message');
   });
+  test('Held recording restarts and preserves a long two-transfer sentence exactly once', function () {
+    key('keydown'); var current = recognizers.at(-1);
+    assert(current.continuous === true, 'Continuous recognition not requested');
+    emit(current, [['Send fifty dollars to John', true]]);
+    current.onend();
+    assert(send.disabled && mic.getAttribute('aria-pressed') === 'true', 'Browser end finished a held session');
+    emit(current, [['stale duplicated first clause', true]]);
+    advance(200); var restarted = recognizers.at(-1);
+    assert(restarted !== current, 'Recognizer not restarted');
+    emit(restarted, [['and send thirty dollars', true], ['to Jane', false]]);
+    emit(restarted, [['and send thirty dollars', true], ['to Jane', false]]);
+    assert(input.value === 'Send fifty dollars to John and send thirty dollars', 'Accumulation duplicated or included interim');
+    key('keyup'); advance(5000);
+    emit(restarted, [['and send thirty dollars', true], ['to Jane Tan.', true]]);
+    restarted.onend(); advance(200);
+    assert(input.value === 'Send fifty dollars to John and send thirty dollars to Jane Tan.', 'Late final after restart lost');
+    assert(!send.disabled && recognizers.at(-1) === restarted && restarted.stops === 1, 'Release restarted or did not stop');
+  });
+  test('Release during restart gap prevents another recognizer', function () {
+    key('keydown'); var current = recognizers.at(-1), count = recognizers.length;
+    emit(current, [['fifty dollars', true]]); current.onend(); key('keyup'); advance(200);
+    assert(recognizers.length === count && !send.disabled, 'Restart survived release');
+  });
+  test('Permission denial never restarts while held', function () {
+    key('keydown'); var current = recognizers.at(-1), count = recognizers.length;
+    current.onerror({error:'not-allowed'}); current.onend(); advance(200);
+    assert(recognizers.length === count && current.aborts === 1 && !send.disabled, 'Permission denial restarted');
+    assert(document.getElementById('voice-status').textContent.includes('denied'), 'No denial feedback');
+  });
+  test('Tap mode starts, survives browser end, and stops with a second tap', function () {
+    var toggle = document.getElementById('mic-toggle-btn'); toggle.click(); var current = recognizers.at(-1);
+    emit(current, [['Send fifty dollars',true]]); current.onend(); advance(200);
+    var restarted = recognizers.at(-1); emit(restarted, [['to John Smith',true]]);
+    toggle.click(); restarted.onend(); advance(200);
+    assert(input.value === 'Send fifty dollars to John Smith' && !send.disabled && toggle.getAttribute('aria-pressed') === 'false', 'Tap mode broken');
+  });
+  test('Repeated empty endings are bounded with a visible fallback', function () {
+    key('keydown'); for (var n=0;n<3;n++){recognizers.at(-1).onend();advance(200)}
+    var count=recognizers.length;advance(1000);
+    assert(recognizers.length===count&&!send.disabled&&document.getElementById('voice-status').textContent.includes('tap-to-start'), 'Empty restart loop unbounded');
+  });
+  test('Pointer cancellation stops all restarts and ignores stale finals', function () {
+    key('keydown'); var current=recognizers.at(-1);mic.dispatchEvent(new Event('pointercancel'));
+    var before=input.value;current.onend();emit(current,[['stale',true]]);advance(200);
+    assert(current.aborts===1&&input.value===before&&!send.disabled,'Cancellation leaked a restart/result');
+  });
+  test('Speech never clicks Send', function () {
+    var submissions=0;send.addEventListener('click',()=>submissions++);
+    key('keydown');var current=recognizers.at(-1);emit(current,[['yes send it',true]]);key('keyup');current.onend();
+    assert(submissions===0&&input.value==='yes send it','Speech submitted instead of filling editable text');
+  });
   window.voiceTestResults = results;
   document.getElementById('test-results').textContent = JSON.stringify(results, null, 2);
 })();

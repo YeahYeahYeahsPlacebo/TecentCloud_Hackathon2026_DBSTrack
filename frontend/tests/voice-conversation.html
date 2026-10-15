@@ -1,0 +1,37 @@
+<!doctype html><meta charset="utf-8"><title>Conversation speech queue regression tests</title>
+<!-- Deterministic speech lifecycle doubles; no microphone, service or transaction API calls. -->
+<textarea id="text-input"></textarea><button id="send-btn">Send</button><button id="mic-btn">Hold to talk</button>
+<p id="voice-status"></p><p id="voice-preview"></p><div id="draft-display"></div><pre id="test-results">Running</pre>
+<script>
+var spoken=[],active=0,overlaps=0,cancels=0,timers=new Map(),next=0;
+window.setTimeout=(fn,ms)=>{timers.set(++next,fn);return next};window.clearTimeout=id=>timers.delete(id);
+window.SpeechRecognition=undefined;window.webkitSpeechRecognition=undefined;
+window.SpeechSynthesisUtterance=class{constructor(text){this.text=text}};
+Object.defineProperty(window,'speechSynthesis',{value:{speak(u){if(active)overlaps++;active++;spoken.push(u);u.onstart()},cancel(){active=0;cancels++}},configurable:true});
+function ended(){active=0;spoken.at(-1).onend()}
+</script>
+<script src="../js/voice.js"></script><script src="../js/ambiguity.js"></script>
+<script>
+(async function(){
+ var results=[];function assert(x,message){if(!x)throw Error(message)}
+ function test(name,fn){try{fn();results.push({name,passed:true})}catch(e){results.push({name,passed:false,error:e.message})}}
+ DctaVoice.init();var display=document.getElementById('draft-display');
+ var draft={amount:{value:'30.00',currency:'SGD'},payee:{display_name:'Actual Person',masked_account:'****8642'},source_account:'actual-source'};
+ function known(){var c=document.createElement('div');display.append(c);DctaVoice.attachDraftReadback(c,draft,false,0);return c}
+ function ambiguous(){var c=document.createElement('div');c.innerHTML='<p class="clarify-prompt"></p><input class="js-payee-filter"><div class="js-clarify-list"></div><button class="js-clarify-confirm" disabled>Confirm selection</button>';display.append(c);DctaAmbiguity.attach(c,[{id:'a',display_name:'Maya Tan',masked_account:'****1357'},{id:'b',display_name:'Maya Lim',masked_account:'****2468'}]);return c}
+ var a=known(),b=ambiguous(),items=[{card:a,draft,index:0},{card:b,draft:{},index:1}];
+ test('Automatic queue prioritizes ambiguity with an item label and actual offered candidates',()=>{DctaVoice.queueCards(items);assert(spoken.length===1&&spoken[0].text==='Item 2. I found Maya Tan ending in 1357 and Maya Lim ending in 2468. Which one did you mean?','Wrong question/order');assert(!b.querySelector('.candidate-btn.selected')&&b.querySelector('.js-clarify-confirm').disabled,'Audio selected a payee')});
+ test('Draft waits for question end, then reads only its server details without overlap',()=>{assert(spoken.length===1,'Draft started before question ended');ended();assert(spoken.length===2&&spoken[1].text.startsWith('Item 1. Draft.')&&spoken[1].text.includes('30.00 SGD')&&spoken[1].text.includes('Actual Person')&&spoken[1].text.includes('8642'),'Wrong draft read-back');assert(overlaps===0,'Speech overlapped');ended()});
+ test('Manual replay controls remain available',()=>{a.querySelector('.js-draft-readback').click();assert(spoken.at(-1).text.includes('30.00 SGD'),'Replay unavailable');ended();b.querySelector('.js-hear-question').click();assert(spoken.at(-1).text.includes('Maya Tan'),'Question replay unavailable');ended()});
+ test('Audio error stops queued speech and retains visible fallbacks',()=>{DctaVoice.queueCards(items);var count=spoken.length;spoken.at(-1).onerror();assert(spoken.length===count&&!b.querySelector('.js-hear-question').disabled&&b.querySelector('.js-question-status').textContent.includes('blocked'),'Missing blocked playback fallback')});
+ test('A silent autoplay block times out to manual replay instead of hanging the queue',()=>{var original=speechSynthesis.speak;speechSynthesis.speak=u=>{active++;spoken.push(u)};DctaVoice.queueCards(items);var count=spoken.length;Array.from(timers.values()).forEach(fn=>fn());speechSynthesis.speak=original;assert(active===0&&spoken.length===count&&b.querySelector('.js-question-status').textContent.includes('blocked')&&b.querySelector('.js-hear-question').textContent==='Hear question','Silent block did not recover')});
+ test('Two known drafts queue in server item order without overlap',()=>{var c=known(),d=known();DctaVoice.queueCards([{card:d,draft,index:1},{card:c,draft,index:0}]);assert(spoken.at(-1).text.startsWith('Item 1.'),'First item reordered');ended();assert(spoken.at(-1).text.startsWith('Item 2.')&&overlaps===0,'Second item overlapped/reordered');ended()});
+ test('New message reset cancels active and queued speech and ignores old onend',()=>{DctaVoice.queueCards(items);var old=spoken.at(-1),count=spoken.length;DctaVoice.reset();old.onend();assert(spoken.length===count&&active===0,'Stale queue survived reset')});
+ DctaVoice.queueCards(items);var count=spoken.length,old=spoken.at(-1);b.remove();await new Promise(resolve=>queueMicrotask(resolve));
+ test('Replacing a card cancels its stale active/queued audio',()=>{old.onend();assert(active===0&&spoken.length===count,'Detached card kept talking')});
+ test('Unsupported recognition leaves tap controls and readable question intact',()=>{assert(document.getElementById('mic-toggle-btn').disabled&&b.querySelector('.js-answer-voice').disabled&&b.querySelector('.clarify-prompt').textContent.includes('Maya'),'Unsupported fallback missing')});
+ test('A response waiting on another hash cannot read a superseded card root',()=>{DctaVoice.reset();var c=known(),anchor=c.querySelector('.js-draft-readback'),count=spoken.length;c.innerHTML='<p>New returned content</p>';DctaVoice.queueCards([{card:c,draft,index:0,anchor}]);assert(spoken.length===count,'Reused root read an old draft')});
+ test('Speech does not send or confirm even when transcript says yes',()=>{var calls=0;document.getElementById('send-btn').addEventListener('click',()=>calls++);b.querySelector('.js-clarify-confirm').addEventListener('click',()=>calls++);var c=known();DctaVoice.queueCards([{card:c,draft,index:0}]);assert(calls===0&&spoken.at(-1).text.includes('never signs or executes'),'Speech authorized')});
+ DctaVoice.reset();window.conversationTestResults=results;document.getElementById('test-results').textContent=JSON.stringify(results,null,2);
+})();
+</script>
