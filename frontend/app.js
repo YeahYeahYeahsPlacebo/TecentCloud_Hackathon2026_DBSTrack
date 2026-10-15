@@ -746,6 +746,7 @@
     wireCandidateButtons(cardEl);
     wirePayeeFilter(cardEl);
     wireClarifyConfirmBtn(cardEl);
+    DctaAmbiguity.attach(cardEl, candidates);
     setHint("Select the intended payee, then choose Confirm selection to update the draft.");
   }
 
@@ -1351,6 +1352,7 @@
             var inner = cardEl.querySelector('[' + marker + ']');
             if (!inner) return;
             renderServerDraftInto(draft, hash, validator, policy, inner);
+            DctaVoice.attachDraftReadback(inner.querySelector(".card"), draft, true);
           })
           .catch(function (err) {
             var inner = cardEl.querySelector('[' + marker + ']');

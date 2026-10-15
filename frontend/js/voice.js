@@ -9,10 +9,22 @@
 
   function sayStatus(text) { status.textContent = text; }
   function clearPreview() { preview.textContent = ""; preview.hidden = true; }
+  function recognitionStatus(record, text) {
+    (record.target ? record.target.status : status).textContent = text;
+  }
   function finish(record, message) {
     if (session !== record) return;
     session = null;
     clearTimeout(record.timer);
+    if (record.target) {
+      record.target.preview.textContent = "";
+      record.target.preview.hidden = true;
+      record.target.button.setAttribute("aria-pressed", "false");
+      record.target.button.textContent = "Answer by voice";
+      if (!message && record.finalText) record.target.onFinal(record.finalText);
+      else recognitionStatus(record, message || "No final answer heard. Try again or tap a payee.");
+      return;
+    }
     clearPreview();
     mic.setAttribute("aria-pressed", "false");
     mic.textContent = "Hold to talk";
@@ -32,33 +44,44 @@
     var old = playback;
     playback = null;
     global.speechSynthesis.cancel();
-    old.button.textContent = "Read amount twice";
-    old.status.textContent = "Read-back stopped. Audio is not authorization.";
+    old.button.textContent = old.idleLabel;
+    old.status.textContent = "Audio stopped. Audio is not authorization.";
   }
   function reset() {
     cancelRecognition();
     cancelPlayback();
   }
-  function startRecording() {
-    if (!Recognition || session || input.disabled) return;
+  function startRecording(target) {
+    target = target || null;
+    if (!Recognition || input.disabled || (target && (!target.card.isConnected || target.card.getAttribute("data-clarify-in-flight") === "true"))) return;
+    if (session) {
+      if (session.target === target) return;
+      cancelRecognition("Microphone stopped. You can still tap a payee or type your message.");
+    }
     cancelPlayback();
     clearPreview();
     var recognition;
     try { recognition = new Recognition(); }
-    catch (_) { sayStatus("Speech recognition could not start. Please type your message."); return; }
-    var record = { recognition: recognition, finalText: "", stopping: false, stopIssued: false, timer: null };
+    catch (_) { (target ? target.status : status).textContent = target ? "Voice could not start. Tap a payee instead." : "Speech recognition could not start. Please type your message."; return; }
+    var record = { recognition: recognition, finalText: "", stopping: false, stopIssued: false, timer: null, target: target };
     session = record;
     recognition.lang = "en-SG";
     recognition.interimResults = true;
     recognition.continuous = false;
-    send.disabled = true;
-    mic.setAttribute("aria-pressed", "true");
-    mic.textContent = "Release to finish";
-    sayStatus("Starting microphone… Hold to speak; release to finish.");
+    if (target) {
+      target.onStart();
+      target.button.setAttribute("aria-pressed", "true");
+      target.button.textContent = "Finish voice answer";
+    } else {
+      send.disabled = true;
+      mic.setAttribute("aria-pressed", "true");
+      mic.textContent = "Release to finish";
+    }
+    recognitionStatus(record, target ? "Listening for a payee. Click again to finish; you must confirm the selection yourself." : "Starting microphone… Hold to speak; release to finish.");
     recognition.onstart = function () {
       if (session !== record) return;
       if (record.stopping) { stopRecording(); return; }
-      sayStatus("Listening… Release to finish. Nothing will be sent automatically.");
+      recognitionStatus(record, target ? "Listening for a payee. Click again to finish; nothing is submitted automatically." : "Listening… Release to finish. Nothing will be sent automatically.");
     };
     recognition.onresult = function (event) {
       if (session !== record) return;
@@ -70,9 +93,11 @@
         (result.isFinal ? finals : interim).push(result[0].transcript);
       }
       record.finalText = finals.join(" ").trim();
-      if (record.finalText) input.value = record.finalText;
-      preview.textContent = interim.length ? "Preview only: " + interim.join(" ") : "";
-      preview.hidden = !interim.length;
+      if (!target && record.finalText) input.value = record.finalText;
+      var previewEl = target ? target.preview : preview;
+      previewEl.textContent = interim.length ? "Preview only: " + interim.join(" ") : "";
+      previewEl.hidden = !interim.length;
+      if (target && record.finalText) target.onHeard(record.finalText);
     };
     recognition.onerror = function (event) {
       if (session !== record) return;
@@ -99,7 +124,7 @@
     var record = session;
     record.stopping = true;
     if (record.stopIssued) return;
-    sayStatus("Finishing recognition… Review the final words before sending.");
+    recognitionStatus(record, record.target ? "Finishing recognition… Review the selected payee before confirming." : "Finishing recognition… Review the final words before sending.");
     // stop() while starting may throw; onstart retries after a quick release.
     try {
       record.recognition.stop();
@@ -118,7 +143,7 @@
     mic.disabled = !Recognition;
     sayStatus(Recognition ? "Hold to talk. Speech recognition may use your browser's online speech service." : "Speech recognition is not supported here. Please type your message.");
     mic.addEventListener("pointerdown", function (event) {
-      if (event.button !== 0 || session) return;
+      if (event.button !== 0 || (session && !session.target)) return;
       event.preventDefault();
       mic.focus();
       mic.setPointerCapture(event.pointerId);
@@ -155,6 +180,7 @@
     // A detached/replaced card must never keep talking about an old draft.
     new MutationObserver(function () {
       if (playback && !playback.button.isConnected) cancelPlayback();
+      if (session && session.target && !session.target.card.isConnected) cancelRecognition();
     }).observe(document.getElementById("draft-display"), { childList: true, subtree: true });
   }
   function attachReadback(card, draft) {
@@ -175,30 +201,68 @@
     note.textContent = !canSpeak ? "Read-back is not supported in this browser." : !available ? "No server-returned amount to read." : "Reads this draft's amount twice. Audio is not authorization.";
     controls.appendChild(button); controls.appendChild(note); card.appendChild(controls);
     button.addEventListener("click", function () {
-      if (playback && playback.button === button) { cancelPlayback(); return; }
-      cancelRecognition(); cancelPlayback();
-      var text = "The draft amount is " + amount.value + " " + amount.currency + ". I repeat: " + amount.value + " " + amount.currency + ". Review the draft on screen. This is not authorization.";
-      var utterance;
-      try { utterance = new global.SpeechSynthesisUtterance(text); }
-      catch (_) { note.textContent = "Read-back could not start. Review the amount on screen."; return; }
-      var record = { button: button, status: note, utterance: utterance };
-      playback = record;
-      utterance.lang = "en-SG";
-      button.textContent = "Stop read-back";
-      note.textContent = "Reading the server-returned amount twice. Audio is not authorization.";
-      utterance.onend = function () {
-        if (playback !== record) return;
-        playback = null; button.textContent = "Read amount twice";
-        note.textContent = "Read-back finished. Review the draft on screen; audio is not authorization.";
-      };
-      utterance.onerror = function () {
-        if (playback !== record) return;
-        playback = null; button.textContent = "Read amount twice";
-        note.textContent = "Read-back unavailable. Review the amount on screen.";
-      };
-      try { global.speechSynthesis.speak(utterance); }
-      catch (_) { utterance.onerror(); }
+      speakText(button, note, "The draft amount is " + amount.value + " " + amount.currency + ". I repeat: " + amount.value + " " + amount.currency + ". Review the draft on screen. This is not authorization.", "Read amount twice");
     });
   }
-  global.DctaVoice = { init: init, reset: reset, attachReadback: attachReadback };
+  function speakText(button, note, text, idleLabel) {
+    if (!canSpeak || !button.isConnected) return;
+    if (playback && playback.button === button) { cancelPlayback(); return; }
+    cancelRecognition(); cancelPlayback();
+    var utterance;
+    try { utterance = new global.SpeechSynthesisUtterance(text); }
+    catch (_) { note.textContent = "Audio could not start. Please read the text on screen."; return; }
+    var record = { button: button, status: note, utterance: utterance, idleLabel: idleLabel };
+    playback = record;
+    utterance.lang = "en-SG";
+    button.textContent = "Stop audio";
+    note.textContent = "Playing audio. Audio is not authorization.";
+    utterance.onend = function () {
+      if (playback !== record) return;
+      playback = null; button.textContent = idleLabel;
+      note.textContent = "Audio finished. Review the details on screen; audio is not authorization.";
+    };
+    utterance.onerror = function () {
+      if (playback !== record) return;
+      playback = null; button.textContent = idleLabel;
+      note.textContent = "Audio unavailable. Please read the text on screen.";
+    };
+    try { global.speechSynthesis.speak(utterance); }
+    catch (_) { utterance.onerror(); }
+  }
+  function wireAnswer(target) {
+    target.button.disabled = !Recognition;
+    if (!Recognition) target.status.textContent = "Voice recognition is unavailable. Tap a payee, then Confirm selection.";
+    target.button.addEventListener("click", function () {
+      if (session && session.target === target) stopRecording();
+      else startRecording(target);
+    });
+    // Tapping/filtering is an explicit alternative to the pending voice answer.
+    target.card.addEventListener("click", function (event) {
+      if (event.target.closest(".candidate-btn") && session && session.target === target) cancelRecognition();
+    });
+    target.card.addEventListener("input", function () {
+      if (session && session.target === target) cancelRecognition();
+    });
+  }
+  function attachDraftReadback(card, draft, autoplay) {
+    if (!card || !card.isConnected) return;
+    var controls = document.createElement("div"), button = document.createElement("button"), note = document.createElement("p");
+    controls.className = "readback-controls";
+    button.type = "button"; button.className = "btn btn-voice js-draft-readback"; button.textContent = "Read updated draft";
+    note.className = "hint"; note.setAttribute("role", "status");
+    controls.append(button, note); card.appendChild(controls);
+    button.disabled = !canSpeak;
+    note.textContent = canSpeak ? "Reads the newly returned draft. Speech is acknowledgement only, never authorization." : "Audio is unavailable. Review the updated draft on screen.";
+    // Only the new server response is used. Neither the old candidate nor the
+    // recognized answer can supply the amount or recipient in this read-back.
+    var amount = draft.amount;
+    var text = "Updated draft. " + (amount ? "Amount: " + amount.value + " " + amount.currency + ". " : "") +
+      (draft.payee ? "Recipient: " + draft.payee.display_name + ", account ending " + String(draft.payee.masked_account).replace(/\*/g, "") + ". " : "Recipient is unresolved. ") +
+      "Source account: " + draft.source_account + ". Review the details. This is a draft, not an execution. Spoken confirmation never signs or executes.";
+    button.addEventListener("click", function () { speakText(button, note, text, "Read updated draft"); });
+    // The user's manual Confirm selection requested this read-back. Browser
+    // autoplay restrictions may still require tapping the retained button.
+    if (autoplay && canSpeak) button.click();
+  }
+  global.DctaVoice = { init: init, reset: reset, attachReadback: attachReadback, wireAnswer: wireAnswer, speakText: speakText, canSpeak: canSpeak, attachDraftReadback: attachDraftReadback };
 })(window);
