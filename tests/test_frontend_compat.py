@@ -19,9 +19,10 @@ one to a user: the name on the candidate button is the name on the confirmed
 draft. The resolved payee comes from the directory (`FixtureDirectory`),
 which is authoritative per CONTRACT.md §4, so the stub parser must build its
 candidates from that same directory. It used to hard-code payee-102 as
-"John Smith" while the directory knows it as "John Lee"; the user clicked
-one name and the draft showed another. The stub now takes its candidates
-from the directory, and `test_resolved_payee_comes_from_the_directory_not_the_candidate_label`
+"John Smith" while the directory knew it as "John Lee" — and the shared
+fixture did the same — so the user clicked one name and the draft showed
+another. Both now read from the directory, and
+`test_resolved_payee_comes_from_the_directory_not_the_candidate_label`
 asserts the two agree (it was skipped while they did not).
 
 The payee pick also reaches the validator with a ClarificationRecord
@@ -109,10 +110,12 @@ def test_a_wrong_clarification_answer_is_422_invalid_clarification_answer():
 
 def test_resolved_payee_comes_from_the_directory_not_the_candidate_label():
     """CONTRACT.md §4: the directory is authoritative. The resolved name is
-    the directory's, which is why a "John Smith" candidate can resolve to
-    "John Lee" — that mismatch is Member 1's parser/directory data, not a
-    protocol break. This asserts the authoritative behaviour explicitly so
-    the divergence is tracked, not hidden."""
+    always the directory's, never the label the candidate happened to carry:
+    when the two disagreed, that was a data drift (payee-102 was "John Smith"
+    to the stub and the fixture, "John Lee" to the directory), not a protocol
+    break. Both sides now read from the directory. This asserts the
+    authoritative behaviour explicitly so the next drift fails here, not in
+    front of a user."""
     c = client()
     draft = _message(c, "Send fifty dollars to John.")["items"][0]["draft"]
     answer = draft["payee_candidates"][1]["id"]  # payee-102
@@ -130,7 +133,8 @@ def test_resolved_payee_comes_from_the_directory_not_the_candidate_label():
     }[answer]
     assert resolved["display_name"] == directory_name
     # The label the user clicked is the name the draft shows. This was a
-    # pytest.skip while the stub offered payee-102 as "John Smith".
+    # pytest.skip while the stub and the fixture offered payee-102 as
+    # "John Smith" and the directory called it "John Lee".
     assert shown_name == directory_name
     assert shown_name == "John Lee"
 

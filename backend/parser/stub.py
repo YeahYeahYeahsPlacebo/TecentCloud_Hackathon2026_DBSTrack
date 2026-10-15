@@ -272,8 +272,9 @@ def _ambiguous_payee(
     """The ambiguous-payee draft (shape of fixtures/drafts/ambiguous_payee.json).
 
     Only the shape matches the fixture.  The candidate names come from the
-    directory, so payee-102 is "John Lee" here, whereas the shared fixture
-    still labels it "John Smith".
+    directory, so payee-102 is "John Lee" here — the same name the shared
+    fixture carries since PR #24 aligned it.  tests/test_fixture_directory_parity.py
+    is what keeps the two in step from now on.
     """
     created, expires = _fresh_timestamps()
     return TransactionDraft(
