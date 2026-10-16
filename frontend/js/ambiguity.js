@@ -40,13 +40,11 @@
     prompt.textContent = question(candidates);
     var controls = document.createElement("div");
     controls.className = "ambiguity-voice";
-    controls.innerHTML = '<div class="clarify-actions"><button type="button" class="btn btn-voice js-hear-question">Hear question</button>' +
-      '<button type="button" class="btn btn-voice js-answer-voice" aria-pressed="false">Answer by voice</button></div>' +
+    controls.innerHTML = '<div class="clarify-actions"><button type="button" class="btn btn-voice js-answer-voice" aria-pressed="false">Answer by voice</button></div>' +
       '<p class="hint js-answer-heard" role="status">Heard: nothing yet.</p>' +
       '<p class="hint js-answer-selected" role="status">Selected: none.</p>' +
       '<p class="hint js-answer-status" role="status">Say a name or the full account ending. Review the selection, then click Confirm selection. You can always tap a payee.</p>' +
-      '<p class="voice-preview js-answer-preview" aria-live="polite" hidden></p>' +
-      '<p class="hint js-question-status" role="status"></p>';
+      '<p class="voice-preview js-answer-preview" aria-live="polite" hidden></p>';
     prompt.after(controls);
     var status = controls.querySelector(".js-answer-status");
     var heard = controls.querySelector(".js-answer-heard");
@@ -60,14 +58,6 @@
     }
     Array.prototype.forEach.call(buttons, function (button) { button.addEventListener("click", showSelection); });
     card.querySelector(".js-payee-filter").addEventListener("input", showSelection);
-    var hear = controls.querySelector(".js-hear-question");
-    var questionStatus = controls.querySelector(".js-question-status");
-    hear.disabled = !DctaVoice.canSpeak;
-    if (!DctaVoice.canSpeak) questionStatus.textContent = "Audio is unavailable. Read the question or tap a payee.";
-    hear.addEventListener("click", function () {
-      if (card.getAttribute("data-clarify-in-flight") === "true") return;
-      DctaVoice.speakText(hear, questionStatus, prompt.textContent, "Hear question");
-    });
     DctaVoice.wireAnswer({
       card: card, button: controls.querySelector(".js-answer-voice"), status: status,
       preview: controls.querySelector(".js-answer-preview"),

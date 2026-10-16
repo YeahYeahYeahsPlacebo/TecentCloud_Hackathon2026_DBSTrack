@@ -268,7 +268,7 @@
             if (responseGen !== messageGen) return;
             renderApiDraftInto(draft, hash, validator, policy, placeholderId);
             var card = document.getElementById(placeholderId).querySelector(".card");
-            if (!card.querySelector(".js-hear-question")) DctaVoice.attachDraftReadback(card, draft, false, idx, validator, policy);
+            DctaVoice.attachDraftReadback(card, draft, false, idx, validator, policy);
             speechCards.push({ card: card, draft: draft, validator: validator, policy: policy, index: idx,
               anchor: card.querySelector(".js-hear-question, .js-draft-readback") });
           })
@@ -660,7 +660,6 @@
 
     html += "</div>";
     el.innerHTML = html;
-    DctaVoice.attachReadback(el.querySelector(".card"), draft);
   }
 
   // Render an ambiguous-payee draft received from the API.
@@ -746,7 +745,6 @@
 
     html += "</div>";
     el.innerHTML = html;
-    DctaVoice.attachReadback(el.querySelector(".card"), draft);
 
     // Wire all interactions scoped to THIS card only. The card root
     // is the .clarify-card element inside el.

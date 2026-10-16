@@ -8,7 +8,7 @@ window.SpeechRecognition=class{
  constructor(){recognizers.push(this)}start(){this.ttsAtStart=speechActive;this.onstart()}stop(){}abort(){this.aborted=true}
 };
 window.SpeechSynthesisUtterance=class{constructor(text){this.text=text}};
-Object.defineProperty(window,'speechSynthesis',{value:{speak(u){speechActive=true;spoken.push(u)},cancel(){speechActive=false;cancellations++}},configurable:true});
+Object.defineProperty(window,'speechSynthesis',{value:{speak(u){speechActive=true;spoken.push(u);u.onstart()},cancel(){speechActive=false;cancellations++}},configurable:true});
 </script>
 <script src="../js/voice.js"></script><script src="../js/ambiguity.js"></script>
 <script>
@@ -21,13 +21,13 @@ Object.defineProperty(window,'speechSynthesis',{value:{speak(u){speechActive=tru
   var root=document.createElement('div');root.className='clarify-card';
   root.innerHTML='<p class="clarify-prompt"></p><input class="js-payee-filter"><div class="js-clarify-list"></div><button class="js-clarify-confirm" disabled>Confirm selection</button>';
   candidates.forEach(function(c){var button=document.createElement('button');button.className='candidate-btn';button.dataset.candidateId=c.id;button.innerHTML='<span class="candidate-check"></span>';button.addEventListener('click',function(){root.querySelectorAll('.candidate-btn').forEach(b=>b.classList.remove('selected'));button.classList.add('selected');root.querySelector('.js-clarify-confirm').disabled=false});root.querySelector('.js-clarify-list').append(button)});
-  document.getElementById('draft-display').append(root);DctaAmbiguity.attach(root,candidates);return root;
+  document.getElementById('draft-display').append(root);DctaAmbiguity.attach(root,candidates);DctaVoice.attachDraftReadback(root,{amount:{value:'50.00',currency:'SGD'},source_account:'source'},false,0,{verdict:'freeze'},{decision:'hold'});return root;
  }
  DctaVoice.init();var a=card(),b=card();
  function answer(root,text){root.querySelector('.js-answer-voice').click();var r=recognizers.at(-1);r.onresult({results:[{0:{transcript:text},isFinal:true}]});if(root.querySelector('.js-answer-voice').getAttribute('aria-pressed')==='true')root.querySelector('.js-answer-voice').click();r.onend();return r}
  function selected(root){return root.querySelector('.candidate-btn.selected')?.dataset.candidateId}
  test('Question uses supplied names and suffixes',()=>assert(a.querySelector('.clarify-prompt').textContent==='I found Maya Tan ending in 1357, Maya Lim ending in 2468 and Maya Ng ending in 9753. Which one did you mean?','Wrong question'));
- test('Hear question speaks that card question',()=>{a.querySelector('.js-hear-question').click();assert(spoken.at(-1).text===a.querySelector('.clarify-prompt').textContent,'Wrong audio')});
+ test('Single Read draft includes that card question',()=>{a.querySelector('.js-hear-question').click();assert(spoken.at(-1).text.includes(a.querySelector('.clarify-prompt').textContent)&&a.querySelectorAll('.js-draft-readback').length===1,'Wrong audio')});
  test('Unique final name naturally stops and highlights without a Finish click',()=>{a.querySelector('.js-answer-voice').click();let r=recognizers.at(-1);r.onresult({results:[{0:{transcript:'Maya Lim'},isFinal:true}]});assert(!r.ttsAtStart&&selected(a)==='b'&&a.querySelector('.js-answer-voice').getAttribute('aria-pressed')==='false','Speech was active at mic start or did not stop naturally');r.onend()});
  test('Unique full suffix selects offered ID',()=>{answer(b,'ending in 1357');assert(selected(b)==='a','Wrong suffix')});
  test('Spoken digit suffix including one is supported',()=>{answer(b,'one three five seven');assert(selected(b)==='a','Spoken suffix lost digits')});
@@ -37,13 +37,13 @@ Object.defineProperty(window,'speechSynthesis',{value:{speak(u){speechActive=tru
  test('Shared name is ambiguous',()=>{answer(a,'Maya');assert(selected(a)==='a'&&a.querySelector('.js-answer-status').textContent.includes('more than one'),'Partial name changed selection')});
  test('Partial suffix, unknown name, negation and conflicting clues fail closed',()=>{for(let word of ['135','not Maya Lim','Maya Tan ending in 2468','Maya Lim or Maya Tan','someone else'])assert(DctaAmbiguity.matchAnswer(word,candidates).length!==1,word+' selected')});
  test('New card microphone cancels old one and ignores late answer',()=>{a.querySelector('.js-answer-voice').click();let old=recognizers.at(-1);b.querySelector('.js-answer-voice').click();old.onresult({results:[{0:{transcript:'Maya Tan'},isFinal:true}]});old.onend();assert(old.aborted&&selected(a)==='a','Stale answer changed selection');DctaVoice.reset()});
- test('Amount read-back still repeats only the server amount and shares audio cancellation',()=>{
+ test('Full draft read-back repeats only the server amount and shares audio cancellation',()=>{
   var amountCard=document.createElement('div');document.getElementById('draft-display').append(amountCard);
-  DctaVoice.attachReadback(amountCard,{amount:{value:'73.25',currency:'SGD'}});
-  var read=amountCard.querySelector('.js-readback');read.click();
+  DctaVoice.attachDraftReadback(amountCard,{amount:{value:'73.25',currency:'SGD'},source_account:'source'},false,0);
+  var read=amountCard.querySelector('.js-draft-readback');read.click();
   assert((spoken.at(-1).text.match(/73.25 SGD/g)||[]).length===2,'Amount read-back changed');
   var before=cancellations;a.querySelector('.js-hear-question').click();
-  assert(cancellations===before+1&&read.textContent==='Read amount twice','Audio queues overlapped');
+  assert(cancellations===before+1&&read.textContent==='Read draft','Audio queues overlapped');
  });
  test('New-draft read-back uses only returned details without confirming anything',()=>{
   var returned=document.createElement('div');document.getElementById('draft-display').append(returned);
