@@ -24,6 +24,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from backend.bank import BankError  # noqa: E402
 from backend.canonical import draft_hash  # noqa: E402
 from backend.gateway import reason_codes as R  # noqa: E402
 from backend.gateway.errors import Rejection  # noqa: E402
@@ -104,6 +105,7 @@ def build(
     verify=None,
     idempotency: dict | None = None,
     ledger=None,
+    bank=None,
 ):
     """A gateway wired to the clean fixture, with sane defaults."""
     clean = load_draft("clean_transfer.json")
@@ -125,6 +127,7 @@ def build(
         verdicts=verdicts,
         policy=policy if policy is not None else (lambda d, h: PolicyDecision("allow")),
         ledger=ledger if ledger is not None else InMemoryLedger(),
+        bank=bank,
         clock=lambda: now,
     )
 
@@ -462,6 +465,36 @@ def test_unresolved_beats_expired():
     assert only_code(
         gw.execute(request_for(ambiguous.id, make_assertion(challenge_for(ambiguous))))
     ) == R.UNRESOLVED_FIELDS
+
+
+def test_a_failed_transfer_leaves_the_draft_retryable():
+    """Only a *successful* execution may claim a draft id.
+
+    Check 10 refuses any draft already named in the idempotency map, so a
+    rejected execution that also landed there would lock the draft for
+    good: the user tops up, retries with a fresh key, and gets `replayed`
+    for a transfer that never happened. Nothing in the suite failed when
+    the write was moved to the top of ``_commit`` — this is the test that
+    does.
+    """
+    clean = load_draft("clean_transfer.json")
+
+    class RefusingBank:
+        def accounts(self) -> list:
+            return []
+
+        def transfer(self, **_: object) -> None:
+            raise BankError("insufficient funds")
+
+    gw = build(bank=RefusingBank())
+    assertion = make_assertion(challenge_for(clean))
+
+    assert only_code(gw.execute(request_for(clean.id, assertion, key="k1"))) == R.POLICY_BLOCKED
+    assert gw.idempotency == {}, "a rejected execution must not claim the draft"
+
+    gw.bank = None  # the money is there now
+    assert gw.execute(request_for(clean.id, assertion, key="k2"))["result"] == "executed"
+    assert len(gw.ledger.entries) == 1
 
 
 def test_rejection_response_shape():
