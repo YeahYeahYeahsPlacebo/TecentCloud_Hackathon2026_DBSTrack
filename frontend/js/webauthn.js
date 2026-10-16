@@ -36,7 +36,11 @@
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: signal
     });
     var result = await response.json();
-    if (!response.ok) throw Error((result.reason_code || "HTTP " + response.status) + ": " + (result.message || "Request refused"));
+    if (!response.ok) {
+      var failure = Error((result.reason_code || "Request refused") + ": " + (result.message || "Request refused"));
+      failure.httpStatus = response.status;
+      throw failure;
+    }
     return result;
   }
   function checkOrigin() {
@@ -54,9 +58,11 @@
     if (registering) return;
     var button = document.getElementById("register-passkey"), note = document.getElementById("passkey-status");
     registering = true; button.disabled = true;
+    var phase = "origin check";
     try {
       checkOrigin();
       note.textContent = "Create a passkey with your browser or authenticator. This does not authorize a transaction.";
+      phase = "browser creation";
       var created = await navigator.credentials.create({ publicKey: {
         challenge: crypto.getRandomValues(new Uint8Array(32)),
         rp: { id: config.rp_id, name: "DCTA prototype" },
@@ -64,16 +70,29 @@
         pubKeyCredParams: [{ type: "public-key", alg: -7 }],
         authenticatorSelection: { userVerification: "required" }, attestation: "none", timeout: 60000
       } });
+      phase = "public key extraction";
       if (!created || !created.response.getPublicKey || created.response.getPublicKeyAlgorithm() !== -7) throw Error("This browser did not expose an ES256 public key. Try a compatible browser.");
       var publicKey = created.response.getPublicKey();
       if (!publicKey) throw Error("No public key returned by the authenticator.");
       var browserId = encode(created.rawId);
+      phase = "server registration";
       var result = await json("/api/webauthn/register", { user_id: "user-001", credential_id: browserId, public_key: encode(publicKey) });
+      phase = "credential ID check";
       if (result.status !== "registered" || result.credential_id_source !== "client" || result.credential_id !== browserId) throw Error("Registration did not preserve this browser's credential ID. Signing remains disabled.");
       credentialId = browserId;
-      note.textContent = "Passkey registered for this server session. Review a server-approved draft before signing.";
+      note.textContent = "Passkey registered for this server session; browser credential ID matched. Review a server-approved draft before signing.";
       button.textContent = "Register another passkey";
-    } catch (error) { note.textContent = "Passkey registration failed: " + error.message; }
+    } catch (error) {
+      // Browser NotAllowedError intentionally combines several possible causes.
+      // Do not label it user cancellation or pretend a server request occurred.
+      if (phase === "browser creation" && error.name === "NotAllowedError") {
+        note.textContent = "Chrome did not complete passkey creation (NotAllowedError): cancellation, timeout or browser refusal are possible. No registration request was sent. Retry Register passkey and complete the browser/Touch ID prompt while keeping this page visible.";
+      } else {
+        note.textContent = "Passkey registration not confirmed — " + phase +
+          (error.httpStatus ? " HTTP " + error.httpStatus : "") + " (" + error.name + "): " + error.message +
+          (phase === "browser creation" || phase === "public key extraction" || phase === "origin check" ? " No registration request was sent." : "");
+      }
+    }
     finally { registering = false; button.disabled = !config; refresh(); }
   }
   function init() {

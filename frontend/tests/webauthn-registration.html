@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>Passkey registration status regression tests</title>
+<!-- Explicit browser/API doubles: no authenticator, biometrics, real registration or execution. -->
+<button id="register-passkey" disabled>Register passkey</button><p id="passkey-status"></p>
+<p id="validation-mode" hidden></p><div id="draft-display"></div><pre id="test-results">Running</pre>
+<script>
+var mode='cancel',requests=[],creates=0,pendingReject;
+function credential(){return {rawId:new Uint8Array([1,2,3]).buffer,response:{getPublicKeyAlgorithm(){return -7},getPublicKey(){return new Uint8Array([4,5,6]).buffer}}}}
+navigator.credentials.create=async function(){creates++;if(mode==='cancel')throw new DOMException('Browser refusal','NotAllowedError');if(mode==='security')throw new DOMException('Browser origin restriction','SecurityError');if(mode==='pending')return new Promise((resolve,reject)=>pendingReject=reject);var c=credential();if(mode==='unsupported')c.response.getPublicKey=undefined;return c};
+window.fetch=async function(url,options){requests.push({url,body:options?.body?JSON.parse(options.body):null});if(url==='/api/health')return new Response(JSON.stringify({origin:location.origin,rp_id:location.hostname,validator:'UnconfiguredValidator'}));if(url!=='/api/webauthn/register')throw Error('Unexpected route');var body=JSON.parse(options.body);if(mode==='server-refusal')return new Response(JSON.stringify({reason_code:'malformed_request',message:'Public key refused'}),{status:422});return new Response(JSON.stringify({status:'registered',credential_id_source:'client',credential_id:mode==='mismatch'?'different':body.credential_id}))};
+</script>
+<script src="../js/webauthn.js"></script>
+<script>
+(async function(){
+ var results=[],button=document.getElementById('register-passkey'),note=document.getElementById('passkey-status');
+ function assert(ok,message){if(!ok)throw Error(message)}
+ async function test(name,fn){try{await fn();results.push({name,passed:true})}catch(e){results.push({name,passed:false,error:e.message})}}
+ async function settled(){for(var i=0;i<30;i++){await new Promise(r=>setTimeout(r,0));if(!button.disabled)return}throw Error('Registration did not settle')}
+ async function register(value){mode=value;requests=[];button.click();await settled()}
+ DctaPasskeys.init();await settled();
+ await test('Native NotAllowedError names ambiguity and confirms no server POST',async()=>{await register('cancel');assert(note.textContent.includes('NotAllowedError')&&note.textContent.includes('cancellation, timeout or browser refusal')&&note.textContent.includes('No registration request was sent')&&!requests.length,'Browser refusal misclassified')});
+ await test('Browser restriction is separate from server registration',async()=>{await register('security');assert(note.textContent.includes('browser creation')&&note.textContent.includes('SecurityError')&&!requests.length,'Restriction hidden')});
+ await test('Unsupported public-key extraction never sends registration',async()=>{await register('unsupported');assert(note.textContent.includes('public key extraction')&&note.textContent.includes('No registration request was sent')&&!requests.length,'Unsupported browser submitted')});
+ await test('Server rejection includes actual HTTP status and phase',async()=>{await register('server-refusal');assert(note.textContent.includes('server registration HTTP 422')&&note.textContent.includes('malformed_request')&&requests.length===1,'Server response mislabelled browser timeout')});
+ await test('Credential ID mismatch is not reported as registration success',async()=>{await register('mismatch');assert(note.textContent.includes('credential ID check')&&!note.textContent.startsWith('Passkey registered'),'Mismatch accepted')});
+ var frozen=document.createElement('div'),allowed=document.createElement('div');for(var c of [frozen,allowed]){c.innerHTML='<div class="action-bar"></div>';document.getElementById('draft-display').append(c)}
+ DctaPasskeys.attach(frozen,{id:'frozen'},false);DctaPasskeys.attach(allowed,{id:'approved'},true);
+ await test('Successful registration clearly confirms browser ID match',async()=>{await register('success');assert(note.textContent.startsWith('Passkey registered for this server session; browser credential ID matched')&&button.textContent==='Register another passkey','No clear success')});
+ await test('Registering cannot unlock a frozen draft or execute an approved one',async()=>{assert(frozen.querySelector('.js-passkey-sign').disabled&&frozen.querySelector('.js-passkey-execute').disabled&&!allowed.querySelector('.js-passkey-sign').disabled&&allowed.querySelector('.js-passkey-execute').disabled,'Registration bypassed draft safety')});
+ await test('Repeated clicks do not open competing registration ceremonies',async()=>{mode='pending';var before=creates;button.click();button.click();assert(creates===before+1&&button.disabled,'Duplicate browser ceremony');pendingReject(new DOMException('Cancelled','NotAllowedError'));await settled()});
+ await test('Registration attempts never request execution or challenge',async()=>{assert(requests.every(r=>r.url==='/api/webauthn/register')&&!document.querySelector('details[open]'),'Unsafe registration side effect')});
+ window.registrationTestResults=results;document.getElementById('test-results').textContent=JSON.stringify(results,null,2);
+})();
+</script>
