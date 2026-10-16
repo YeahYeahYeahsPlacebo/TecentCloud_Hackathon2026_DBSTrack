@@ -35,6 +35,7 @@ from backend.gateway.webauthn import der_to_raw_signature, public_key_to_pem  # 
 from backend.llm.fake_client import FakeChatClient  # noqa: E402
 from backend.models.draft import TransactionDraft  # noqa: E402
 from backend.parser.directory import FixtureDirectory  # noqa: E402
+from backend.parser.independent import independent_transfer_clauses  # noqa: E402
 from backend.parser.interface import (  # noqa: E402
     ClarifyingQuestion,
     ParseResult,
@@ -223,21 +224,51 @@ def test_a_missing_or_wrongly_shaped_validator_is_refused_at_startup():
         )
 
 
+class DroppingParser:
+    """Claims two intents but returns one item: an intent was dropped."""
+
+    def __call__(self, transcript):
+        return ParseResult(items=[load("clean_transfer.json")], intents_detected=2)
+
+
 def test_a_parser_that_drops_an_intent_is_a_bug_not_a_rejection():
     """len(items) must equal intents_detected. There is no reason code for this,
-    so it must fail loudly rather than show the user a short list."""
+    so it must fail loudly rather than show the user a short list.
 
-    class DroppingParser:
-        def __call__(self, transcript):
-            return ParseResult(items=[load("clean_transfer.json")], intents_detected=2)
-
+    This is the SINGLE-request path, so the sentence must be one that
+    independent_transfer_clauses does not split. A two-transfer sentence
+    takes the clause path instead and fails earlier, with a different
+    message (see the next test)."""
     api = GatewayAPI(parser=DroppingParser(), clock=lambda: clean_and_now()[1])
     try:
-        api.message({"transcript": "Send fifty to John and twenty to Jane."})
+        api.message({"transcript": "Send fifty dollars to John Smith."})
     except ParserContractViolation as exc:
         assert "2 intent" in str(exc)
     else:
         raise AssertionError("expected ParserContractViolation")
+
+
+def test_a_clause_that_drops_an_intent_is_a_bug_and_nothing_is_stored():
+    """The same broken parser on a sentence that IS split into two independent
+    transfers. Each clause is parsed on its own and must yield exactly one
+    item, so the check fires per clause, before the single-path "2 intent"
+    check is ever reached -- and before anything is stored or published."""
+    transcript = "Send fifty to John and twenty to Jane."
+    # Guard against this test silently drifting back onto the single path.
+    assert independent_transfer_clauses(transcript, FixtureDirectory()) is not None
+
+    api = GatewayAPI(parser=DroppingParser(), clock=lambda: clean_and_now()[1])
+    with pytest.raises(ParserContractViolation) as caught:
+        api.message({"transcript": transcript})
+
+    assert str(caught.value) == "each independent clause must produce exactly one item"
+    assert "2 intent" not in str(caught.value)
+
+    # Nothing was stored, recorded or left pending.
+    assert len(api.store) == 0          # drafts the gateway could later execute
+    assert len(api.verdicts) == 0       # validator verdicts, keyed by draft hash
+    assert len(api.messages.pending) == 0
+    assert len(api.audit.rows) == 0     # no "message" audit row either
 
 
 # ── POST /api/clarify ─────────────────────────────────────────────────
