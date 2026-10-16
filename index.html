@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Confirm Plus Chop — Interactive preview</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div class="phone-frame">
+
+  <!-- Header -->
+  <header class="app-header">
+    <h1>Confirm Plus Chop</h1>
+    <p class="subtitle">Review · sign · confirm execution</p>
+  </header>
+
+  <section class="preview-banner" role="note" aria-label="Public preview limitations">
+    <strong>Interactive preview — live AI validation unavailable</strong>
+    <p>This is the merged demo frontend, hosted without a gateway. Try voice-to-text,
+    edit your words, and explore the explicitly labelled sample cards below.</p>
+    <p>Send, live two-transfer parsing, server clarification, passkey registration,
+    signing and execution are unavailable here. Samples are not live AI results.
+    This preview is not the full video demo and does not move money.</p>
+  </section>
+  <!-- API status banner -->
+  <div class="preview-banner" id="api-banner">
+    Speak or type a message, then review the transaction draft.
+    You can also explore the sample scenarios below.
+  </div>
+
+  <section class="input-section" aria-label="Passkey setup">
+    <button type="button" id="register-passkey" class="btn btn-primary" disabled>Register passkey</button>
+    <p id="passkey-status" class="hint" role="status">Checking passkey support…</p>
+    <p id="validation-mode" class="preview-banner" role="status" hidden></p>
+  </section>
+
+  <!-- Text input -->
+  <section class="input-section">
+    <label for="text-input" class="input-label">Your message</label>
+    <textarea id="text-input" rows="2" placeholder="e.g. Send fifty dollars to John Smith."></textarea>
+    <button id="mic-btn" type="button" class="btn btn-voice" aria-describedby="voice-status voice-preview" aria-pressed="false">Tap to talk</button>
+    <p id="voice-status" class="hint" role="status">Checking speech recognition support…</p>
+    <p id="voice-preview" class="voice-preview" aria-live="polite" hidden></p>
+    <p class="hint">Tap to talk, then tap Stop listening when finished. Only final words enter the editable message. Review them, then press Send.</p>
+    <button id="send-btn" class="btn btn-primary">Send</button>
+    <p class="hint" id="input-hint">
+      Review your message before sending. You'll see the transaction details before any confirmation.
+    </p>
+  </section>
+
+  <!-- Sample scenario buttons (demo fallback) -->
+  <section class="scenarios">
+    <h2>Sample scenarios <span class="demo-label">(demo fallback)</span></h2>
+    <p class="hint">These buttons load local fixture files for preview when the backend is not available.</p>
+    <div class="scenario-buttons">
+      <button class="btn btn-scenario" data-scenario="clean_transfer">1. Clean Transfer</button>
+      <button class="btn btn-scenario" data-scenario="ambiguous_payee">2. Ambiguous Payee (clarify)</button>
+      <button class="btn btn-scenario" data-scenario="equity_purchase">3. Equity Purchase</button>
+      <button class="btn btn-scenario" data-scenario="over_limit">4. Over Limit (policy hold)</button>
+    </div>
+  </section>
+
+  <!-- Draft display area -->
+  <section id="draft-display" class="draft-display">
+    <p class="placeholder">Select a scenario above to display its draft.</p>
+  </section>
+
+  <!-- Footer -->
+  <footer class="app-footer">
+    <p class="footer-note">
+      This prototype is not live banking. Voice only helps enter and review
+      your message. A passkey signs an approved draft; a separate deliberate
+      click confirms execution. Sample scenarios remain previews only.
+    </p>
+  </footer>
+
+</div>
+
+<script src="js/canonical.js"></script>
+<script src="js/voice.js"></script>
+<script src="js/webauthn.js"></script>
+<script src="js/ambiguity.js"></script>
+<script src="public-preview.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

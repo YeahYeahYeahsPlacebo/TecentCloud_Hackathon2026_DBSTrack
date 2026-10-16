@@ -1,0 +1,8 @@
+{
+  "project": "Confirm Plus Chop",
+  "mode": "interactive-preview",
+  "live_ai_validation": false,
+  "backend_available": false,
+  "transactions_enabled": false,
+  "source_commit": "839a4597a848891e1e1039275bc3948205f752ba"
+}

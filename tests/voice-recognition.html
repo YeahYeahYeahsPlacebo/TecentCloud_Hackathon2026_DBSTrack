@@ -1,0 +1,150 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Voice recognition regression tests</title>
+<!-- Standalone browser test: open /tests/voice-recognition.html on the demo server.
+     No app.js, network API calls, microphone or speech service is used. -->
+<textarea id="text-input"></textarea>
+<button id="send-btn">Send</button><button id="mic-btn">Tap to talk</button>
+<p id="voice-status"></p><p id="voice-preview" hidden></p>
+<div id="draft-display"></div><pre id="test-results">Running…</pre>
+<script>
+var clock = 0, timers = new Map(), nextTimer = 0;
+window.setTimeout = function (fn, delay) { timers.set(++nextTimer, { fn: fn, at: clock + delay }); return nextTimer; };
+window.clearTimeout = function (id) { timers.delete(id); };
+function advance(ms) {
+  clock += ms;
+  Array.from(timers).forEach(function (entry) {
+    if (entry[1].at <= clock && timers.delete(entry[0])) entry[1].fn();
+  });
+}
+var recognizers = [], audioActive = false, audioCancels = 0;
+window.SpeechSynthesisUtterance = class { constructor(text) { this.text = text; } };
+Object.defineProperty(window, 'speechSynthesis', {configurable:true,value:{speak(u){audioActive=true;u.onstart()},cancel(){audioActive=false;audioCancels++}}});
+window.SpeechRecognition = class {
+  constructor() { this.stops = 0; this.aborts = 0; recognizers.push(this); }
+  start() { this.onstart(); }
+  stop() { this.stops++; }
+  abort() { this.aborts++; }
+};
+function emit(recognizer, words) {
+  recognizer.onresult({ results: words.map(function (word) {
+    return { 0: { transcript: word[0] }, isFinal: word[1] };
+  }) });
+}
+</script>
+<script src="../js/voice.js"></script>
+<script>
+(function () {
+  var results = [], input = document.getElementById('text-input');
+  var mic = document.getElementById('mic-btn'), send = document.getElementById('send-btn');
+  function test(name, fn) {
+    try { fn(); results.push({ name: name, passed: true }); }
+    catch (error) { results.push({ name: name, passed: false, error: error.message }); }
+  }
+  function assert(value, message) { if (!value) throw Error(message); }
+  function key(type) { mic.click(); }
+  DctaVoice.init();
+  key('keydown');
+  var first = recognizers[0];
+  test('Cumulative final segments are preserved without duplication', function () {
+    emit(first, [['Send fifty dollars', true], ['to', false]]);
+    assert(input.value === 'Send fifty dollars', 'Interim leaked into message');
+    emit(first, [['Send fifty dollars', true], ['to John', true]]);
+    emit(first, [['Send fifty dollars', true], ['to John', true]]);
+    assert(input.value === 'Send fifty dollars to John', 'Finals lost or duplicated');
+  });
+  test('Stop uses stop once, never abort', function () {
+    key('keyup');
+    assert(first.stops === 1 && first.aborts === 0, 'Normal stop did not finish gracefully');
+  });
+  test('Late final survives stop, focus loss and five seconds of latency', function () {
+    mic.dispatchEvent(new Event('blur'));
+    advance(5000);
+    emit(first, [['Send fifty dollars', true], ['to John Lee', true]]);
+    assert(first.aborts === 0, 'Pending final aborted');
+    assert(input.value === 'Send fifty dollars to John Lee', 'Late final lost');
+    assert(send.disabled, 'Send enabled before recognition ended');
+    first.onend();
+    assert(!send.disabled, 'Send not restored after end');
+  });
+  test('Editing cancels pending finals rather than overwriting correction', function () {
+    key('keydown'); var current = recognizers[1];
+    emit(current, [['Send fifteen dollars to John', true]]);
+    key('keyup');
+    input.value = 'Send fifty dollars to John';
+    input.dispatchEvent(new Event('input'));
+    emit(current, [['Send fifteen dollars to John', true]]);
+    assert(current.aborts === 1, 'Editing should cancel recognition');
+    assert(input.value === 'Send fifty dollars to John', 'Correction overwritten');
+  });
+  test('Switching drafts cancels and ignores stale final callbacks', function () {
+    key('keydown'); var current = recognizers[2];
+    DctaVoice.reset();
+    emit(current, [['stale words', true]]);
+    assert(current.aborts === 1 && input.value === 'Send fifty dollars to John', 'Stale final overwrote message');
+  });
+  test('Tap recording restarts and preserves a long two-transfer sentence exactly once', function () {
+    key('keydown'); var current = recognizers.at(-1);
+    assert(current.continuous === true, 'Continuous recognition not requested');
+    emit(current, [['Send fifty dollars to John', true]]);
+    current.onend();
+    assert(send.disabled && mic.getAttribute('aria-pressed') === 'true', 'Browser end finished a active session');
+    emit(current, [['stale duplicated first clause', true]]);
+    advance(200); var restarted = recognizers.at(-1);
+    assert(restarted !== current, 'Recognizer not restarted');
+    emit(restarted, [['and send thirty dollars', true], ['to Jane', false]]);
+    emit(restarted, [['and send thirty dollars', true], ['to Jane', false]]);
+    assert(input.value === 'Send fifty dollars to John and send thirty dollars', 'Accumulation duplicated or included interim');
+    key('keyup'); advance(5000);
+    emit(restarted, [['and send thirty dollars', true], ['to Jane Tan.', true]]);
+    restarted.onend(); advance(200);
+    assert(input.value === 'Send fifty dollars to John and send thirty dollars to Jane Tan.', 'Late final after restart lost');
+    assert(!send.disabled && recognizers.at(-1) === restarted && restarted.stops === 1, 'Stop restarted or did not stop');
+  });
+  test('Stop during restart gap prevents another recognizer', function () {
+    key('keydown'); var current = recognizers.at(-1), count = recognizers.length;
+    emit(current, [['fifty dollars', true]]); current.onend(); key('keyup'); advance(200);
+    assert(recognizers.length === count && !send.disabled, 'Restart survived stop');
+  });
+  test('Permission denial never restarts while active', function () {
+    key('keydown'); var current = recognizers.at(-1), count = recognizers.length;
+    current.onerror({error:'not-allowed'}); current.onend(); advance(200);
+    assert(recognizers.length === count && current.aborts === 1 && !send.disabled, 'Permission denial restarted');
+    assert(document.getElementById('voice-status').textContent.includes('denied'), 'No denial feedback');
+  });
+  test('Tap mode starts, survives browser end, and stops with a second tap', function () {
+    var toggle = document.getElementById('mic-btn'); toggle.click(); var current = recognizers.at(-1);
+    emit(current, [['Send fifty dollars',true]]); current.onend(); advance(200);
+    var restarted = recognizers.at(-1); emit(restarted, [['to John Smith',true]]);
+    toggle.click(); restarted.onend(); advance(200);
+    assert(input.value === 'Send fifty dollars to John Smith' && !send.disabled && toggle.getAttribute('aria-pressed') === 'false', 'Tap mode broken');
+  });
+  test('Repeated empty endings are bounded with a visible fallback', function () {
+    key('keydown'); for (var n=0;n<3;n++){recognizers.at(-1).onend();advance(200)}
+    var count=recognizers.length;advance(1000);
+    assert(recognizers.length===count&&!send.disabled&&document.getElementById('voice-status').textContent.includes('Tap to talk'), 'Empty restart loop unbounded');
+  });
+  test('Cancellation stops all restarts and ignores stale finals', function () {
+    key('keydown'); var current=recognizers.at(-1);DctaVoice.reset();
+    var before=input.value;current.onend();emit(current,[['stale',true]]);advance(200);
+    assert(current.aborts===1&&input.value===before&&!send.disabled,'Cancellation leaked a restart/result');
+  });
+  test('Speech never clicks Send', function () {
+    var submissions=0;send.addEventListener('click',()=>submissions++);
+    key('keydown');var current=recognizers.at(-1);emit(current,[['yes send it',true]]);key('keyup');current.onend();
+    assert(submissions===0&&input.value==='yes send it','Speech submitted instead of filling editable text');
+  });
+  test('Starting the message microphone cancels active and pending old narration', function () {
+    var card=document.createElement('div');document.getElementById('draft-display').append(card);
+    var draft={amount:{value:'30.00',currency:'SGD'},payee:{display_name:'Jane Tan',masked_account:'****5678'},source_account:'source'};
+    DctaVoice.attachDraftReadback(card,draft,false,0,{verdict:'pass'},{decision:'allow'});
+    send.click();DctaVoice.queueCards([{card,draft,index:0,validator:{verdict:'pass'},policy:{decision:'allow'}}]);
+    assert(audioActive,'No test narration');var before=audioCancels;mic.click();
+    assert(!audioActive&&audioCancels>before&&mic.getAttribute('aria-pressed')==='true','Microphone did not cancel speech');
+    var r=recognizers.at(-1);emit(r,[['New editable message',true]]);mic.click();r.onend();
+    assert(!audioActive&&input.value==='New editable message','Old audio revived after mic stop');
+  });
+  window.voiceTestResults = results;
+  document.getElementById('test-results').textContent = JSON.stringify(results, null, 2);
+})();
+</script>
