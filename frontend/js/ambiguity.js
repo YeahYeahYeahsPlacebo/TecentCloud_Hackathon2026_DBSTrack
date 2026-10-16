@@ -61,7 +61,9 @@
     DctaVoice.wireAnswer({
       card: card, button: controls.querySelector(".js-answer-voice"), status: status,
       preview: controls.querySelector(".js-answer-preview"),
+      onPending: function () { heard.textContent = "Heard: waiting for Chrome to start the microphone."; },
       onStart: function () { heard.textContent = "Heard: listening… Your current selection is unchanged."; },
+      onNoResult: function () { heard.textContent = "Heard: Chrome returned no final words. Your selection is unchanged."; },
       isUnique: function (text) { return matchAnswer(text, candidates).length === 1; },
       onHeard: function (text) { heard.textContent = "Heard: “" + text + "” (final words)."; },
       onFinal: function (text) {

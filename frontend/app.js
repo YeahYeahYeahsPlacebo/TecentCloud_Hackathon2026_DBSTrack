@@ -1370,6 +1370,7 @@
       }
     });
 
+    DctaVoice.replacingCard(cardEl);
     cardEl.innerHTML = html;
     setHint("Your selection was applied. Review the updated transaction details below.");
   }
@@ -1435,10 +1436,8 @@
     html +=     '<span>expires: ' + escapeHtml(draft.expires_at) + '</span>';
     html +=     '<span class="hash-line">hash: ' + escapeHtml(hash) + '</span>';
     html +=   '</div>';
-    html +=   '<div class="acct-note">' +
-              'Account ID shown as-is. An account-display API or mapping ' +
-              'is still needed — do not fabricate a display name.' +
-              '</div>';
+    // Developer note: IDs remain canonical; a future display mapping must
+    // come from the server rather than invented account names.
     html += '</details>';
     return html;
   }

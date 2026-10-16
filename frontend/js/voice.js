@@ -20,6 +20,7 @@
     session = null;
     clearTimeout(record.timer);
     clearTimeout(record.restartTimer);
+    clearTimeout(record.audioTimer);
     if (record.target) {
       record.target.preview.textContent = "";
       record.target.preview.hidden = true;
@@ -29,7 +30,8 @@
         if (record.target.onFinal(record.finalText) === false) record.target.button.textContent = "Retry voice answer";
       } else {
         record.target.button.textContent = "Retry voice answer";
-        recognitionStatus(record, (message || "No clear answer heard.") + " Retry or tap a payee; your selection is unchanged.");
+        if (!record.finalText && record.target.onNoResult) record.target.onNoResult();
+        recognitionStatus(record, (message || noResult(record)) + " Retry or tap a payee; your selection is unchanged.");
       }
       return;
     }
@@ -68,6 +70,18 @@
     conversation = null;
     pause();
   }
+  function noResult(record) {
+    return "Chrome returned no final words (" + (record.speechDetected ? "speech detected" : record.audioStarted ? "microphone audio started" : record.started ? "recognition started; no microphone audio event" : "recognition did not start") + ").";
+  }
+  function suspendReview() {
+    pause(); autoReviewAllowed = false;
+    if (!conversation) return;
+    conversation.suspended = true;
+    conversation.items.slice(conversation.cursor).forEach(function (item) {
+      item.continueButton.hidden = true;
+      item.note.textContent = "Spoken review paused because the tab was hidden. Return and tap Read draft, or confirm an offered payee, to resume. Nothing was authorized.";
+    });
+  }
   function startRecording(target) {
     target = target || null;
     if (!Recognition || input.disabled || (target && (!target.card.isConnected || target.card.getAttribute("data-clarify-in-flight") === "true"))) return;
@@ -81,10 +95,11 @@
     else cancelPlayback();
     clearPreview();
     var record = { recognition: null, finalText: "", completed: [], stopping: false,
-      stopIssued: false, timer: null, restartTimer: null, emptyEnds: 0, target: target };
+      stopIssued: false, timer: null, restartTimer: null, audioTimer: null, emptyEnds: 0, target: target };
     session = record;
     if (target) {
-      target.onStart(); target.button.setAttribute("aria-pressed", "true"); target.button.textContent = "Stop listening";
+      if (target.onPending) target.onPending();
+      target.button.setAttribute("aria-pressed", "true"); target.button.textContent = "Stop listening";
     } else {
       send.disabled = true; mic.setAttribute("aria-pressed", "true");
       mic.textContent = "Stop listening";
@@ -92,7 +107,7 @@
     // Bounded session lifetime, including restart cycles and permission prompts.
     record.timer = setTimeout(function () {
       if (session === record) cancelRecognition(target ? "No clear answer heard before the microphone timed out." : "Microphone timed out. Review your words; tap to talk again or type.");
-    }, target ? 15000 : 120000);
+    }, target ? 45000 : 120000);
     function cycle() {
       if (session !== record || record.stopping) return;
       var recognition, cycleFinal = "", ended = false;
@@ -100,10 +115,28 @@
       catch (_) { finish(record, target ? "Voice answer could not start." : "Voice could not start. Tap to talk again or type."); return; }
       record.recognition = recognition; record.stopIssued = false;
       recognition.lang = "en-SG"; recognition.interimResults = true; recognition.continuous = !target;
-      recognitionStatus(record, target ? "Listening for a payee. A clear final answer stops listening; confirm manually." : "Listening… Tap Stop listening when finished. Send is always manual.");
+      recognitionStatus(record, target ? "Requesting microphone. Allow Chrome access and wait for Listening before answering." : "Starting microphone… Allow browser access, then wait for Listening. Send is manual.");
       recognition.onstart = function () {
         if (session !== record || ended || record.recognition !== recognition) return;
+        record.started = true;
+        if (target) {
+          target.onStart();
+          clearTimeout(record.timer);
+          record.timer = setTimeout(function () {
+            if (session === record) cancelRecognition(noResult(record) + " Answer timed out.");
+          }, 15000);
+        }
+        recognitionStatus(record, target ? "Listening for a payee. Say the full offered name or account ending; confirm manually." : "Listening… Tap Stop listening when finished. Send is manual.");
         if (record.stopping) stopRecording();
+      };
+      recognition.onaudiostart = function () {
+        if (session !== record || ended || record.recognition !== recognition) return;
+        record.audioStarted = true;
+      };
+      recognition.onspeechstart = function () {
+        if (session !== record || ended || record.recognition !== recognition) return;
+        record.speechDetected = true;
+        if (target) recognitionStatus(record, "Speech detected. Waiting for Chrome's final words; nothing is selected yet.");
       };
       recognition.onresult = function (event) {
         if (session !== record || ended || record.recognition !== recognition) return;
@@ -140,7 +173,18 @@
           "network": "Speech recognition could not connect. Please type your message."
         };
         var message = messages[event.error] || "Recognition stopped. Review the words; tap to talk again or type.";
-        if (target) message = event.error === "not-allowed" ? "Microphone permission denied. Enable it in Chrome to retry, or tap a payee." : event.error === "no-speech" ? "No answer heard." : "Voice answer unavailable or interrupted.";
+        if (target) {
+          var errors = {
+            "not-allowed": "Microphone permission denied (not-allowed). Check Chrome and macOS microphone permissions.",
+            "service-not-allowed": "Chrome speech service blocked (service-not-allowed).",
+            "audio-capture": "Chrome could not capture microphone audio (audio-capture). Check the selected microphone.",
+            "network": "Chrome speech recognition service connection failed (network).",
+            "no-speech": noResult(record) + " Chrome reported no-speech.",
+            "aborted": "Chrome recognition was interrupted (aborted).",
+            "language-not-supported": "Chrome speech service does not support this language (language-not-supported)."
+          };
+          message = errors[event.error] || "Chrome recognition failed without a supported error code.";
+        }
         cancelRecognition(message);
       };
       recognition.onend = function () {
@@ -164,7 +208,19 @@
       try { recognition.start(); }
       catch (_) { finish(record, target ? "Voice answer could not start." : "Microphone could not start. Tap to talk again or type."); }
     }
-    cycle();
+    if (canSpeak && (global.speechSynthesis.speaking || global.speechSynthesis.pending)) global.speechSynthesis.cancel();
+    var audioWaits = 0;
+    function afterAudio() {
+      if (session !== record || record.stopping) return;
+      if (canSpeak && (global.speechSynthesis.speaking || global.speechSynthesis.pending)) {
+        if (++audioWaits >= 20) { cancelRecognition("Speech playback has not stopped. Wait, then retry or tap a payee."); return; }
+        recognitionStatus(record, "Stopping spoken playback before opening the microphone…");
+        record.audioTimer = setTimeout(afterAudio, 100);
+        return;
+      }
+      cycle();
+    }
+    afterAudio();
   }
   function stopRecording() {
     if (!session) return;
@@ -197,16 +253,20 @@
     });
     input.addEventListener("input", function () { cancelRecognition("Message edited. Review it, then press Send."); });
     global.addEventListener("pagehide", function () { reset(); autoReviewAllowed = false; });
-    document.addEventListener("visibilitychange", function () { if (document.hidden) { reset(); autoReviewAllowed = false; } });
+    document.addEventListener("visibilitychange", function () { if (document.hidden) suspendReview(); });
     // Abort pending microphone/playback on a new message, fixture or clarification.
     document.addEventListener("click", function (event) {
-      if (event.target.closest(".js-clarify-confirm")) pause();
+      if (event.target.closest(".js-clarify-confirm")) {
+        pause();
+        // A new deliberate confirmation may resume this message's paused review.
+        if (conversation && !document.hidden) conversation.suspended = false;
+      }
       else if (event.target.closest(".btn-scenario, #send-btn")) { reset(); autoReviewAllowed = true; }
     }, true);
     // A detached/replaced card must never keep talking about an old draft.
     new MutationObserver(function () {
       if ((playback && !playback.button.isConnected) || speechQueue.some(function (item) { return !item.button.isConnected; })) cancelPlayback();
-      if (conversation && conversation.items.some(function (item) { return !item.card.isConnected; })) reset();
+      if (conversation && conversation.items.slice(conversation.cursor).some(function (item) { return !item.card.isConnected && !(item.replacing && item.host.isConnected); })) reset();
       if (session && session.target && (!session.target.card.isConnected || !session.target.button.isConnected)) cancelRecognition();
     }).observe(document.getElementById("draft-display"), { childList: true, subtree: true });
   }
@@ -271,6 +331,11 @@
     if (conversation !== plan) return;
     var item = plan.items[plan.cursor];
     if (!item) return;
+    if (plan.suspended || document.hidden) {
+      item.continueButton.hidden = true;
+      item.note.textContent = "Automatic speech paused while the tab was hidden. Tap Read draft to resume, or review the displayed details.";
+      return;
+    }
     if (item.skipped) { plan.cursor++; advance(plan); return; }
     if (!item.card.isConnected || (item.anchor && !item.anchor.isConnected)) return;
     var hear = item.card.querySelector(".js-hear-question");
@@ -302,20 +367,24 @@
   }
   function queueCards(items) {
     reset();
-    if (!autoReviewAllowed) return;
     var plan = { items: items.filter(function (item) {
       return item.card.isConnected && (!item.anchor || item.anchor.isConnected);
-    }).sort(function (a, b) { return a.index - b.index; }), cursor: 0 };
+    }).sort(function (a, b) { return a.index - b.index; }), cursor: 0, suspended: !autoReviewAllowed || document.hidden };
     conversation = plan;
-    plan.items.forEach(function (item) { addContinue(plan, item); });
+    plan.items.forEach(function (item) { item.host = item.card.closest("[id^=api-item-]") || item.card; addContinue(plan, item); });
     advance(plan);
   }
+  function replacingCard(card) {
+    var item = conversation && conversation.items.find(function (entry) { return entry.card === card; });
+    if (item) { pause(); item.replacing = true; }
+  }
   function resolvedCard(oldCard, card, draft, validator, policy) {
-    if (!oldCard.isConnected || !card.isConnected) return;
+    if (!card.isConnected) return;
     var plan = conversation, item = plan && plan.items.find(function (entry) { return entry.card === oldCard; });
+    if (!oldCard.isConnected && !(item && item.replacing && item.host.contains(card))) return;
     if (!item) { attachDraftReadback(card, draft, false, oldCard.dataset.reviewIndex ? Number(oldCard.dataset.reviewIndex) : undefined, validator, policy); return; }
     pause();
-    item.card = card; item.draft = draft; item.validator = validator; item.policy = policy;
+    item.replacing = false; item.card = card; item.draft = draft; item.validator = validator; item.policy = policy;
     attachDraftReadback(card, draft, false, item.index, validator, policy);
     item.anchor = card.querySelector(".js-draft-readback");
     addContinue(plan, item);
@@ -365,7 +434,11 @@
     var text = draftText(draft, index, validator, policy) + (prompt ? " " + prompt.textContent : "");
     button.addEventListener("click", function () {
       var plan = conversation, item = plan && plan.items[plan.cursor];
-      if (card.getAttribute("data-clarify-in-flight") === "true") return;
+      if (card.getAttribute("data-clarify-in-flight") === "true" || document.hidden) return;
+      if (item && item.card === card) {
+        plan.suspended = false;
+        item.continueButton.hidden = !prompt;
+      }
       var done = !prompt && item && item.card === card ? function () { complete(plan, item); } : null;
       speakText(button, note, text, label, done);
     });
@@ -373,5 +446,5 @@
     // autoplay restrictions may still require tapping the retained button.
     if (autoplay && canSpeak) button.click();
   }
-  global.DctaVoice = { init: init, reset: reset, pause: pause, resolvedCard: resolvedCard, wireAnswer: wireAnswer, speakText: speakText, canSpeak: canSpeak, queueCards: queueCards, attachDraftReadback: attachDraftReadback };
+  global.DctaVoice = { init: init, reset: reset, pause: pause, resolvedCard: resolvedCard, replacingCard: replacingCard, wireAnswer: wireAnswer, speakText: speakText, canSpeak: canSpeak, queueCards: queueCards, attachDraftReadback: attachDraftReadback };
 })(window);
