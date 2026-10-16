@@ -231,3 +231,23 @@ def test_idempotency_key_replays_the_same_result_and_rejects_a_different_draft()
         "replayed",
     )
     assert len(ledger_drafts(gw)) == 1
+
+
+def test_same_signed_draft_cannot_execute_again_with_a_fresh_key():
+    """A valid assertion is not a permit to post its draft repeatedly.
+
+    Signature verification is stubbed only in this binding unit test; the
+    Chromium ceremony separately exercises the real ES256 verification.
+    """
+    gw, stored = make_gateway()
+    assertion = make_assertion(challenge_for(stored))
+    first_request = request_for(stored.id, assertion, key="original-key")
+    first = gw.execute(first_request)
+    assert first["result"] == "executed"
+    assert_rejected(
+        gw.execute(request_for(stored.id, assertion, key="fresh-key")), "replayed"
+    )
+    assert len(ledger_drafts(gw)) == 1
+    # The safe recovery from an uncertain network result remains idempotent.
+    assert gw.execute(first_request) == first
+    assert len(ledger_drafts(gw)) == 1

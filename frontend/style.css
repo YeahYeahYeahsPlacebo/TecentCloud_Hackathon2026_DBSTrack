@@ -491,6 +491,8 @@ body {
 .voice-preview { font-size: 13px; padding: 8px 10px; background: #eceff1; color: #455a64; border-radius: 8px; }
 .readback-controls { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
 
+.tech-details pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.passkey-card-status { padding: 8px 0; }
 /* Keep primary, microphone, scenario and payee controls easy to tap on mobile. */
 .btn, .candidate-btn { min-height: 44px; }
 

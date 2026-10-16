@@ -9,7 +9,7 @@
  * Fixture scenario buttons remain as a demo fallback when the
  * backend is not running.
  *
- * WebAuthn signing and execution are deliberately disabled.
+ * Passkey signing and separate execution are available only for eligible server drafts.
  * ───────────────────────────────────────────────────────────── */
 
 (function () {
@@ -68,6 +68,7 @@
     }
 
     DctaVoice.init();
+    DctaPasskeys.init();
 
     // ── Scenario button wiring (demo fallback) ───────────────
     Array.prototype.forEach.call(scenarioBtns, function (btn) {
@@ -305,7 +306,7 @@
               " clarifying question" + (questionCount > 1 ? "s" : "") +
               ". Draft signing and execution are disabled.");
     } else {
-      setHint("Review the transaction details below. Signing and execution are disabled in this demo.");
+      setHint("Review the transaction details below. Only validated, policy-approved drafts can be signed.");
     }
   }
 
@@ -660,6 +661,7 @@
 
     html += "</div>";
     el.innerHTML = html;
+    DctaPasskeys.attach(el.querySelector(".card"), draft, !st.blocked);
   }
 
   // Render an ambiguous-payee draft received from the API.

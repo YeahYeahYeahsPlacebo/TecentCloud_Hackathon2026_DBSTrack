@@ -663,7 +663,7 @@ first failure, so every rejection has exactly one reason code:
 | 7 | Assertion has exactly its 4 fields, all valid base64url; `client_data_json` is JSON; `assertion.credential_id` equals `credential_id` | `malformed_signature` |
 | 8 | `challenge` in `client_data_json` equals base64url of the server's recomputed hash of the stored draft | `hash_mismatch` |
 | 9 | `type` is `webauthn.get`; `origin` is the expected origin; rpIdHash matches; user-verified flag set; credential is registered; ES256 signature over `authenticator_data ‖ SHA256(client_data_json)` verifies | `signature_invalid` |
-| 10 | `idempotency_key` not previously used for a different draft (same key + same draft returns the original result) | `replayed` |
+| 10 | `idempotency_key` not previously used for a different draft; this draft has not executed under another key (same key + same draft returns the original result) | `replayed` |
 | 11 | Validator verdict for this draft hash is `pass` | `validator_frozen` |
 | 12 | Policy decision for this draft hash is `allow` (or step-up satisfied) | `policy_blocked` / `step_up_required` / `unresolved_fields` |
 
@@ -769,7 +769,7 @@ put them in the client's branch logic.
 | `hash_mismatch` | The challenge embedded in `client_data_json` does not equal the server's recomputed draft hash (base64url of the SHA-256 of the stored draft's canonical bytes). |
 | `signature_invalid` | The ECDSA (ES256) signature over `authenticator_data ‖ SHA256(client_data_json)` does not verify against the registered public key for `credential_id`. Also covers: unregistered credential, `type` not `webauthn.get`, wrong `origin`, wrong rpIdHash, or the user-verified (UV) flag not set. |
 | `expired` | The stored draft's `expires_at` is not in the future. |
-| `replayed` | The `idempotency_key` has already been used for a different draft. |
+| `replayed` | The `idempotency_key` has already been used for a different draft, or this draft already executed under another key. Retry an uncertain result with the original key. |
 | `unresolved_fields` | The stored draft's `unresolved` array is non-empty. The gateway rejects this regardless of any frontend check. |
 | `policy_blocked` | The policy engine determined the draft violates a rule (e.g. over per-transaction limit). |
 | `validator_frozen` | The validator returned a verdict of `freeze` — the transcript does not match the draft. The reason code keeps its own name; the verdict value is `freeze`. |

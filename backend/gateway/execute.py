@@ -352,12 +352,18 @@ def _check_not_replayed(gw: "ExecuteGateway", ctx: ExecuteContext) -> Optional[R
     """10. idempotency_key must not have been used for a different draft.
 
     Same key + same draft short-circuits to the original result (idempotent
-    retry). Same key + different draft is a replay.
+    retry). Same key + different draft, or an already executed draft under
+    a fresh key, is a replay.
     """
     assert ctx.draft is not None
     key = ctx.request["idempotency_key"]
     prior = gw.idempotency.get(key)
     if prior is None:
+        # The signature binds a draft, not the caller-supplied request key.
+        # Without this check a captured assertion can execute the same draft
+        # repeatedly simply by choosing a fresh key each time.
+        if any(draft_id == ctx.draft.id for draft_id, _ in gw.idempotency.values()):
+            return rejected(R.REPLAYED, "this draft has already executed; retry with the original idempotency_key")
         return None
     prior_draft_id, prior_result = prior
     if prior_draft_id != ctx.draft.id:
