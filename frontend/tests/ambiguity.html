@@ -1,62 +1,41 @@
-<!doctype html><meta charset="utf-8"><title>Ambiguity voice regression tests</title>
-<!-- Deterministic lifecycle/matching test doubles; no speech service or transaction API calls. -->
-<textarea id="text-input">Original message</textarea><button id="send-btn">Send</button><button id="mic-btn">Mic</button>
+<!doctype html><meta charset="utf-8"><title>Spoken question and tap clarification regression tests</title>
+<!-- Speech/recognition event doubles; no microphone, biometrics or transaction API calls. -->
+<textarea id="text-input">Original message</textarea><button id="send-btn">Send</button><button id="mic-btn">Tap to talk</button>
 <p id="voice-status"></p><p id="voice-preview"></p><div id="draft-display"></div><pre id="test-results">Running</pre>
 <script>
 var recognizers=[],spoken=[],cancellations=0;
-window.SpeechRecognition=class{
- constructor(){recognizers.push(this)}start(){this.onstart()}stop(){}abort(){this.aborted=true}
-};
+window.SpeechRecognition=class{constructor(){recognizers.push(this)}start(){this.onstart()}stop(){}abort(){this.aborted=true}};
 window.SpeechSynthesisUtterance=class{constructor(text){this.text=text}};
-Object.defineProperty(window,'speechSynthesis',{value:{speak(u){spoken.push(u)},cancel(){cancellations++}},configurable:true});
+Object.defineProperty(window,'speechSynthesis',{value:{speak(u){spoken.push(u);u.onstart()},cancel(){cancellations++}},configurable:true});
 </script>
 <script src="../js/voice.js"></script><script src="../js/ambiguity.js"></script>
 <script>
 (async function(){
- var results=[];
+ var results=[],confirms=0;
  function test(name,fn){try{fn();results.push({name,passed:true})}catch(e){results.push({name,passed:false,error:e.message})}}
  function assert(x,message){if(!x)throw Error(message)}
- var candidates=[{id:'a',display_name:'Maya Tan',masked_account:'****1357'},{id:'b',display_name:'Maya Lim',masked_account:'****2468'},{id:'c',display_name:'Maya Ng',masked_account:'****9753'}];
+ var candidates=[{id:'a',display_name:'Maya Tan',masked_account:'****1357'},{id:'b',display_name:'Maya Lim',masked_account:'****2468'}];
  function card(){
   var root=document.createElement('div');root.className='clarify-card';
   root.innerHTML='<p class="clarify-prompt"></p><input class="js-payee-filter"><div class="js-clarify-list"></div><button class="js-clarify-confirm" disabled>Confirm selection</button>';
-  candidates.forEach(function(c){var button=document.createElement('button');button.className='candidate-btn';button.dataset.candidateId=c.id;button.innerHTML='<span class="candidate-check"></span>';button.addEventListener('click',function(){root.querySelectorAll('.candidate-btn').forEach(b=>b.classList.remove('selected'));button.classList.add('selected');root.querySelector('.js-clarify-confirm').disabled=false});root.querySelector('.js-clarify-list').append(button)});
-  document.getElementById('draft-display').append(root);DctaAmbiguity.attach(root,candidates);return root;
+  candidates.forEach(function(c){var button=document.createElement('button');button.className='candidate-btn';button.dataset.candidateId=c.id;button.textContent=c.display_name;button.addEventListener('click',function(){root.querySelectorAll('.candidate-btn').forEach(b=>b.classList.remove('selected'));button.classList.add('selected');root.querySelector('.js-clarify-confirm').disabled=false});root.querySelector('.js-clarify-list').append(button)});
+  root.querySelector('.js-clarify-confirm').addEventListener('click',()=>confirms++);
+  document.getElementById('draft-display').append(root);DctaAmbiguity.attach(root,candidates);DctaVoice.attachDraftReadback(root,{amount:{value:'50.00',currency:'SGD'},source_account:'source'},false,0,{verdict:'freeze'},{decision:'hold'});return root;
  }
  DctaVoice.init();var a=card(),b=card();
- function answer(root,text){root.querySelector('.js-answer-voice').click();var r=recognizers.at(-1);r.onresult({results:[{0:{transcript:text},isFinal:true}]});root.querySelector('.js-answer-voice').click();r.onend();return r}
- function selected(root){return root.querySelector('.candidate-btn.selected')?.dataset.candidateId}
- test('Question uses supplied names and suffixes',()=>assert(a.querySelector('.clarify-prompt').textContent==='I found Maya Tan ending in 1357, Maya Lim ending in 2468 and Maya Ng ending in 9753. Which one did you mean?','Wrong question'));
- test('Hear question speaks that card question',()=>{a.querySelector('.js-hear-question').click();assert(spoken.at(-1).text===a.querySelector('.clarify-prompt').textContent,'Wrong audio')});
- test('Unique offered name selects only after final end',()=>{a.querySelector('.js-answer-voice').click();let r=recognizers.at(-1);r.onresult({results:[{0:{transcript:'Maya Lim'},isFinal:true}]});assert(!selected(a),'Selected too early');a.querySelector('.js-answer-voice').click();r.onend();assert(selected(a)==='b','Wrong selection')});
- test('Unique full suffix selects offered ID',()=>{answer(b,'ending in 1357');assert(selected(b)==='a','Wrong suffix')});
- test('Spoken digit suffix including one is supported',()=>{answer(b,'one three five seven');assert(selected(b)==='a','Spoken suffix lost digits')});
- test('Two cards keep heard words and selection separate',()=>{assert(selected(a)==='b'&&selected(b)==='a','Selections crossed');assert(a.querySelector('.js-answer-heard').textContent.includes('Maya Lim')&&!a.querySelector('.js-answer-heard').textContent.includes('one three'),'Heard text crossed')});
- test('Unclear answer clears own selection and keeps tap available',()=>{answer(a,'whatever');assert(!selected(a)&&a.querySelector('.js-clarify-confirm').disabled,'Unclear selected');a.querySelector('.candidate-btn').click();assert(selected(a)==='a','Tap unavailable')});
- test('Shared name is ambiguous',()=>{answer(a,'Maya');assert(!selected(a)&&a.querySelector('.js-answer-status').textContent.includes('more than one'),'Ambiguity selected')});
- test('Partial suffix, unknown name, negation and conflicting clues fail closed',()=>{for(let word of ['135','not Maya Lim','Maya Tan ending in 2468','Maya Lim or Maya Tan','someone else'])assert(DctaAmbiguity.matchAnswer(word,candidates).length!==1,word+' selected')});
- test('New card microphone cancels old one and ignores late answer',()=>{a.querySelector('.js-answer-voice').click();let old=recognizers.at(-1);b.querySelector('.js-answer-voice').click();old.onresult({results:[{0:{transcript:'Maya Tan'},isFinal:true}]});old.onend();assert(old.aborted&&!selected(a),'Stale answer selected');DctaVoice.reset()});
- test('Amount read-back still repeats only the server amount and shares audio cancellation',()=>{
-  var amountCard=document.createElement('div');document.getElementById('draft-display').append(amountCard);
-  DctaVoice.attachReadback(amountCard,{amount:{value:'73.25',currency:'SGD'}});
-  var read=amountCard.querySelector('.js-readback');read.click();
-  assert((spoken.at(-1).text.match(/73.25 SGD/g)||[]).length===2,'Amount read-back changed');
-  var before=cancellations;a.querySelector('.js-hear-question').click();
-  assert(cancellations===before+1&&read.textContent==='Read amount twice','Audio queues overlapped');
- });
- test('New-draft read-back uses only returned details without confirming anything',()=>{
-  var returned=document.createElement('div');document.getElementById('draft-display').append(returned);
-  DctaVoice.attachDraftReadback(returned,{amount:{value:'91.00',currency:'SGD'},payee:{display_name:'Ada Wong',masked_account:'****8642'},source_account:'source-test'},true);
-  assert(spoken.at(-1).text.includes('91.00 SGD')&&spoken.at(-1).text.includes('Ada Wong')&&spoken.at(-1).text.includes('8642')&&spoken.at(-1).text.includes('source-test'),'Read-back used stale details');
-  assert(spoken.at(-1).text.includes('never signs or executes'),'Missing authorization boundary');
- });
- test('Voice never edits the main message',()=>assert(document.getElementById('text-input').value==='Original message','Message overwritten'));
- test('No automatic confirmation',()=>{let count=0;for(let root of [a,b])root.querySelector('.js-clarify-confirm').addEventListener('click',()=>count++);answer(a,'Maya Lim');assert(count===0&&!a.querySelector('.js-clarify-confirm').disabled,'Auto confirmation')});
- // A fresh realm loads voice.js with recognition explicitly unavailable.
+ test('Question uses only supplied names and account endings',()=>assert(a.querySelector('.clarify-prompt').textContent==='I found Maya Tan ending in 1357 and Maya Lim ending in 2468. Which one did you mean?','Wrong question'));
+ test('Clarification has no microphone, heard, preview or retry states',()=>{assert(!a.querySelector('.js-answer-voice,.js-answer-heard,.js-answer-preview,.js-answer-status')&&!/Answer by voice|Retry voice|Heard:|Say a name/.test(a.textContent),'Voice answer remains');assert(a.textContent.includes('Tap an offered payee')&&a.querySelectorAll('.js-draft-readback').length===1,'Missing tap instructions or duplicate replay')});
+ test('Question replay uses offered candidates without opening a microphone or confirming',()=>{a.querySelector('.js-draft-readback').click();assert(spoken.at(-1).text.includes(a.querySelector('.clarify-prompt').textContent)&&recognizers.length===0&&confirms===0,'Question selected/submitted/listened')});
+ test('Tap highlights the offered payee for review without submission',()=>{a.querySelector('[data-candidate-id="b"]').click();assert(a.querySelector('.js-answer-selected').textContent.includes('Maya Lim ending in 2468')&&!a.querySelector('.js-clarify-confirm').disabled&&confirms===0,'Tap submitted or lost selected details')});
+ test('Two cards keep tap selection and selected status separate',()=>{b.querySelector('[data-candidate-id="a"]').click();assert(a.querySelector('.candidate-btn.selected').dataset.candidateId==='b'&&b.querySelector('.candidate-btn.selected').dataset.candidateId==='a'&&b.querySelector('.js-answer-selected').textContent.includes('Maya Tan'),'Selections crossed')});
+ test('Only deliberate Confirm selection submits',()=>{a.querySelector('.js-clarify-confirm').click();assert(confirms===1,'Manual confirm unavailable')});
+ test('Main Tap to talk still fills editable words and cannot select or confirm payees',()=>{document.querySelector('#mic-btn').click();var r=recognizers.at(-1);r.onresult({results:[{0:{transcript:'Send fifty dollars to Maya Tan'},isFinal:true}]});document.querySelector('#mic-btn').click();r.onend();assert(document.querySelector('#text-input').value==='Send fifty dollars to Maya Tan'&&a.querySelector('.candidate-btn.selected').dataset.candidateId==='b'&&confirms===1,'Main speech changed payee or submitted')});
+ test('Full Read draft repeats the server amount twice and remains non-authorizing',()=>{a.querySelector('.js-draft-readback').click();assert((spoken.at(-1).text.match(/50.00 SGD/g)||[]).length===2&&spoken.at(-1).text.includes('never signs or executes')&&confirms===1,'Amount/replay authorized')});
+ test('No candidate is selected automatically on a new card',()=>{var c=card();assert(!c.querySelector('.candidate-btn.selected')&&c.querySelector('.js-clarify-confirm').disabled&&c.querySelector('.js-answer-selected').textContent==='Selected: none.','Auto-selected')});
  var frame=document.createElement('iframe');document.body.append(frame);
- frame.srcdoc='<textarea id="text-input"></textarea><button id="send-btn"></button><button id="mic-btn"></button><p id="voice-status"></p><p id="voice-preview"></p><div id="draft-display"></div><script>window.SpeechRecognition=undefined;window.webkitSpeechRecognition=undefined;<\/script><script src="/js/voice.js"><\/script><script> DctaVoice.init();parent.postMessage("unsupported-ready",location.origin);<\/script>';
+ frame.srcdoc='<textarea id="text-input"></textarea><button id="send-btn"></button><button id="mic-btn"></button><p id="voice-status"></p><p id="voice-preview"></p><div id="draft-display"></div><script>window.SpeechRecognition=undefined;window.webkitSpeechRecognition=undefined;<\/script><script src="/js/voice.js"><\/script><script src="/js/ambiguity.js"><\/script><script>DctaVoice.init();<\/script>';
  await new Promise(resolve=>frame.onload=resolve);
- test('Recognition unavailable leaves tap selection available',()=>{var w=frame.contentWindow;assert(w.document.getElementById('mic-btn').disabled,'Mic supported unexpectedly');var disabled=w.document.createElement('button'),note=w.document.createElement('p');w.DctaVoice.wireAnswer({button:disabled,status:note,card:w.document.body});assert(disabled.disabled&&note.textContent.includes('Tap a payee'),'No fallback')});
- window.ambiguityTestResults=results;document.getElementById('test-results').textContent=JSON.stringify(results,null,2);
+ test('Unsupported recognition does not affect tap clarification',()=>{var w=frame.contentWindow,c=w.document.createElement('div');c.innerHTML='<p class="clarify-prompt"></p><input class="js-payee-filter"><button class="candidate-btn" data-candidate-id="a">Maya Tan</button><button class="js-clarify-confirm">Confirm selection</button>';w.document.querySelector('#draft-display').append(c);c.querySelector('.candidate-btn').onclick=e=>e.currentTarget.classList.add('selected');w.DctaAmbiguity.attach(c,candidates);c.querySelector('.candidate-btn').click();assert(w.document.querySelector('#mic-btn').disabled&&!c.querySelector('.js-answer-voice')&&c.querySelector('.js-answer-selected').textContent.includes('Maya Tan'),'Tap depends on recognition')});
+ DctaVoice.reset();window.ambiguityTestResults=results;document.getElementById('test-results').textContent=JSON.stringify(results,null,2);
 })();
 </script>

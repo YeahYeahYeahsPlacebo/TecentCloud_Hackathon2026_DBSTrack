@@ -469,7 +469,14 @@ Rules (proposed):
 ### Narrow independent-transfer exception
 
 `/api/message` also accepts exactly two independent clauses in the form
-`Send <exact SGD amount> to <saved payee name> and send/transfer <exact SGD amount> to <saved payee name>`.
+`Send <exact SGD amount> to <saved payee name> and [send/transfer] <exact SGD amount> to <saved payee name>`.
+The second verb may be omitted only when exactly one safe split yields two
+complete amount-to-payee clauses. For example, `Send fifty dollars to John Smith
+and thirty dollars to Jane.` resolves unique `Jane` through the existing trusted
+directory; full names are not required. An ambiguous saved name still needs
+explicit per-draft clarification. No missing amount, payee or dependency is
+inferred. Each child transcript remains the exact clause, including the second
+clause's absence of a verb; no synthetic verb is added for parsing or validation.
 The split is deterministic and verbatim. Conditions, sequencing, shared references,
 source-account overrides, bills, equities and more than two requests remain
 `422 multi_intent_unsupported`; general grouped execution stays deferred.
