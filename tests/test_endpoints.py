@@ -233,7 +233,11 @@ def test_a_parser_that_drops_an_intent_is_a_bug_not_a_rejection():
 
     api = GatewayAPI(parser=DroppingParser(), clock=lambda: clean_and_now()[1])
     try:
-        api.message({"transcript": "Send fifty to John and twenty to Jane."})
+        # One clause on purpose. "Send fifty to John and twenty to Jane." now
+        # takes the two-independent-transfers path, whose own item-count check
+        # is locked down in test_independent_transfers.py; this test is about
+        # the contract check that covers every other transcript.
+        api.message({"transcript": "Send fifty dollars to John Smith."})
     except ParserContractViolation as exc:
         assert "2 intent" in str(exc)
     else:
