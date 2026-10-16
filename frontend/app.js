@@ -237,6 +237,11 @@
                        ' intents detected.</p>';
     }
 
+    if (body.request_mode === "independent_transfers" && typeof body.source_transcript === "string") {
+      containerHtml += '<p class="hint">Two independent transfers. Review each draft separately; no ordering or automatic execution.</p>' +
+                       '<div class="transcript">Original message: ' + escapeHtml(body.source_transcript) + '</div>';
+    }
+
     // Render each item. Draft items are rendered asynchronously
     // (hash computation), so we build a placeholder first, then
     // fill it in. Question items are rendered synchronously.
@@ -743,6 +748,7 @@
     wireCandidateButtons(cardEl);
     wirePayeeFilter(cardEl);
     wireClarifyConfirmBtn(cardEl);
+    DctaAmbiguity.attach(cardEl, candidates);
     setHint("Select the intended payee, then choose Confirm selection to update the draft.");
   }
 
@@ -1348,6 +1354,7 @@
             var inner = cardEl.querySelector('[' + marker + ']');
             if (!inner) return;
             renderServerDraftInto(draft, hash, validator, policy, inner);
+            DctaVoice.attachDraftReadback(inner.querySelector(".card"), draft, true);
           })
           .catch(function (err) {
             var inner = cardEl.querySelector('[' + marker + ']');
