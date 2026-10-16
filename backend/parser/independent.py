@@ -19,6 +19,8 @@ from backend.parser.interface import ParserCannotHandle
 from backend.parser.speech_norm import spoken_amount
 
 _CONNECTOR = re.compile(r"\s+and\s+(?=(?:send|transfer)\b)", re.IGNORECASE)
+_SHARED_VERB_CLAUSE = re.compile(r"(?:(?:send|transfer)\s+)?(.+?)\s+to\s+(.+)", re.IGNORECASE)
+_AND = re.compile(r"\s+and\s+", re.IGNORECASE)
 _CLAUSE = re.compile(r"(?:send|transfer)\s+(.+?)\s+to\s+(.+)", re.IGNORECASE)
 _DEPENDENCY = re.compile(
     r"\b(?:then|after|before|if|unless|when|until|once|otherwise|remaining|remainder|rest|"
@@ -42,49 +44,75 @@ def _refuse() -> NoReturn:
 
 
 def independent_transfer_clauses(transcript: str, directory: Optional[PayeeDirectory]) -> Optional[tuple[str, str]]:
-    """Return two safe verbatim clauses, or None for the existing single path.
+    """Return two safe verbatim clauses (a shared second verb is allowed), or None for the existing single path.
 
     A recognized but unsupported combination is rejected as a whole; it is
     never shortened to one draft. A partial name may produce payee candidates,
     but must actually name a payee in the authoritative directory.
     """
     parts = _CONNECTOR.split(transcript)
-    if len(parts) == 1:
-        return None
-    if directory is None or len(parts) != 2 or len(sanitise(transcript)) > 500 or _DEPENDENCY.search(transcript):
+    if len(parts) > 2:
         _refuse()
-    clauses = tuple(part.strip() for part in parts)
-    for clause in clauses:
-        match = _CLAUSE.fullmatch(clause)
-        if match is None:
-            _refuse()
-        money, recipient = match.groups()
-        # Limit the accepted language before interpreting it. For example,
-        # "fifty dollars after ..." must not become an independent payment.
-        if not re.fullmatch(r"[\w\s.$]+", money):
-            _refuse()
-        tokens = re.findall(r"[a-z_]+|\d+(?:\.\d+)?|\$", money.lower())
-        if any(token not in _NUMBER_WORDS and token != "$" and not re.fullmatch(r"\d+(?:\.\d{1,2})?", token) for token in tokens):
-            _refuse()
-        reading = spoken_amount(money)
-        if reading.status != "exact" or resolve_currency(money) != "SGD" or Decimal(reading.value) <= 0:
-            _refuse()
-        # The amount reader must consume the entire numeric phrase, not
-        # ignore a stray word such as "zero" in "zero fifty dollars".
-        start, end = reading.span
-        if money[:start].strip().lower() not in ("", "sgd", "$", "sgd $") or money[end:].strip().lower() not in (
-            "", "dollar", "dollars", "sgd", "singapore dollar", "singapore dollars",
-        ):
-            _refuse()
-        recipient = recipient.rstrip(".,").strip()
-        offered = match_payees(recipient, directory, context=clause)
-        phrase = recipient.casefold()
-        if not offered or not any(
-            phrase == payee.display_name.casefold() or phrase in payee.display_name.casefold().split()
-            for payee in offered
-        ):
-            _refuse()
-    return clauses[0], clauses[1]
+    if len(parts) == 2:
+        candidates = [tuple(part.strip() for part in parts)]
+    else:
+        # Consider only an explicit first transfer and an amount-to-payee
+        # second clause. Enumerate boundaries rather than splitting number
+        # phrases such as "one hundred and fifty" at their internal "and".
+        if not re.match(r"(?:send|transfer)\s+", transcript.lstrip(), re.IGNORECASE):
+            return None
+        candidates = []
+        for connector in _AND.finditer(transcript):
+            first, second = transcript[:connector.start()].strip(), transcript[connector.end():].strip()
+            if _CLAUSE.fullmatch(first) and _SHARED_VERB_CLAUSE.fullmatch(second):
+                candidates.append((first, second))
+        if not candidates:
+            return None
+    if directory is None or len(sanitise(transcript)) > 500 or _DEPENDENCY.search(transcript):
+        _refuse()
+    accepted = []
+    for first, second in candidates:
+        try:
+            _check_clause(first, directory, shared_verb=False)
+            _check_clause(second, directory, shared_verb=True)
+        except ParserCannotHandle:
+            continue
+        accepted.append((first, second))
+    if len(accepted) != 1:
+        _refuse()
+    return accepted[0]
+
+
+def _check_clause(clause: str, directory: PayeeDirectory, *, shared_verb: bool) -> None:
+    match = (_SHARED_VERB_CLAUSE if shared_verb else _CLAUSE).fullmatch(clause)
+    if match is None:
+        _refuse()
+    money, recipient = match.groups()
+    # Limit the accepted language before interpreting it. For example,
+    # "fifty dollars after ..." must not become an independent payment.
+    if not re.fullmatch(r"[\w\s.$]+", money):
+        _refuse()
+    tokens = re.findall(r"[a-z_]+|\d+(?:\.\d+)?|\$", money.lower())
+    if any(token not in _NUMBER_WORDS and token != "$" and not re.fullmatch(r"\d+(?:\.\d{1,2})?", token) for token in tokens):
+        _refuse()
+    reading = spoken_amount(money)
+    if reading.status != "exact" or resolve_currency(money) != "SGD" or Decimal(reading.value) <= 0:
+        _refuse()
+    # The amount reader must consume the entire numeric phrase, not
+    # ignore a stray word such as "zero" in "zero fifty dollars".
+    start, end = reading.span
+    if money[:start].strip().lower() not in ("", "sgd", "$", "sgd $") or money[end:].strip().lower() not in (
+        "", "dollar", "dollars", "sgd", "singapore dollar", "singapore dollars",
+    ):
+        _refuse()
+    recipient = recipient.rstrip(".,").strip()
+    offered = match_payees(recipient, directory, context=clause)
+    phrase = recipient.casefold()
+    if not offered or not any(
+        phrase == payee.display_name.casefold() or phrase in payee.display_name.casefold().split()
+        for payee in offered
+    ):
+        _refuse()
 
 
 def independent_draft_matches(clause: str, draft: TransactionDraft, directory: PayeeDirectory) -> bool:
@@ -94,7 +122,7 @@ def independent_draft_matches(clause: str, draft: TransactionDraft, directory: P
     prevents a parser from swapping amounts/payees or guessing an ambiguous
     name, even if a later validator were to miss that mismatch.
     """
-    money, recipient = _CLAUSE.fullmatch(clause).groups()
+    money, recipient = _SHARED_VERB_CLAUSE.fullmatch(clause).groups()
     offered = match_payees(recipient.rstrip(".,").strip(), directory, context=clause)
     expected = {p.id: {"id": p.id, "display_name": p.display_name, "masked_account": p.masked_account} for p in offered}
     if (draft.transcript != clause or draft.intent_type != "transfer"
