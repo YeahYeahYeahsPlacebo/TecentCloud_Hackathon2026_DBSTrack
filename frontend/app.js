@@ -224,6 +224,7 @@
     var items = parsed.items;
     var intents = parsed.intentsDetected;
     var responseGen = messageGen;
+    var speechCards = [], renderJobs = [];
 
     // Build a container for all rendered items.
     var containerHtml = '';
@@ -262,10 +263,14 @@
 
         // Compute hash, then render into the placeholder.
         // We use a closure to capture the placeholderId and item data.
-        canonical.draftHashAsync(draft)
+        renderJobs.push(canonical.draftHashAsync(draft)
           .then(function (hash) {
             if (responseGen !== messageGen) return;
             renderApiDraftInto(draft, hash, validator, policy, placeholderId);
+            var card = document.getElementById(placeholderId).querySelector(".card");
+            DctaVoice.attachDraftReadback(card, draft, false, idx, validator, policy);
+            speechCards.push({ card: card, draft: draft, validator: validator, policy: policy, index: idx,
+              anchor: card.querySelector(".js-hear-question, .js-draft-readback") });
           })
           .catch(function (err) {
             if (responseGen !== messageGen) return;
@@ -273,7 +278,7 @@
             if (el) el.innerHTML =
               '<p class="placeholder">Hash error: ' +
               escapeHtml(err.message) + "</p>";
-          });
+          }));
         draftCount++;
       } else if (item.kind === "question") {
         containerHtml += renderQuestionItem(item);
@@ -284,6 +289,9 @@
     // Set the container HTML. Draft placeholders will be filled
     // asynchronously as each hash completes.
     displayEl.innerHTML = containerHtml;
+    Promise.all(renderJobs).then(function () {
+      if (responseGen === messageGen) DctaVoice.queueCards(speechCards);
+    });
 
     if (draftCount === 0 && questionCount === 0) {
       // No recognizable items.
@@ -652,7 +660,6 @@
 
     html += "</div>";
     el.innerHTML = html;
-    DctaVoice.attachReadback(el.querySelector(".card"), draft);
   }
 
   // Render an ambiguous-payee draft received from the API.
@@ -738,7 +745,6 @@
 
     html += "</div>";
     el.innerHTML = html;
-    DctaVoice.attachReadback(el.querySelector(".card"), draft);
 
     // Wire all interactions scoped to THIS card only. The card root
     // is the .clarify-card element inside el.
@@ -1321,7 +1327,6 @@
   // card's content — other cards on screen are untouched. The server
   // returns a new draft with a new id and nonce.
   function renderClarifySuccessInto(body, cardEl) {
-    DctaVoice.reset();
     var parsed = parseMessageResponse(body);
     if (!parsed) {
       cardEl.innerHTML =
@@ -1350,9 +1355,9 @@
         canonical.draftHashAsync(draft)
           .then(function (hash) {
             var inner = cardEl.querySelector('[' + marker + ']');
-            if (!inner) return;
+            if (!cardEl.isConnected || !inner) return;
             renderServerDraftInto(draft, hash, validator, policy, inner);
-            DctaVoice.attachDraftReadback(inner.querySelector(".card"), draft, true);
+            DctaVoice.resolvedCard(cardEl, inner.querySelector(".card"), draft, validator, policy);
           })
           .catch(function (err) {
             var inner = cardEl.querySelector('[' + marker + ']');
@@ -1365,6 +1370,7 @@
       }
     });
 
+    DctaVoice.replacingCard(cardEl);
     cardEl.innerHTML = html;
     setHint("Your selection was applied. Review the updated transaction details below.");
   }
@@ -1430,10 +1436,8 @@
     html +=     '<span>expires: ' + escapeHtml(draft.expires_at) + '</span>';
     html +=     '<span class="hash-line">hash: ' + escapeHtml(hash) + '</span>';
     html +=   '</div>';
-    html +=   '<div class="acct-note">' +
-              'Account ID shown as-is. An account-display API or mapping ' +
-              'is still needed — do not fabricate a display name.' +
-              '</div>';
+    // Developer note: IDs remain canonical; a future display mapping must
+    // come from the server rather than invented account names.
     html += '</details>';
     return html;
   }
